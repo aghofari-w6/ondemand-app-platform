@@ -64,7 +64,7 @@ async function capture(ctx: TenantTxContext & { emit: (d: any) => void; config: 
     })
     .execute();
   if (res.ok) {
-    ctx.emit({ type: 'payment.captured', aggregateType: 'payment', aggregateId: id, data: { payment_id: id, reference: input.reference, amount, currency, method: input.method, provider_ref: res.providerRef } });
+    ctx.emit({ type: 'payment.captured', aggregateType: 'payment', aggregateId: id, data: { payment_id: id, reference: input.reference, amount, currency, method: input.method, provider_ref: res.providerRef, pos_sale_id: input.reference.startsWith('pos:sale:') ? input.reference.slice(9) : null } });
   } else {
     ctx.emit({ type: 'payment.failed', aggregateType: 'payment', aggregateId: id, data: { payment_id: id, reference: input.reference, amount, currency, reason: res.reason } });
   }

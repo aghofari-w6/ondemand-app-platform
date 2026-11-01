@@ -19,6 +19,7 @@ export interface EventBus {
 export interface Consumer {
   /** unique, stable name: its cursor and dedup key */
   name: string;
+  /** event types, or `*` for every event */
   types: string[];
   /**
    * Runs in the same transaction (scoped to the event's tenant) that records the
@@ -52,9 +53,38 @@ export interface Jobs {
   stop(): Promise<void>;
 }
 
-/** Svix later; Integration Hub delivery tables in Milestone B. */
+/**
+ * Outbound deliveries (Svix later). One method per message; the adapter picks the
+ * transport from `target.kind` (webhook, REST push, Kafka, Redis Streams, SFTP, SQS)
+ * and enforces the private-address (SSRF) policy on every connection it makes.
+ */
 export interface Webhooks {
-  deliver(endpointId: string, event: EventEnvelope): Promise<void>;
+  /** Validates a target before it is saved (URL/host policy, required credentials). */
+  checkTarget(target: DeliveryTarget): Promise<void>;
+  deliver(target: DeliveryTarget, msg: OutboundMessage): Promise<DeliveryResult>;
+}
+export interface DeliveryTarget {
+  kind: 'webhook' | 'rest_push' | 'kafka' | 'redis_stream' | 'sftp' | 'sqs' | 'http';
+  config: Record<string, any>;
+  credentials: Record<string, any> | null;
+  /** webhook signing secret (Standard Webhooks, `whsec_...`) */
+  signingSecret?: string | null;
+}
+export interface OutboundMessage {
+  /** event id: stays the same across retries and replays */
+  id: string;
+  type: string;
+  timestamp: Date;
+  /** JSON body */
+  body: string;
+}
+export interface DeliveryResult {
+  ok: boolean;
+  status?: number;
+  error?: string;
+  /** first 2 KB of the response body */
+  response?: string;
+  durationMs: number;
 }
 
 /** Email/SMS/Telegram later; demo mode shows the message on screen. */
@@ -117,6 +147,6 @@ export interface Sandbox {
 
 /** Billing provider later; plans from config/platform.yaml now. */
 export interface Billing {
-  plan(planId: string): { label: string; packages: string[]; appSlots: number } | null;
+  plan(planId: string): { label: string; packages: string[]; appSlots: number; limits: { custom_entities: number; custom_fields: number; hub_endpoints: number; api_keys: number } } | null;
   trialDays(): number;
 }

@@ -1,6 +1,7 @@
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { useEffect, useState, type ReactNode } from 'react';
+import { LinkedRecords } from './links';
 import { Alert, Badge, Button, Card, Checkbox, EmptyState, Select, TextField } from './ui';
 import { api, ApiError, dateTime, label, money } from '../lib/api';
 
@@ -235,6 +236,7 @@ export function Detail(props: { meta: AppMeta; entity: string; id: string; title
             </dl>
           </Card>
           {props.extra?.(item)}
+          <LinkedRecords type={(ent as any).resource} id={props.id} />
         </div>
         <Card title="Events">
           <ol className="flex flex-col gap-3 text-sm">

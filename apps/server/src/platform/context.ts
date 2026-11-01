@@ -2,6 +2,8 @@ import type { Env, PlatformConfig } from '../config.ts';
 import type { Database } from '../db/database.ts';
 import type { Auth, Billing, Channel, EventBus, Files, Jobs, Llm, Metrics, Retriever, Sandbox, Search, Telemetry, Vault, Webhooks } from '../ports/index.ts';
 import type { Catalog } from './catalog.ts';
+import type { HubDeliverer } from './hub.ts';
+import type { IndexBuilder } from './maintenance.ts';
 
 export interface Logger {
   info(obj: unknown, msg?: string): void;
@@ -16,6 +18,8 @@ export interface Platform {
   catalog: Catalog;
   database: Database;
   log: Logger;
+  /** in-process background workers (started by startWorkers) */
+  workers: { hub: HubDeliverer; indexes: IndexBuilder | null };
   ports: {
     eventBus: EventBus;
     search: Search;

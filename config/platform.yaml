@@ -1,5 +1,5 @@
 # Apps-on-Demand platform configuration (prototype).
-# One file holds plans, trial limits, release channels and capability rules.
+# One file holds plans, trial limits, plan limits, release channels and capability rules.
 
 trial:
   days: 14
@@ -15,14 +15,17 @@ plans:
     label: Trial
     packages: [Apps]
     app_slots: 3
+    limits: { custom_entities: 2, custom_fields: 20, hub_endpoints: 2, api_keys: 2 }
   starter:
     label: Starter
     packages: [Apps]
     app_slots: 4
+    limits: { custom_entities: 5, custom_fields: 60, hub_endpoints: 5, api_keys: 5 }
   growth:
     label: Growth
     packages: [Apps, Analytics, Bot, Omnichannel]
     app_slots: 12
+    limits: { custom_entities: 25, custom_fields: 400, hub_endpoints: 25, api_keys: 25 }
 
 # Release channels: which manifest release each channel serves.
 channels:

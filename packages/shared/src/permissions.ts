@@ -33,6 +33,12 @@ export const PLATFORM_PERMISSIONS: PermissionDef[] = [
   { id: 'platform:billing.manage', label: 'Change plan and billing', level: 'admin', ownerOnly: true },
   { id: 'platform:tenant.delete', label: 'Delete the workspace', level: 'admin', ownerOnly: true },
   { id: 'platform:fields.manage', label: 'Manage custom fields', level: 'admin' },
+  { id: 'platform:datastudio.manage', label: 'Edit and publish the data model (Data studio)', level: 'admin' },
+  { id: 'platform:records.read', label: 'See custom entity records', level: 'read' },
+  { id: 'platform:records.write', label: 'Create and edit custom entity records', level: 'operate' },
+  { id: 'platform:hub.read', label: 'See Integration Hub endpoints and deliveries', level: 'manage' },
+  { id: 'platform:hub.manage', label: 'Configure the Integration Hub and replay deliveries', level: 'admin' },
+  { id: 'platform:apikeys.manage', label: 'Manage API keys and OAuth clients', level: 'admin' },
 ];
 
 export const ROLE_PRESETS = ['Owner', 'Admin', 'Manager', 'Staff', 'Viewer'] as const;

@@ -3,5 +3,6 @@ export const QUEUES = {
   provisionStep: 'provision-step',
   lifecycleSweep: 'lifecycle-sweep',
   tenantLifecycle: 'tenant-lifecycle',
+  backfill: 'metadata-backfill',
 } as const;
 export const ALL_QUEUES = Object.values(QUEUES);

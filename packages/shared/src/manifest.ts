@@ -45,6 +45,8 @@ export const Entity = z.object({
   events: z.array(eventType).min(1),
   fields: z.array(EntityField).min(1),
   default_sort: z.string().optional(),
+  /** field used as the record's title in links and pickers */
+  title_field: z.string().optional(),
 });
 export type Entity = z.infer<typeof Entity>;
 
@@ -124,6 +126,18 @@ export const Release = z.object({
   notes: z.string().default(''),
 });
 
+/**
+ * Link index declarations: when `on` is published, record a relation between two
+ * records (ids taken from event paths, e.g. `data.order_id`). No cross-app FKs needed.
+ */
+export const LinkDecl = z.object({
+  on: eventType,
+  from: z.object({ resource: z.string().regex(/^[a-z][a-z0-9_]*::[A-Z][A-Za-z0-9]*$/), id: z.string().regex(/^data(\.[a-z_][a-z0-9_]*)+$/) }),
+  to: z.object({ resource: z.string().regex(/^[a-z][a-z0-9_]*::[A-Z][A-Za-z0-9]*$/), id: z.string().regex(/^data(\.[a-z_][a-z0-9_]*)+$/) }),
+  rel: ident,
+});
+export type LinkDecl = z.infer<typeof LinkDecl>;
+
 export const Manifest = z.object({
   id: ident,
   name: z.string(),
@@ -152,6 +166,7 @@ export const Manifest = z.object({
     metrics: z.array(z.string()).default([]),
   }),
   permissions: z.array(ManifestPermission).min(1),
+  links: z.array(LinkDecl).default([]),
   config: z.record(z.string(), z.unknown()).default({}),
 });
 export type Manifest = z.infer<typeof Manifest>;
@@ -265,6 +280,18 @@ export function validateManifest(raw: unknown, migrationSources?: Record<string,
     if (t.command && !commands.has(t.command)) problems.push(`assistant tool ${t.name}: unknown command ${t.command}`);
     if (t.view && !m.views.some((v) => v.name === t.view)) problems.push(`assistant tool ${t.name}: unknown view ${t.view}`);
     if (t.command && t.risk === 'read') problems.push(`assistant tool ${t.name}: a command tool cannot be risk tier 'read'`);
+  }
+  for (const l of m.links) {
+    if (!published.has(l.on)) problems.push(`link ${l.rel}: event ${l.on} is not in events.publishes`);
+    if (!l.from.resource.startsWith(`${m.id}::`)) problems.push(`link ${l.rel}: from must be one of this app's resources`);
+    const ev = m.events.publishes.find((e) => e.type === l.on);
+    for (const path of [l.from.id, l.to.id]) {
+      const top = path.split('.')[1]!;
+      if (ev && ev.data.length && !ev.data.includes(top)) problems.push(`link ${l.rel}: ${l.on} has no data.${top}`);
+    }
+  }
+  for (const e of m.entities) {
+    if (e.title_field && !e.fields.some((f) => f.key === e.title_field)) problems.push(`entity ${e.name}: title_field ${e.title_field} is not a field`);
   }
   const versions = m.releases.map((r) => r.version);
   if (!versions.includes(m.version)) problems.push(`version ${m.version} has no release entry`);

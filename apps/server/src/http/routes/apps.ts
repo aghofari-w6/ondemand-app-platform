@@ -1,4 +1,4 @@
-import { action, authorize, CommandError, DeprovisionInput, FieldDefinitionInput, ProvisionInput } from '@aod/shared';
+import { action, authorize, CommandError, DeprovisionInput, ProvisionInput } from '@aod/shared';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { systemPrincipal } from '../../auth/principal.ts';
@@ -265,29 +265,6 @@ export function appRoutes(p: Platform) {
       const a = requireAuth(req);
       const q = parse(z.object({ app: z.string(), entity: z.string() }), req.query);
       return p.database.withTenant(a.tenantId, async (tx) => ({ fields: await fieldDefinitions(tx, q.app, q.entity) }));
-    });
-
-    app.post('/api/fields', async (req, reply) => {
-      const a = requirePermission(req, 'platform:fields.manage');
-      const input = parse(FieldDefinitionInput, req.body);
-      const ent = p.catalog.entity(input.app, input.entity);
-      if (!ent?.custom_fields) throw new CommandError(422, 'no_custom_fields', `${input.app}/${input.entity} does not support custom fields`);
-      if (ent.fields.some((f) => f.key === input.key)) throw new CommandError(409, 'field_exists', `${input.key} is a built-in field`);
-      if (input.type === 'select' && input.options.length === 0) throw new CommandError(422, 'invalid_input', 'a select field needs options');
-      const id = await p.database.withTenant(a.tenantId, async (tx) => {
-        const id = newId();
-        await tx
-          .insertInto('field_definition')
-          .values({ id, tenant_id: a.tenantId, app: input.app, entity: input.entity, key: input.key, label: input.label, type: input.type, options: input.options, required: input.required })
-          .execute()
-          .catch((e) => {
-            if (e?.code === '23505') throw new CommandError(409, 'field_exists', `${input.key} already exists`);
-            throw e;
-          });
-        await recordChange(p, tx, { tenantId: a.tenantId, actor: a.principal, action: 'platform:field.defined', resourceType: 'platform::FieldDefinition', resourceId: id, correlationId: correlationId(req), events: [{ type: 'field.defined', data: { app: input.app, entity: input.entity, key: input.key, type: input.type } }] });
-        return id;
-      });
-      return reply.code(201).send({ id });
     });
 
     // ------------------------------------------------------------ public inbound (e.g. carrier callbacks)

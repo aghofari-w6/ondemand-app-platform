@@ -1,12 +1,5 @@
-import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
-
-/** WCAG 2.1 AA check of the current page. */
-async function expectAccessible(page: Page, name: string) {
-  const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze();
-  const summary = r.violations.map((v) => `${v.id} (${v.impact}): ${v.nodes.map((n) => n.target.join(' ')).slice(0, 3).join(' | ')}`);
-  expect(summary, `axe violations on ${name}`).toEqual([]);
-}
+import { expectAccessible } from './helpers.ts';
 
 async function provision(page: Page, app: string) {
   await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Catalog' }).click();
