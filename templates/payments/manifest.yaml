@@ -1,0 +1,91 @@
+id: payments
+name: Payments
+description: Capture and refund payments through a payment provider (test mode in the prototype).
+package: Apps
+version: 1.0.0
+releases:
+  - version: 1.0.0
+    channel: stable
+    migrations: [20261101110001_payments.sql]
+dependencies:
+  requires: []
+  optional: [ordering, pos]
+
+entities:
+  - name: payment
+    label: Payment
+    resource: payments::Payment
+    table: pay_payment
+    custom_fields: true
+    default_sort: -created_at
+    events: [payment.captured, payment.failed, payment.refunded]
+    fields:
+      - { key: reference, label: Reference, type: text, searchable: true }
+      - { key: status, label: Status, type: select, options: [captured, failed, refunded], facet: true, sortable: true }
+      - { key: method, label: Method, type: select, options: [card, qris, ewallet], facet: true }
+      - { key: amount, label: Amount, type: money, sortable: true }
+      - { key: provider_ref, label: Provider ref, type: text, searchable: true }
+      - { key: created_at, label: Created, type: datetime, sortable: true }
+  - name: settings
+    label: Payment settings
+    resource: payments::Settings
+    table: pay_settings
+    read_permission: "payments:payment.read"
+    workspace: false
+    events: [payment_settings.updated]
+    fields:
+      - { key: fail_next_capture, label: Fail next capture, type: boolean }
+
+events:
+  publishes:
+    - { type: payment.captured, entity: payment, description: A payment was captured., data: [payment_id, reference, amount, currency, method, provider_ref] }
+    - { type: payment.failed, entity: payment, description: A capture was declined by the provider., data: [payment_id, reference, amount, currency, reason] }
+    - { type: payment.refunded, entity: payment, description: A payment was refunded., data: [payment_id, reference, amount] }
+    - { type: payment_settings.updated, entity: settings, description: Test-mode settings changed., data: [fail_next_capture] }
+  consumes:
+    - { type: sale.completed, consumer: pos_card_tenders, capability: pos_card_tenders_use_payments }
+
+commands:
+  - name: payment.capture
+    description: Capture a payment with the provider.
+    permission: payments:payment.capture
+    entity: payment
+    may_emit: [payment.captured, payment.failed]
+  - name: payment.refund
+    description: Refund a captured payment.
+    permission: payments:payment.refund
+    entity: payment
+    may_emit: [payment.refunded]
+  - name: settings.update
+    description: Change test-mode settings (e.g. make the next capture fail).
+    permission: payments:settings.manage
+    entity: settings
+    may_emit: [payment_settings.updated]
+
+views:
+  - { name: captured, label: Captured, entity: payment, filter: { status: [captured] } }
+  - { name: failed, label: Failed, entity: payment, filter: { status: [failed] } }
+  - { name: all, label: All payments, entity: payment, sort: -created_at }
+
+analytics:
+  metrics:
+    - { name: captured_amount, label: Captured amount, entity: payment, aggregate: sum, field: amount }
+
+assistant:
+  tools:
+    - { name: list_failed_payments, description: List failed payments., risk: read, view: failed }
+    - { name: refund_payment, description: Refund a payment., risk: high, command: payment.refund }
+
+telemetry:
+  spans: [payments.capture]
+  metrics: [payments_captures_total, payments_failures_total]
+
+permissions:
+  - { id: "payments:payment.read", label: See payments, level: read }
+  - { id: "payments:payment.capture", label: Capture payments, level: operate }
+  - { id: "payments:payment.refund", label: Refund payments, level: manage }
+  - { id: "payments:settings.manage", label: Change payment settings, level: admin }
+
+config:
+  currency: IDR
+  provider: fake

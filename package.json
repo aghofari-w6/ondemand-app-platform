@@ -1,0 +1,32 @@
+{
+  "name": "apps-on-demand",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.28.0",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "pnpm -r --parallel run typecheck",
+    "test": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:all": "vitest run",
+    "db:migrate": "pnpm --filter @aod/server run db:migrate",
+    "seed": "pnpm --filter @aod/server run seed",
+    "dev": "pnpm --parallel --filter @aod/server --filter @aod/web run dev",
+    "build": "pnpm --filter @aod/web run build && pnpm --filter @aod/server run build",
+    "start": "pnpm --filter @aod/server run start",
+    "e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
+    "@eslint/js": "^10.0.0",
+    "@playwright/test": "1.63.0",
+    "@types/node": "^24.0.0",
+    "eslint": "^10.14.0",
+    "globals": "^16.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "6.0.3",
+    "typescript-eslint": "^8.72.1",
+    "vitest": "^5.0.5"
+  }
+}

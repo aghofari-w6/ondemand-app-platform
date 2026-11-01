@@ -1,0 +1,45 @@
+# Apps-on-Demand platform configuration (prototype).
+# One file holds plans, trial limits, release channels and capability rules.
+
+trial:
+  days: 14
+  # tenants in `deleted` status are purged after this many days
+  purge_after_days: 30
+
+deprovision:
+  # data of a deprovisioned app is kept this long when mode = retain
+  retain_days: 30
+
+plans:
+  trial:
+    label: Trial
+    packages: [Apps]
+    app_slots: 3
+  starter:
+    label: Starter
+    packages: [Apps]
+    app_slots: 4
+  growth:
+    label: Growth
+    packages: [Apps, Analytics, Bot, Omnichannel]
+    app_slots: 12
+
+# Release channels: which manifest release each channel serves.
+channels:
+  ordering: { stable: 1.0.0, canary: 1.1.0 }
+  payments: { stable: 1.0.0 }
+  pos: { stable: 1.0.0 }
+  logistics: { stable: 1.0.0 }
+
+# Capability rules for app combinations. A rule is active for a tenant when all
+# `when_installed` apps are active; consumers tagged with the capability run only then.
+capabilities:
+  - id: pos_sales_to_orders
+    label: POS sales appear in Ordering
+    when_installed: [ordering, pos]
+  - id: shipments_track_orders
+    label: Logistics tracks Ordering orders
+    when_installed: [ordering, logistics]
+  - id: pos_card_tenders_use_payments
+    label: POS card tenders are captured by Payments
+    when_installed: [pos, payments]

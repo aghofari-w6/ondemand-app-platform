@@ -1,0 +1,99 @@
+id: logistics
+name: Logistics
+description: Ship orders with carriers and track deliveries, including carrier status callbacks.
+package: Apps
+version: 1.0.0
+releases:
+  - version: 1.0.0
+    channel: stable
+    migrations: [20261101130001_logistics.sql]
+dependencies:
+  requires: [ordering]
+  optional: []
+
+entities:
+  - name: shipment
+    label: Shipment
+    resource: logistics::Shipment
+    table: lgx_shipment
+    custom_fields: true
+    default_sort: -created_at
+    events: [shipment.created, shipment.status_changed, shipment.delivered, shipment.exception]
+    fields:
+      - { key: tracking_no, label: Tracking no., type: text, searchable: true, sortable: true }
+      - { key: order_number, label: Order, type: number, searchable: true, sortable: true }
+      - { key: carrier, label: Carrier, type: select, options: [jne, sicepat, gosend, internal], facet: true }
+      - { key: status, label: Status, type: select, options: [pending, picked_up, in_transit, out_for_delivery, delivered, exception], facet: true, sortable: true }
+      - { key: destination, label: Destination, type: text, pii: true, searchable: true }
+      - { key: created_at, label: Created, type: datetime, sortable: true }
+  - name: carrier_account
+    label: Carrier account
+    resource: logistics::CarrierAccount
+    table: lgx_carrier_account
+    read_permission: "logistics:carrier.manage"
+    workspace: false
+    events: [carrier_account.connected]
+    fields:
+      - { key: carrier, label: Carrier, type: text }
+
+events:
+  publishes:
+    - { type: shipment.created, entity: shipment, description: A shipment was created for an order., data: [shipment_id, order_id, order_number, carrier, tracking_no] }
+    - { type: shipment.status_changed, entity: shipment, description: A shipment moved to another status., data: [shipment_id, order_id, from, to, source, note] }
+    - { type: shipment.delivered, entity: shipment, description: A shipment was delivered., data: [shipment_id, order_id, delivered_at] }
+    - { type: shipment.exception, entity: shipment, description: A shipment hit an exception (failed delivery, damage, ...)., data: [shipment_id, order_id, reason] }
+    - { type: carrier_account.connected, entity: carrier_account, description: A carrier was connected for status callbacks., data: [carrier] }
+  consumes:
+    - { type: order.created, consumer: orders, capability: shipments_track_orders }
+    - { type: order.status_changed, consumer: orders, capability: shipments_track_orders }
+
+commands:
+  - name: shipment.create
+    description: Create a shipment for an order.
+    permission: logistics:shipment.create
+    entity: shipment
+    may_emit: [shipment.created]
+  - name: shipment.update_status
+    description: Move a shipment along its status flow (staff or carrier callback).
+    permission: logistics:shipment.update
+    entity: shipment
+    may_emit: [shipment.status_changed, shipment.delivered, shipment.exception]
+  - name: carrier.connect
+    description: Connect a carrier and issue its callback token.
+    permission: logistics:carrier.manage
+    entity: carrier_account
+    may_emit: [carrier_account.connected]
+
+views:
+  - { name: in_flight, label: In flight, entity: shipment, filter: { status: [pending, picked_up, in_transit, out_for_delivery] } }
+  - { name: exceptions, label: Exceptions, entity: shipment, filter: { status: [exception] } }
+  - { name: all, label: All shipments, entity: shipment, sort: -created_at }
+
+workflows:
+  templates:
+    - name: exception_alert
+      label: Flag shipment exceptions
+      trigger: shipment.exception
+      action: shipment.update_status
+
+analytics:
+  metrics:
+    - { name: shipments, label: Shipments, entity: shipment, aggregate: count }
+
+assistant:
+  tools:
+    - { name: list_exceptions, description: List shipments with exceptions., risk: read, view: exceptions }
+    - { name: update_shipment, description: Update a shipment's status., risk: low, command: shipment.update_status }
+
+telemetry:
+  spans: [logistics.carrier_callback]
+  metrics: [logistics_shipments_total, logistics_exceptions_total]
+
+permissions:
+  - { id: "logistics:shipment.read", label: See shipments, level: read }
+  - { id: "logistics:shipment.create", label: Create shipments, level: operate }
+  - { id: "logistics:shipment.update", label: Update shipment status, level: operate }
+  - { id: "logistics:carrier.manage", label: Connect carriers, level: admin }
+
+config:
+  carriers: [jne, sicepat, gosend, internal]

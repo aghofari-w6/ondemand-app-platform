@@ -1,0 +1,18 @@
+{
+  "name": "@aod/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./expr": "./src/expr/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "kysely": "^0.29.8",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
+  }
+}
