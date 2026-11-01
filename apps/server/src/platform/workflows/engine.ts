@@ -362,9 +362,15 @@ async function startRuns(p: Platform, tx: Tx, event: EventEnvelope) {
     else if (event.workflow_chain.includes(wf.id)) guard = 'loop guard: this workflow already ran earlier in the chain';
     else {
       const t = await tx.selectFrom('tenant').select('plan').executeTakeFirstOrThrow();
-      const limit = p.ports.billing.plan(t.plan)?.limits.workflow_runs_month ?? 0;
+      const limits = p.ports.billing.plan(t.plan)?.limits;
+      const limit = limits?.workflow_runs_month ?? 0;
       const used = await tx.selectFrom('workflow_run').select(sql<number>`count(*)::int`.as('n')).where('status', '<>', 'cancelled').where('started_at', '>=', sql<Date>`date_trunc('month', now())`).executeTakeFirstOrThrow();
+      // Fan-out budget: k workflows re-emitting each other's triggers stay within this many
+      // runs per correlation chain, whatever the hop limit allows.
+      const chainLimit = limits?.workflow_runs_per_chain ?? 0;
+      const inChain = await tx.selectFrom('workflow_run').select(sql<number>`count(*)::int`.as('n')).where('correlation_id', '=', event.correlation_id).where('status', '<>', 'cancelled').executeTakeFirstOrThrow();
       if (used.n >= limit) guard = `plan limit: ${limit} workflow runs per month`;
+      else if (inChain.n >= chainLimit) guard = `chain limit: ${chainLimit} workflow runs for one change (plan limit workflow_runs_per_chain)`;
     }
     // The user whose change started this chain may not approve its approval requests.
     const initiator = guard

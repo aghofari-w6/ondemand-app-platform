@@ -201,6 +201,7 @@ export interface PlanLimits {
   workflows: number;
   workflow_nodes: number;
   workflow_runs_month: number;
+  workflow_runs_per_chain: number;
 }
 
 /** Billing provider later; plans from config/platform.yaml now. */

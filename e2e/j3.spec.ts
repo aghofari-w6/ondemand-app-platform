@@ -101,6 +101,17 @@ test('J3: build an approval-gated refund on the canvas, test it, run it, approve
   await expect(nodeOn('Notify store')).toBeVisible();
   await page.getByRole('button', { name: 'Auto-layout' }).click();
   await expectAccessible(page, 'workflow canvas');
+  // Every port has a 44 px pointer target (canvas units = screen px at 100% zoom), and
+  // ports are at least 44 px apart, so neighbouring targets never overlap.
+  const ports = await nodeOn('Manager approval').evaluate((node) => {
+    const handles = [...node.querySelectorAll('.react-flow__handle.source')] as HTMLElement[];
+    const target = getComputedStyle(handles[0]!, '::before');
+    const tops = handles.map((h) => h.parentElement!.offsetTop + h.offsetTop);
+    return { width: target.width, height: target.height, gaps: tops.slice(1).map((t, i) => t - tops[i]!) };
+  });
+  expect(ports.width).toBe('44px');
+  expect(ports.height).toBe('44px');
+  expect(ports.gaps.every((g) => g >= 44)).toBe(true);
 
   // ---- Rejected branch in the outline view, keyboard only
   await page.getByRole('button', { name: 'Outline (keyboard)' }).focus();

@@ -253,7 +253,10 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
   by the consumer. Failed runs keep their state for retry from the failed node.
 - **Loop protection:** events written by a run carry `origin: workflow`, the run's hop and
   chain; an event at hop 5, or whose chain holds the workflow, records a cancelled run
-  with the reason instead of starting one.
+  with the reason instead of starting one. One change (correlation chain) starts at most
+  `workflow_runs_per_chain` runs, a plan limit in `config/platform.yaml` (trial 20,
+  starter 50, growth 200), which bounds fan-out when several workflows re-emit each
+  other's triggers.
 - **Approvals** (`platform/approvals.ts`): a platform service (workflows now, assistant
   tools in E). Approver roles, quorum (any rejection rejects), expiry; every decision is
   audited under the request's correlation id. The user whose change started the chain
