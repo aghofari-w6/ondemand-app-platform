@@ -61,6 +61,8 @@ const Plan = z.object({
     workflows: z.int().nonnegative(),
     workflow_nodes: z.int().positive(),
     workflow_runs_month: z.int().nonnegative(),
+    /** runs one correlation chain may start (fan-out budget; hops are capped separately) */
+    workflow_runs_per_chain: z.int().positive(),
   }),
 });
 const PlatformConfig = z.object({

@@ -295,6 +295,30 @@ describe('engine guarantees', () => {
     await disable(w1);
   });
 
+  it('chain limit: one change starts at most workflow_runs_per_chain runs (configurable per plan)', async () => {
+    const limits = p.config.plans.growth!.limits;
+    const before = limits.workflow_runs_per_chain;
+    limits.workflow_runs_per_chain = 3;
+    try {
+      const mk = (tag: string) =>
+        orderGraph([node('again', 'command', { app: 'ordering', command: 'order.create', input: { channel: 'phone', customer_name: tag, lines: [{ sku: 'C', name: 'Chain', qty: 1, unit_price: 2 }] } })], [edge('trigger', 'out', 'again')], 'trigger.data.total == 7001 or trigger.data.total == 2');
+      const a = await publish('Chain A', mk('a'));
+      const b = await publish('Chain B', mk('b'));
+      const r = await cmd(p, t, 'ordering', 'order.create', { channel: 'web', lines: [{ sku: 'C', name: 'C', qty: 1, unit_price: 7001 }] });
+      await settle();
+      const ev = await inTenant((tx) => tx.selectFrom('event_log').select('payload').where('aggregateid', '=', r.body.id).where('type', '=', 'order.created').executeTakeFirstOrThrow());
+      const corr = (ev.payload as EventEnvelope).correlation_id;
+      const chain = await inTenant((tx) => tx.selectFrom('workflow_run').select(['status', 'error']).where('correlation_id', '=', corr).execute());
+      // Without the budget this chain runs 4 times (2 workflows × 2 hops before the loop guard).
+      expect(chain.filter((x) => x.status !== 'cancelled')).toHaveLength(3);
+      expect(chain.some((x) => x.status === 'cancelled' && x.error!.startsWith('chain limit: 3'))).toBe(true);
+      await disable(a);
+      await disable(b);
+    } finally {
+      limits.workflow_runs_per_chain = before;
+    }
+  });
+
   it('exactly once: a re-delivered trigger starts one run; a node processed twice runs its command once', async () => {
     const g = orderGraph([node('adv', 'command', { app: 'ordering', command: 'order.advance', input: { id: '{{ trigger.data.order_id }}', version: 1 } })], [edge('trigger', 'out', 'adv')], 'trigger.data.total == 5001');
     const w = await publish('Advance kiosk orders', g);

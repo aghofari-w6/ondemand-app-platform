@@ -68,7 +68,7 @@ const WfNode = memo(function WfNode({ data, selected }: NodeProps<Node<WfNodeDat
   const ring = problems.length ? 'border-bad' : overlay ? (statusRing[overlay.status] ?? 'border-line') : 'border-line';
   return (
     <div className={`w-56 rounded-lg border-2 bg-white text-left shadow-sm ${ring} ${selected ? 'outline-2 outline-offset-2 outline-accent' : ''}`}>
-      {node.type !== 'trigger' && <Handle type="target" position={Position.Left} className="!h-3 !w-3 !border-2 !border-white !bg-muted" />}
+      {node.type !== 'trigger' && <Handle type="target" position={Position.Left} className="aod-port !h-3.5 !w-3.5 !border-2 !border-white !bg-muted" />}
       <div className="border-b border-line px-3 py-1.5 text-xs font-medium text-muted">{NODE_LABELS[node.type] ?? node.type}</div>
       <div className="px-3 py-2">
         <p className="text-sm font-semibold text-ink">{node.name}</p>
@@ -80,11 +80,12 @@ const WfNode = memo(function WfNode({ data, selected }: NodeProps<Node<WfNodeDat
         )}
         {problems.length > 0 && <p className="mt-1 text-xs font-medium text-bad">{problems.length === 1 ? problems[0] : `${problems.length} problems`}</p>}
       </div>
-      <div className="flex flex-col gap-1 pb-2">
+      <div className="flex flex-col pb-1">
         {ports.map((port) => (
-          <div key={port} className="relative flex justify-end pr-4 text-xs text-muted">
+          // Rows are 44 px apart so neighbouring ports' 44 px hit areas never overlap.
+          <div key={port} className="relative flex min-h-11 items-center justify-end pr-4 text-xs text-muted">
             {port}
-            <Handle type="source" id={port} position={Position.Right} className="!h-3 !w-3 !border-2 !border-white !bg-accent" style={{ top: '50%' }} />
+            <Handle type="source" id={port} position={Position.Right} className="aod-port !h-3.5 !w-3.5 !border-2 !border-white !bg-accent" style={{ top: '50%' }} />
           </div>
         ))}
       </div>
