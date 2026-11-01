@@ -1,6 +1,6 @@
 # Apps-on-Demand prototype: plan for phases 3–6 (Milestones C–F)
 
-Status: **v0.2, 2026-11-01.** The decisions in section 8 are answered. Written after
+Status: **v0.3, 2026-11-01.** All decisions in section 8 are answered except the time budget. Written after
 Milestones A (week 0 + phase 1) and B (phase 2) were merged.
 
 > The original implementation plan (`prototype-implementation-plan.md` v0.2) is not in this
@@ -238,11 +238,16 @@ check. **Screens replaced:** Dashboards, Reports, Data governance.
      `WHERE tenant_id = … ORDER BY embedding <=> $q` and pgvector's iterative index scans
      so tenant filtering keeps recall. Tests check that a tenant can never retrieve
      another tenant's chunks.
-   - **Embeddings (default; decide with E's kickoff if you prefer otherwise).** An
-     `Embeddings` adapter inside the Retriever port. The default is an in-process
-     open-source model (transformers.js / ONNX; no data leaves the container, no extra
-     vendor key). A Voyage AI API client, Anthropic's recommended embedding partner, is
-     the alternative. CI uses a deterministic fake embedder.
+   - **Embeddings: Voyage AI** (decision 7), as an API client behind an `Embeddings`
+     adapter inside the Retriever port.
+     - The API key lives in the deployment's secret store, never in the repo.
+     - Documents and queries are embedded with the matching input types.
+     - The model name and vector dimension come from config; the `vector(n)` column size
+       follows the chosen model.
+     - Calls go through the outbound policy, with retries and backoff, and batched
+       backfills respect Voyage rate limits.
+     - Per-tenant usage feeds the assistant cost limits and F's usage meters.
+     - CI and local runs use a deterministic fake embedder (decision 6: no live calls yet).
    - Re-embedding runs as backfill jobs when a source changes.
 3. **Channels (Channel port, real adapters; decision 4).**
    - **Telegram:** Bot API webhook with secret-token verification, `sendMessage`, and
@@ -254,8 +259,13 @@ check. **Screens replaced:** Dashboards, Reports, Data governance.
        Pub/Sub is a later option).
      - Outbound: `users.messages.send` with correct threading (`threadId`, `In-Reply-To`,
        `References`). Attachments go to Files.
-     - Google restricted-scope verification is needed before production; tracked in
-       section 10.
+     - The OAuth client lives in the product owner's **own Google Cloud project**
+       (decision 8).
+     - While that project's consent screen is in *Testing* status, only listed test users
+       can connect and refresh tokens expire after 7 days. The adapter must handle expiry
+       with a clear "reconnect Gmail" prompt.
+     - Google restricted-scope verification is needed before any production use; tracked
+       in section 10.
    - **Web chat widget (live chat):**
      - An embeddable `<script>` served by the platform, with per-tenant widget keys and
        allowed origins (CORS + `frame-ancestors`).
@@ -377,13 +387,10 @@ All against the iPaymu mock, per decision 6.
 | 4 | Channels besides Telegram | **Gmail and a web chat widget**; no SMS | Section 6.3; E grows to 5 weeks |
 | 5 | Billing provider (test mode) | **iPaymu** (sandbox) | Section 7.1 |
 | 6 | Live checks with real Telegram/Claude APIs | **Not yet** | Mocks and fakes only; live-readiness checklists in section 10 |
+| 7 | Embeddings model | **Voyage AI** | Section 6.2; fake embedder in CI |
+| 8 | Google Cloud project for Gmail OAuth | **The product owner's personal project** | Section 6.3; Testing-mode limits handled |
 
-Still open; the default applies unless changed:
-- **Embeddings model:** default in-process open-source model; Voyage AI as the alternative
-  (section 6.2). Decide at E's kickoff.
-- **Google Cloud project for Gmail OAuth:** who owns the OAuth client and its
-  verification. Needed before any live Gmail check; not needed for E's mock-based
-  acceptance.
+Still open:
 - **The 19-week budget:** accept ~22 weeks, or apply the cut lines in section 1.
 
 ## 9. Risks
@@ -395,7 +402,8 @@ Still open; the default applies unless changed:
 | Workflow engine grows into a general orchestrator | C | Fixed node types; anything else is a `code` node (Sandbox) or a Hub connector |
 | Assistant does something the user didn't intend | E | Tools run as the user; risk tiers; approvals for `high`; injection tests; full audit |
 | Cross-tenant leakage through vector search | E | Chunks under RLS; tenant-filtered ANN queries; a two-tenant retrieval test added to the isolation suite |
-| Embeddings model too heavy for one container | E | Small model, batched backfill jobs, concurrency cap; swap to the Voyage API client if needed |
+| Voyage AI rate limits or outage stall re-embedding | E | Batched backfill jobs with backoff; full-text search still answers while embeddings catch up |
+| Gmail Testing-mode limits (test users only, 7-day refresh tokens) | E | Reconnect prompt; acceptable for the prototype; verification before production |
 | Gmail restricted scopes and verification delay a launch | E | Mock-based acceptance now; verification tracked in section 10 |
 | Widget abuse (spam, origin spoofing) | E | Allowed origins, per-visitor rate limits, HMAC identity verification, size caps |
 | iPaymu API details differ from assumptions | F | Verify against current docs at F's kickoff; the adapter is isolated behind the Billing port; mock built from the documented shapes |
@@ -412,8 +420,15 @@ Still open; the default applies unless changed:
   - A test bot.
   - `setWebhook` with a secret token.
   - Send and receive, and verify a bad secret token is rejected.
+- **Voyage AI:**
+  - An API key in the secret store.
+  - Embed a sample corpus and check the dimension matches the `vector(n)` column.
+  - Retrieval quality spot check against the fake embedder's test set.
+  - Rate-limit and backoff behaviour.
 - **Gmail:**
-  - A Google Cloud project and OAuth client; the restricted-scope verification plan.
+  - An OAuth client in the product owner's personal Google Cloud project, with the test
+    users added on the consent screen.
+  - The restricted-scope verification plan, needed only before production.
   - A test mailbox.
   - Inbound polling, threading and outbound send verified.
   - Revoking access from Google's side handled.
