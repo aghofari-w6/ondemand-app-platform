@@ -57,6 +57,7 @@ jobs:
       - name: Start Redpanda (Kafka) and SFTP test containers
         run: |
           SFTP_PASSWORD=$(openssl rand -hex 12)
+          echo "::add-mask::$SFTP_PASSWORD"
           echo "TEST_SFTP_PASSWORD=$SFTP_PASSWORD" >> "$GITHUB_ENV"
           docker run -d --name redpanda -p 9092:9092 docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
             redpanda start --mode dev-container --smp 1 --overprovisioned \
