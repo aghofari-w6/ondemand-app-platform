@@ -285,6 +285,8 @@ export async function executeRecordWrite(p: Platform, req: RecordWrite, existing
     let id = req.id ?? newId();
     let version = 1;
     let stored: Record<string, unknown> | null = null;
+    /** a deleted record's public (non-PII) values, so consumers can reverse what it counted */
+    let previous: Record<string, unknown> | null = null;
     let eventType: string;
     if (req.op === 'create') {
       if (req.id && (await tx.selectFrom('custom_record').select('id').where('id', '=', req.id).executeTakeFirst())) throw new CommandError(409, 'exists', 'a record with this id exists');
@@ -304,6 +306,7 @@ export async function executeRecordWrite(p: Platform, req: RecordWrite, existing
       if (req.op === 'delete') {
         await tx.deleteFrom('custom_record').where('id', '=', id).execute();
         eventType = 'record.deleted';
+        previous = publicData(entity, decryptDefined(p.ports.vault, req.tenantId, target, defs, cur.data));
       } else {
         const existing = decryptDefined(p.ports.vault, req.tenantId, target, defs, cur.data);
         const values = validateCustomValues(defs, req.values ?? {}, existing);
@@ -326,7 +329,7 @@ export async function executeRecordWrite(p: Platform, req: RecordWrite, existing
     const plain = stored ? decryptDefined(p.ports.vault, req.tenantId, target, defs, stored) : null;
     const [env] = await writeOutbox(
       tx,
-      [{ type: eventType, aggregateType: target, aggregateId: id, data: { entity: req.entity, record_id: id, version: req.op === 'delete' ? null : version, values: plain ? publicData(entity, plain) : null, changed: Object.keys(req.values ?? {}) } }],
+      [{ type: eventType, aggregateType: target, aggregateId: id, data: { entity: req.entity, record_id: id, version: req.op === 'delete' ? null : version, values: plain ? publicData(entity, plain) : null, changed: Object.keys(req.values ?? {}), ...(previous ? { previous_values: previous } : {}) } }],
       { tenantId: req.tenantId, app: 'custom', correlationId: req.correlationId, causationId: req.causationId ?? null, traceparent: p.ports.telemetry.traceparent(), origin: req.origin ?? 'user', workflowHop: req.workflowHop ?? 0, workflowChain: req.workflowChain ?? [], newId },
     );
     await syncLinks(p, tx, req.tenantId, entity, id, req.op === 'delete' ? null : plain, env!.id);

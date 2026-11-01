@@ -194,8 +194,14 @@ function DsrPanel() {
     e.preventDefault();
     setMsg(null);
     try {
-      const r = await api<{ found: unknown[]; download_url: string | null }>('/api/governance/dsr', { body: { kind, subject } });
-      setMsg({ tone: 'success', text: kind === 'export' ? `Found ${r.found.length} record(s). The export is ready.` : `Erased personal data from ${r.found.length} record(s). Amounts and the audit log are kept.`, link: r.download_url });
+      const r = await api<{ status: string; found: { found_by: string; erased?: boolean }[]; problems: string[]; download_url: string | null }>('/api/governance/dsr', { body: { kind, subject } });
+      const matched = r.found.filter((f) => f.found_by === 'match').length;
+      const linked = r.found.length - matched;
+      const text =
+        kind === 'export'
+          ? `Found ${matched} record(s)${linked ? ` and ${linked} linked record(s), exported without their personal data` : ''}. The export is ready.`
+          : `Erased personal data from ${r.found.filter((f) => f.erased).length} record(s). Amounts and the audit log are kept${linked ? `; ${linked} linked record(s) were left as they are` : ''}.`;
+      setMsg({ tone: r.status === 'partial' ? 'error' : 'success', text: r.status === 'partial' ? `${text} Not complete: ${r.problems.join('; ')}` : text, link: r.download_url });
       setSubject('');
       await qc.invalidateQueries({ queryKey: ['gov-dsr'] });
     } catch (err) {

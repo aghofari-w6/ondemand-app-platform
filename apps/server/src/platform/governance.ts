@@ -100,7 +100,8 @@ export async function accessReview(p: Platform, tx: Tx) {
     roles: roles.flatMap((r) => {
       const d = authorize({ ...r.principal, tenantId: 't' }, action(f.readPermission), { type: f.resource, id: '*', tenantId: 't' });
       if (d.decision === 'deny') return [];
-      const access = d.fields[f.field] ?? 'write';
+      // A field rule narrows access; without one the role reads the field (the review is about reading).
+      const access = d.fields[f.field] ?? 'read';
       return access === 'hidden' ? [] : [{ role: r.id, name: r.name, access }];
     }),
     // Machine credentials carry scopes, not roles: they see every field their scopes allow.
@@ -141,8 +142,33 @@ export async function saveRetentionPolicy(p: Platform, tx: Tx, tenantId: string,
   return { id: row.id };
 }
 
-/** Anonymises the PII columns of the given app rows (in the caller's transaction). */
-async function anonymiseAppRows(tx: Tx, fields: PiiField[], ids: string[], marker: string) {
+interface Why {
+  /** retention policy id or data subject request id */
+  reason: string;
+  actor: Pick<Principal, 'type' | 'id'>;
+  correlationId: string;
+}
+
+/** Audits one anonymised record and publishes `governance.anonymised` (ids and field keys, never values). */
+async function recordAnonymised(p: Platform, tx: Tx, tenantId: string, target: string, resource: string, recordId: string, fields: string[], why: Why) {
+  await recordChange(p, tx, {
+    tenantId,
+    actor: why.actor,
+    action: 'platform:governance.anonymised',
+    resourceType: resource,
+    resourceId: recordId,
+    correlationId: why.correlationId,
+    events: [{ type: 'governance.anonymised', data: { target, record_id: recordId, fields, reason: why.reason } }],
+    data: { fields, reason: why.reason },
+  });
+}
+
+/**
+ * Anonymises the PII columns of the given app rows, in the caller's transaction, and
+ * records each one (audit + event). Only PII columns change: amounts, statuses and ids
+ * stay, so accounting is intact.
+ */
+async function anonymiseAppRows(p: Platform, tx: Tx, tenantId: string, fields: PiiField[], ids: string[], marker: string, why: Why) {
   if (!ids.length || !fields.length) return 0;
   const table = fields[0]!.table;
   const cols = fields.filter((f) => f.storage === 'column').map((f) => f.field);
@@ -151,21 +177,28 @@ async function anonymiseAppRows(tx: Tx, fields: PiiField[], ids: string[], marke
   for (const c of cols) set[c] = sql`CASE WHEN ${sql.ref(c)} IS NULL THEN NULL ELSE ${marker} END`;
   if (customKeys.length) set.custom = sql`custom - ${sql.val(customKeys)}::text[]`;
   // Table and column names come from manifests (validated), never from input.
-  const r = await tx.updateTable(table).set(set).where('id', 'in', ids).executeTakeFirst();
-  return Number(r.numUpdatedRows);
+  const changed = await tx.updateTable(table).set(set).where('id', 'in', ids).returning('id').execute();
+  for (const r of changed) await recordAnonymised(p, tx, tenantId, fields[0]!.target, fields[0]!.resource, r.id as string, fields.map((f) => f.field), why);
+  return changed.length;
 }
 
 /**
- * Empties a custom record's PII fields through the record pipeline. A required field
- * cannot be emptied there (validation), so the record falls back to removing the keys
- * directly; the run is audited by the caller.
+ * Empties a custom record's PII fields through the record pipeline. When the data model
+ * itself refuses (a required PII field, a rule that needs it), erasure still wins: the
+ * keys are removed directly, with the version checked and the change audited. Any other
+ * error (a version conflict, a database error) is rethrown.
  */
-async function clearRecordPii(p: Platform, tenantId: string, actor: Principal, entity: string, id: string, version: number, keys: string[], correlationId: string) {
+async function clearRecordPii(p: Platform, tenantId: string, entity: string, id: string, version: number, keys: string[], why: Why & { principal: Principal }) {
   try {
-    await executeRecordWrite(p, { tenantId, principal: actor, entity, op: 'update', id, version, values: Object.fromEntries(keys.map((k) => [k, null])), origin: 'system', correlationId });
+    await executeRecordWrite(p, { tenantId, principal: why.principal, entity, op: 'update', id, version, values: Object.fromEntries(keys.map((k) => [k, null])), origin: 'system', correlationId: why.correlationId });
+    await p.database.withTenant(tenantId, (tx) => recordAnonymised(p, tx, tenantId, recordTarget(entity), customResource(entity), id, keys, why));
   } catch (e) {
-    p.log.warn({ err: String(e), record: id }, 'governance: clearing PII through the record pipeline failed; removing the fields directly');
-    await p.database.withTenant(tenantId, (tx) => tx.updateTable('custom_record').set({ data: sql`data - ${sql.val(keys)}::text[]`, version: sql`version + 1`, updated_at: new Date() }).where('id', '=', id).execute());
+    if (!(e instanceof CommandError && (e.code === 'invalid_custom_fields' || e.code === 'rule_failed'))) throw e;
+    await p.database.withTenant(tenantId, async (tx) => {
+      const r = await tx.updateTable('custom_record').set({ data: sql`data - ${sql.val(keys)}::text[]`, version: sql`version + 1`, updated_at: new Date() }).where('id', '=', id).where('version', '=', version).returning('id').executeTakeFirst();
+      if (!r) throw new CommandError(409, 'version_conflict', 'the record changed');
+      await recordAnonymised(p, tx, tenantId, recordTarget(entity), customResource(entity), id, keys, why);
+    });
   }
 }
 
@@ -180,59 +213,62 @@ export async function runRetention(p: Platform, tenantId: string, opts: { policy
   const results = [];
   for (const pol of policies) {
     const cutoff = new Date(Date.now() - pol.after_days * 86_400_000);
+    const why = { reason: `retention:${pol.id}`, actor, principal: actor, correlationId: opts.correlationId };
     let affected = 0;
+    let failed = 0;
+    const pii = (await p.database.withTenant(tenantId, (tx) => piiInventory(p, tx))).filter((f) => f.target === pol.target);
     if (pol.target.startsWith('custom:')) {
       const entity = pol.target.slice('custom:'.length);
-      const pii = (await p.database.withTenant(tenantId, (tx) => piiInventory(p, tx))).filter((f) => f.target === pol.target);
+      // Keyset cursor: a record that fails is skipped, never selected again in this run.
+      let after = '00000000-0000-0000-0000-000000000000';
       for (;;) {
         const batch = await p.database.withTenant(tenantId, (tx) =>
           tx
             .selectFrom('custom_record')
-            .select(['id', 'version', 'data'])
+            .select(['id', 'version'])
             .where('entity', '=', entity)
             .where('created_at', '<', cutoff)
+            .where('id', '>', after)
             // anonymise: only records that still hold a PII value
-            .$if(pol.action === 'anonymise', (q) => q.where((eb) => eb.or(pii.map((f) => eb(sql`data ->> ${f.field}`, 'is not', null)))))
+            .$if(pol.action === 'anonymise' && pii.length > 0, (q) => q.where((eb) => eb.or(pii.map((f) => eb(sql`data ->> ${f.field}`, 'is not', null)))))
             .orderBy('id')
             .limit(BATCH)
             .execute(),
         );
-        let n = 0;
         for (const r of batch) {
-          if (pol.action === 'purge') {
-            await executeRecordWrite(p, { tenantId, principal: actor, entity, op: 'delete', id: r.id, version: r.version, origin: 'system', correlationId: opts.correlationId });
-          } else {
-            await clearRecordPii(p, tenantId, actor, entity, r.id as string, r.version as number, pii.map((f) => f.field), opts.correlationId);
+          try {
+            if (pol.action === 'purge') await executeRecordWrite(p, { tenantId, principal: actor, entity, op: 'delete', id: r.id, version: r.version, origin: 'system', correlationId: opts.correlationId });
+            else await clearRecordPii(p, tenantId, entity, r.id as string, r.version as number, pii.map((f) => f.field), why);
+            affected++;
+          } catch (e) {
+            failed++;
+            p.log.warn({ err: String(e), record: r.id, policy: pol.id }, 'retention: a record could not be processed; it is retried next run');
           }
-          n++;
         }
-        affected += n;
-        if (batch.length < BATCH || affected >= MAX_PER_RUN) break;
+        if (batch.length) after = batch.at(-1)!.id as string;
+        if (batch.length < BATCH || affected + failed >= MAX_PER_RUN) break;
       }
-    } else {
-      const pii = (await p.database.withTenant(tenantId, (tx) => piiInventory(p, tx))).filter((f) => f.target === pol.target);
-      if (pii.length) {
-        const cols = pii.filter((f) => f.storage === 'column').map((f) => f.field);
-        const customKeys = pii.filter((f) => f.storage === 'custom').map((f) => f.field.slice('custom.'.length));
-        for (;;) {
-          const n = await p.database.withTenant(tenantId, async (tx) => {
-            // Rows past the cutoff that still hold any PII value.
-            const ids = await tx
-              .selectFrom(pii[0]!.table)
-              .select('id')
-              .where('created_at', '<', cutoff)
-              .where((eb) => eb.or([...cols.map((c) => eb.and([eb(sql.ref(c), 'is not', null), eb(sql.ref(c), '<>', ANON)])), ...customKeys.map((k) => eb(sql<boolean>`custom ? ${k}`, '=', true))]))
-              .orderBy('id')
-              .limit(BATCH)
-              .execute();
-            return anonymiseAppRows(tx, pii, ids.map((i) => i.id as string), ANON);
-          });
-          affected += n;
-          if (n < BATCH || affected >= MAX_PER_RUN) break;
-        }
+    } else if (pii.length) {
+      const cols = pii.filter((f) => f.storage === 'column').map((f) => f.field);
+      const customKeys = pii.filter((f) => f.storage === 'custom').map((f) => f.field.slice('custom.'.length));
+      for (;;) {
+        // Each batch is one transaction: the rows and their audit entries commit together.
+        const n = await p.database.withTenant(tenantId, async (tx) => {
+          const ids = await tx
+            .selectFrom(pii[0]!.table)
+            .select('id')
+            .where('created_at', '<', cutoff)
+            .where((eb) => eb.or([...cols.map((c) => eb.and([eb(sql.ref(c), 'is not', null), eb(sql.ref(c), '<>', ANON)])), ...customKeys.map((k) => eb(sql<boolean>`custom ? ${k}`, '=', true))]))
+            .orderBy('id')
+            .limit(BATCH)
+            .execute();
+          return anonymiseAppRows(p, tx, tenantId, pii, ids.map((i) => i.id as string), ANON, why);
+        });
+        affected += n;
+        if (n < BATCH || affected >= MAX_PER_RUN) break;
       }
     }
-    const result = { target: pol.target, action: pol.action, records: affected, cutoff: cutoff.toISOString() };
+    const result = { target: pol.target, action: pol.action, records: affected, failed, cutoff: cutoff.toISOString() };
     await p.database.withTenant(tenantId, async (tx) => {
       await tx.updateTable('retention_policy').set({ last_run_at: new Date(), last_result: JSON.stringify(result) }).where('id', '=', pol.id).execute();
       await recordChange(p, tx, { tenantId, actor, action: 'platform:retention.applied', resourceType: RESOURCE, resourceId: pol.id, correlationId: opts.correlationId, events: [{ type: 'governance.retention_applied', data: { policy_id: pol.id, ...result } }], data: result });
@@ -263,7 +299,10 @@ function matcher(subject: string) {
   const isEmail = subject.includes('@');
   const want = isEmail ? subject.trim().toLowerCase() : digits(subject).slice(-PHONE_DIGITS);
   if (!isEmail && want.length < PHONE_DIGITS) throw new CommandError(422, 'invalid_subject', `give an email address or a phone number (at least ${PHONE_DIGITS} digits)`);
-  return { isEmail, want, test: (v: unknown) => typeof v === 'string' && (isEmail ? v.trim().toLowerCase() === want : digits(v).length >= PHONE_DIGITS && digits(v).slice(-PHONE_DIGITS) === want) };
+  // A phone only matches a phone-like value (digits and + - ( ) . spaces), never an address
+  // or a note that happens to contain the same digits.
+  const phoneLike = (v: string) => /^[\d+\-(). ]+$/.test(v.trim());
+  return { isEmail, want, test: (v: unknown) => typeof v === 'string' && (isEmail ? v.trim().toLowerCase() === want : phoneLike(v) && digits(v).length >= PHONE_DIGITS && digits(v).slice(-PHONE_DIGITS) === want) };
 }
 
 interface Found {
@@ -272,15 +311,19 @@ interface Found {
   id: string;
   /** PII fields this record holds */
   fields: string[];
+  /** match: the record holds the subject's email/phone; link: it is linked to a match (third-party data) */
   via: 'match' | 'link';
 }
 
-async function findSubject(p: Platform, tx: Tx, tenantId: string, subject: string): Promise<Found[]> {
+async function findSubject(p: Platform, tx: Tx, tenantId: string, subject: string): Promise<{ found: Found[]; truncated: boolean }> {
   const m = matcher(subject);
   const inv = await piiInventory(p, tx);
   const found = new Map<string, Found>();
+  let truncated = false;
   const add = (f: Found) => {
-    if (found.size < MAX_FOUND && !found.has(`${f.target}|${f.id}`)) found.set(`${f.target}|${f.id}`, f);
+    if (found.has(`${f.target}|${f.id}`)) return;
+    if (found.size >= MAX_FOUND) truncated = true;
+    else found.set(`${f.target}|${f.id}`, f);
   };
   const byTarget = new Map<string, PiiField[]>();
   for (const f of inv) byTarget.set(f.target, [...(byTarget.get(f.target) ?? []), f]);
@@ -289,7 +332,11 @@ async function findSubject(p: Platform, tx: Tx, tenantId: string, subject: strin
     if (fields[0]!.storage === 'record') {
       const entity = target.slice('custom:'.length);
       let after = '00000000-0000-0000-0000-000000000000';
-      for (let scanned = 0; scanned < MAX_SCAN; ) {
+      for (let scanned = 0; ; ) {
+        if (scanned >= MAX_SCAN) {
+          truncated = true;
+          break;
+        }
         const rows = await tx.selectFrom('custom_record').select(['id', 'data']).where('entity', '=', entity).where('id', '>', after).orderBy('id').limit(BATCH).execute();
         for (const r of rows) {
           const data = r.data as Record<string, unknown>;
@@ -307,15 +354,19 @@ async function findSubject(p: Platform, tx: Tx, tenantId: string, subject: strin
       const rows = await tx
         .selectFrom(fields[0]!.table)
         .select('id')
-        .where((eb) => eb.or(cols.map((c) => (m.isEmail ? eb(sql`lower(trim(${sql.ref(c)}))`, '=', m.want) : eb(sql`right(regexp_replace(${sql.ref(c)}, '\\D', '', 'g'), ${PHONE_DIGITS})`, '=', m.want)))))
-        .limit(MAX_FOUND)
+        .where((eb) => eb.or(cols.map((c) => (m.isEmail ? eb(sql`lower(trim(${sql.ref(c)}))`, '=', m.want) : eb.and([eb(sql`right(regexp_replace(${sql.ref(c)}, '\\D', '', 'g'), ${PHONE_DIGITS})`, '=', m.want), eb(sql`${sql.ref(c)} ~ '^[0-9+(). -]+$'`, '=', true)])))))
+        .limit(MAX_FOUND + 1)
         .execute();
       for (const r of rows) add({ target, resource: fields[0]!.resource, id: r.id as string, fields: allFields, via: 'match' });
     }
     const customKeys = fields.filter((f) => f.storage === 'custom').map((f) => f.field.slice('custom.'.length));
     if (customKeys.length) {
       let after = '00000000-0000-0000-0000-000000000000';
-      for (let scanned = 0; scanned < MAX_SCAN; ) {
+      for (let scanned = 0; ; ) {
+        if (scanned >= MAX_SCAN) {
+          truncated = true;
+          break;
+        }
         const rows = await tx.selectFrom(fields[0]!.table).select(['id', 'custom']).where('id', '>', after).orderBy('id').limit(BATCH).execute();
         for (const r of rows) {
           const c = (r.custom ?? {}) as Record<string, unknown>;
@@ -331,7 +382,8 @@ async function findSubject(p: Platform, tx: Tx, tenantId: string, subject: strin
   const matched = [...found.values()];
   if (matched.length) {
     const ids = matched.map((f) => f.id);
-    const links = await tx.selectFrom('record_link').select(['from_type', 'from_id', 'to_type', 'to_id']).where((eb) => eb.or([eb('from_id', 'in', ids), eb('to_id', 'in', ids)])).limit(MAX_FOUND).execute();
+    const links = await tx.selectFrom('record_link').select(['from_type', 'from_id', 'to_type', 'to_id']).where((eb) => eb.or([eb('from_id', 'in', ids), eb('to_id', 'in', ids)])).limit(MAX_FOUND + 1).execute();
+    if (links.length > MAX_FOUND) truncated = true;
     for (const l of links) {
       for (const [type, id] of [[l.from_type, l.from_id], [l.to_type, l.to_id]] as const) {
         if (ids.includes(id as string)) continue;
@@ -341,7 +393,7 @@ async function findSubject(p: Platform, tx: Tx, tenantId: string, subject: strin
       }
     }
   }
-  return [...found.values()];
+  return { found: [...found.values()], truncated };
 }
 
 function targetForResource(p: Platform, resource: string): string | null {
@@ -349,8 +401,21 @@ function targetForResource(p: Platform, resource: string): string | null {
   return null;
 }
 
-/** The full record (PII decrypted) for an export. */
+/**
+ * The record for an export: a matched record in full (its personal data is the
+ * subject's), a linked record without its PII fields (they may be someone else's).
+ */
 async function exportRecord(p: Platform, tx: Tx, tenantId: string, f: Found): Promise<Record<string, unknown> | null> {
+  const rec = await fullRecord(p, tx, tenantId, f);
+  if (!rec || f.via === 'match') return rec;
+  for (const k of f.fields) {
+    if (k.startsWith('custom.') && rec.custom && typeof rec.custom === 'object') delete (rec.custom as Record<string, unknown>)[k.slice('custom.'.length)];
+    else delete rec[k];
+  }
+  return rec;
+}
+
+async function fullRecord(p: Platform, tx: Tx, tenantId: string, f: Found): Promise<Record<string, unknown> | null> {
   if (f.target.startsWith('custom:')) {
     const r = await tx.selectFrom('custom_record').selectAll().where('id', '=', f.id).executeTakeFirst();
     return r ? { id: r.id, entity: r.entity, created_at: r.created_at, ...decryptAll(p.ports.vault, tenantId, f.target, r.data as Record<string, unknown>) } : null;
@@ -372,13 +437,17 @@ export async function runDsr(p: Platform, tenantId: string, actor: Principal, ra
   await p.database.withTenant(tenantId, (tx) =>
     tx.insertInto('dsr_request').values({ id, tenant_id: tenantId, kind: input.kind, subject_enc: p.ports.vault.encrypt(input.subject, `dsr:${tenantId}:${id}`), status: 'running', requested_by: actor.id }).execute(),
   );
+  const why = { reason: `dsr:${id}`, actor, principal: actor, correlationId };
+  const erased: string[] = [];
   try {
-    const found = await p.database.withTenant(tenantId, (tx) => findSubject(p, tx, tenantId, input.subject));
+    const { found, truncated } = await p.database.withTenant(tenantId, (tx) => findSubject(p, tx, tenantId, input.subject));
     let fileId: string | null = null;
+    const problems: string[] = [];
+    if (truncated) problems.push(`the search stopped at its limits (${MAX_SCAN} records scanned per entity, ${MAX_FOUND} results); narrow the request or repeat it`);
     if (input.kind === 'export') {
       // Streamed record by record into the Files port (never the whole export in memory).
       async function* lines() {
-        yield `{"generated_at":${JSON.stringify(new Date().toISOString())},"request_id":${JSON.stringify(id)},"records":[`;
+        yield `{"generated_at":${JSON.stringify(new Date().toISOString())},"request_id":${JSON.stringify(id)},"complete":${!truncated},"records":[`;
         let first = true;
         for (const f of found) {
           const rec = await p.database.withTenant(tenantId, (tx) => exportRecord(p, tx, tenantId, f));
@@ -391,28 +460,40 @@ export async function runDsr(p: Platform, tenantId: string, actor: Principal, ra
       const file = await p.ports.files.put(tenantId, { name: `data-subject-export-${id.slice(0, 8)}.json`, contentType: 'application/json', purpose: `dsr:${id}`, createdBy: actor.id, expiresAt: new Date(Date.now() + 7 * 86_400_000) }, lines(), { maxBytes: 50 * 1024 * 1024 });
       fileId = file.id;
     } else {
-      // Erase: PII fields only; amounts, statuses and the audit log stay.
-      for (const f of found.filter((x) => x.fields.length)) {
-        if (f.target.startsWith('custom:')) {
-          const entity = f.target.slice('custom:'.length);
-          const cur = await p.database.withTenant(tenantId, (tx) => tx.selectFrom('custom_record').select('version').where('id', '=', f.id).executeTakeFirst());
-          if (!cur) continue;
-          await clearRecordPii(p, tenantId, actor, entity, f.id, cur.version, f.fields, correlationId);
-        } else {
-          const pii = (await p.database.withTenant(tenantId, (tx) => piiInventory(p, tx))).filter((x) => x.target === f.target);
-          await p.database.withTenant(tenantId, (tx) => anonymiseAppRows(tx, pii, [f.id], ERASED));
+      // Erase: only records that hold the subject's own email/phone (never linked records,
+      // whose personal data may be someone else's), PII fields only; amounts, statuses and
+      // the audit log stay. Each record is audited as it is erased.
+      for (const f of found.filter((x) => x.via === 'match' && x.fields.length)) {
+        try {
+          if (f.target.startsWith('custom:')) {
+            const entity = f.target.slice('custom:'.length);
+            const cur = await p.database.withTenant(tenantId, (tx) => tx.selectFrom('custom_record').select('version').where('id', '=', f.id).executeTakeFirst());
+            if (!cur) continue;
+            await clearRecordPii(p, tenantId, entity, f.id, cur.version, f.fields, why);
+          } else {
+            const pii = (await p.database.withTenant(tenantId, (tx) => piiInventory(p, tx))).filter((x) => x.target === f.target);
+            await p.database.withTenant(tenantId, (tx) => anonymiseAppRows(p, tx, tenantId, pii, [f.id], ERASED, why));
+          }
+          erased.push(`${f.target}:${f.id}`);
+        } catch (e) {
+          problems.push(`${f.target} ${f.id}: ${(e as Error).message}`);
         }
       }
     }
-    const summary = found.map((f) => ({ type: f.target, id: f.id, fields: f.fields, found_by: f.via }));
+    const summary = found.map((f) => ({ type: f.target, id: f.id, fields: f.fields, found_by: f.via, ...(input.kind === 'erase' ? { erased: erased.includes(`${f.target}:${f.id}`) } : {}) }));
+    const status = problems.length ? 'partial' : 'succeeded';
     await p.database.withTenant(tenantId, async (tx) => {
-      await tx.updateTable('dsr_request').set({ status: 'succeeded', found: JSON.stringify(summary), file_id: fileId, finished_at: new Date() }).where('id', '=', id).execute();
+      await tx.updateTable('dsr_request').set({ status, found: JSON.stringify(summary), file_id: fileId, error: problems.length ? problems.join('; ').slice(0, 500) : null, finished_at: new Date() }).where('id', '=', id).execute();
       // No PII in the event or audit data: counts and record ids only.
-      await recordChange(p, tx, { tenantId, actor, action: `platform:dsr.${input.kind}`, resourceType: 'platform::DataSubjectRequest', resourceId: id, correlationId, events: [{ type: 'governance.dsr_completed', data: { request_id: id, kind: input.kind, records: summary.length } }], data: { records: summary.map((s) => `${s.type}:${s.id}`) } });
+      await recordChange(p, tx, { tenantId, actor, action: `platform:dsr.${input.kind}`, resourceType: 'platform::DataSubjectRequest', resourceId: id, correlationId, events: [{ type: 'governance.dsr_completed', data: { request_id: id, kind: input.kind, status, records: summary.length } }], data: { status, records: summary.map((s) => `${s.type}:${s.id}`), erased } });
     });
-    return { id, kind: input.kind, found: summary, file_id: fileId };
+    return { id, kind: input.kind, status, found: summary, file_id: fileId, problems };
   } catch (e) {
-    await p.database.withTenant(tenantId, (tx) => tx.updateTable('dsr_request').set({ status: 'failed', error: (e as Error).message.slice(0, 300), finished_at: new Date() }).where('id', '=', id).execute());
+    // Audited even when it fails: what was already erased is on record.
+    await p.database.withTenant(tenantId, async (tx) => {
+      await tx.updateTable('dsr_request').set({ status: 'failed', error: (e as Error).message.slice(0, 300), finished_at: new Date() }).where('id', '=', id).execute();
+      await recordChange(p, tx, { tenantId, actor, action: 'platform:dsr.failed', resourceType: 'platform::DataSubjectRequest', resourceId: id, correlationId, events: [{ type: 'governance.dsr_failed', data: { request_id: id, kind: input.kind, erased: erased.length } }], data: { erased } });
+    });
     throw e;
   }
 }
@@ -435,25 +516,27 @@ export async function exportAuditLog(p: Platform, tenantId: string, actor: Princ
   let rows = 0;
   async function* lines() {
     yield 'at,actor_type,actor_id,action,resource_type,resource_id,correlation_id,data\r\n';
-    let cursor: { at: Date; id: string } | null = null;
+    // Keyset on the exact timestamp text: a JS Date drops microseconds, which would repeat
+    // rows (or loop) when many entries share one millisecond.
+    let cursor: { at: string; id: string } | null = null;
     for (;;) {
-      const c: { at: Date; id: string } | null = cursor;
+      const c: { at: string; id: string } | null = cursor;
       const batch = (await p.database.withTenant(tenantId, (tx) =>
         tx
           .selectFrom('audit_log')
-          .selectAll()
+          .select(['id', sql<string>`at::text`.as('at_exact'), sql<string>`to_char(at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`.as('at_iso'), 'actor_type', 'actor_id', 'action', 'resource_type', 'resource_id', 'correlation_id', 'data'])
           .where('at', '>=', from)
           .where('at', '<', to)
-          .$if(c !== null, (q) => q.where((eb) => eb.or([eb('at', '>', c!.at), eb.and([eb('at', '=', c!.at), eb('id', '>', c!.id)])])))
+          .$if(c !== null, (q) => q.where(sql<boolean>`(at, id) > (${c!.at}::timestamptz, ${c!.id}::uuid)`))
           .orderBy('at')
           .orderBy('id')
           .limit(BATCH)
           .execute(),
-      )) as { at: Date; id: string; [k: string]: unknown }[];
-      for (const r of batch) yield `${[new Date(r.at).toISOString(), r.actor_type, r.actor_id, r.action, r.resource_type, r.resource_id, r.correlation_id, r.data].map(cell).join(',')}\r\n`;
+      )) as { at_exact: string; at_iso: string; id: string; [k: string]: unknown }[];
+      for (const r of batch) yield `${[r.at_iso, r.actor_type, r.actor_id, r.action, r.resource_type, r.resource_id, r.correlation_id, r.data].map(cell).join(',')}\r\n`;
       rows += batch.length;
       if (batch.length < BATCH) return;
-      cursor = { at: batch.at(-1)!.at as Date, id: batch.at(-1)!.id as string };
+      cursor = { at: batch.at(-1)!.at_exact, id: batch.at(-1)!.id };
     }
   }
   const file = await p.ports.files.put(tenantId, { name: `audit-log ${input.from.slice(0, 10)} to ${input.to.slice(0, 10)}.csv`, contentType: 'text/csv; charset=utf-8', purpose: 'audit-export', createdBy: actor.id, expiresAt: new Date(Date.now() + 7 * 86_400_000) }, lines(), { maxBytes: 200 * 1024 * 1024 });

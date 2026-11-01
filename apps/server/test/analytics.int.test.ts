@@ -9,8 +9,10 @@ import { SESSION_COOKIE, createSession } from '../src/auth/sessions.ts';
 import { newId, type Tx } from '../src/db/database.ts';
 import { buildApp } from '../src/http/app.ts';
 import { listDashboards, saveDashboard } from '../src/platform/analytics/dashboards.ts';
-import { ensureMetrics, forgetSpecs, metricsConsumer, reconcileTenant } from '../src/platform/analytics/metrics.ts';
-import { queryMetric } from '../src/platform/analytics/query.ts';
+import { ensureMetrics, metricsConsumer, rebuildMetric, reconcileTenant } from '../src/platform/analytics/metrics.ts';
+import { queryMetric, visibleDimensionValues } from '../src/platform/analytics/query.ts';
+import { purgeExpiredFiles } from '../src/platform/analytics/jobs.ts';
+import { writeAudit } from '../src/platform/audit.ts';
 import { runDueSchedules, runReport, saveReport } from '../src/platform/analytics/reports.ts';
 import { openDraft, publishDraft, saveDraft, sendJobs } from '../src/platform/datastudio.ts';
 import { accessReview, exportAuditLog, piiInventory, runDsr, runRetention, saveRetentionPolicy } from '../src/platform/governance.ts';
@@ -56,7 +58,6 @@ async function publish(fn: (d: Definition) => void) {
   });
   await sendJobs(p, r.jobs);
   await p.jobs.runAll();
-  forgetSpecs(t.tenantId);
 }
 async function roleUser(name: string, permissions: string[], fieldRules: unknown[] = []) {
   const roleId = newId();
@@ -143,6 +144,25 @@ describe('metrics pipeline', () => {
     const m = await q('custom:members', { group_by: 'store' });
     expect(m.total).toBe(3);
     expect(m.series.find((r) => r.key === 'Kemang')!.value).toBe(2);
+
+    // A deleted record goes back out of the bucket it went into (record.deleted carries previous_values).
+    const one = await inTenant((tx) => tx.selectFrom('custom_record').select(['id', 'version']).where('entity', '=', 'member').where(sql<boolean>`data ->> 'city' = 'Cikini'`).executeTakeFirstOrThrow());
+    await executeRecordWrite(p, { tenantId: t.tenantId, principal: t.owner, entity: 'member', op: 'delete', id: one.id, version: one.version, correlationId: cid() });
+    await settle();
+    const after = await q('custom:members', { group_by: 'store' });
+    expect(after.series.find((r) => r.key === 'Cikini')?.value ?? 0).toBe(0);
+    expect(after.series.find((r) => r.key === '')).toBeUndefined();
+    await executeRecordWrite(p, { tenantId: t.tenantId, principal: t.owner, entity: 'member', op: 'create', values: { name: 'M Cikini', city: 'Cikini', email: 'cikini@member.example' }, correlationId: cid() });
+    await settle();
+  });
+
+  it('restarts a rebuild that died (no progress for 10 minutes)', async () => {
+    await inTenant((tx) => tx.updateTable('metric_state').set({ status: 'rebuilding', updated_at: new Date(Date.now() - 11 * 60_000) }).where('metric', '=', 'ordering:orders').execute());
+    expect(await ensureMetrics(p, t.tenantId)).toContain('ordering:orders');
+    await settle();
+    const st = await inTenant((tx) => tx.selectFrom('metric_state').select('status').where('metric', '=', 'ordering:orders').executeTakeFirstOrThrow());
+    expect(st.status).toBe('ready');
+    expect((await q('ordering:orders')).total).toBe(5);
   });
 
   it('counts events that arrive before a metric has state, and the rebuild that follows does not double them', async () => {
@@ -181,6 +201,11 @@ describe('metrics pipeline', () => {
     await expect(q('ordering:revenue', {}, hidden.principal)).rejects.toMatchObject({ code: 'field_hidden' });
     expect((await q('ordering:orders', {}, hidden.principal)).total).toBe(5); // a count aggregates no field
     await expect(q('ordering:orders', { group_by: 'store' }, hidden.principal)).rejects.toMatchObject({ code: 'field_hidden' });
+    // Filtering store by store would rebuild the breakdown: refused too.
+    await expect(q('ordering:orders', { filters: { store: ['Kemang'] } }, hidden.principal)).rejects.toMatchObject({ code: 'field_hidden' });
+    // Filter pickers only offer dimensions the viewer may see, on metrics they may see.
+    expect((await inTenant((tx) => visibleDimensionValues(p, tx, hidden.principal))).store).toEqual([]);
+    expect((await inTenant((tx) => visibleDimensionValues(p, tx, t.owner))).store).toContain('Kemang');
     // Default dashboards leave out what the viewer cannot see.
     const boards = await inTenant((tx) => listDashboards(p, tx, hidden.principal, hidden.roleId));
     expect(JSON.stringify(boards)).not.toContain('ordering:revenue');
@@ -293,8 +318,12 @@ describe('data governance', () => {
     expect(o).toMatchObject({ customer_name: '[anonymised]', customer_phone: '[anonymised]' });
     expect(Number(o.total)).toBe(42_000);
     expect(rows.find((r) => r.id === recent.body.id)!.customer_name).toBe('Dewi New');
-    const audit = await inTenant((tx) => tx.selectFrom('audit_log').select(['action', 'data']).where('correlation_id', '=', 'retention-test').execute());
-    expect(audit).toEqual([expect.objectContaining({ action: 'platform:retention.applied' })]);
+    const audit = await inTenant((tx) => tx.selectFrom('audit_log').select(['action', 'resource_id', 'data']).where('correlation_id', '=', 'retention-test').execute());
+    expect(audit.map((a) => a.action)).toContain('platform:retention.applied');
+    // Each anonymised record is audited and published on its own (ids and field keys only).
+    expect(audit.filter((a) => a.action === 'platform:governance.anonymised').map((a) => a.resource_id)).toContain(old.body.id);
+    const ev = await inTenant((tx) => tx.selectFrom('outbox_event').select('payload').where('type', '=', 'governance.anonymised').where('aggregateid', '=', old.body.id).executeTakeFirstOrThrow());
+    expect(ev.payload).toMatchObject({ data: { target: 'ordering:order', record_id: old.body.id, fields: ['customer_name', 'customer_phone'] } });
     expect(JSON.stringify(audit)).not.toContain('Rina');
     // A second run finds nothing left to do.
     const [again] = await runRetention(p, t.tenantId, { policyId: id, correlationId: cid() });
@@ -325,7 +354,9 @@ describe('data governance', () => {
 
     // Audited without the subject; the request stores the subject only encrypted.
     const audit = await inTenant((tx) => tx.selectFrom('audit_log').select(['action', 'data']).where('correlation_id', 'in', ['dsr-export', 'dsr-erase']).execute());
-    expect(audit.map((a) => a.action).sort()).toEqual(['platform:dsr.erase', 'platform:dsr.export']);
+    // One entry per request, plus one per anonymised record (ids and field keys only).
+    expect([...new Set(audit.map((a) => a.action))].sort()).toEqual(['platform:dsr.erase', 'platform:dsr.export', 'platform:governance.anonymised']);
+    expect(audit.filter((a) => a.action === 'platform:governance.anonymised')).toHaveLength(2);
     expect(JSON.stringify(audit)).not.toMatch(/5555|Sari/);
     const stored = await inTenant((tx) => tx.selectFrom('dsr_request').select('subject_enc').execute());
     expect(JSON.stringify(stored)).not.toMatch(/5555|subject\.example/);
@@ -337,5 +368,108 @@ describe('data governance', () => {
     expect(csv.split('\r\n')[0]).toBe('at,actor_type,actor_id,action,resource_type,resource_id,correlation_id,data');
     expect(r.rows).toBeGreaterThan(10);
     expect(csv).toContain('platform:retention.applied');
+  });
+
+  it('erases only the subject\'s own records: linked records keep their data and are exported without PII', async () => {
+    await publish((d) => {
+      d.entities.push({ key: 'visit', label: 'Visit', title_field: 'who', fields: [field('who', { pii: true, required: true }), field('order', { type: 'link', link: 'ordering:order' })], rollups: [], rules: [] });
+    });
+    const third = await order('Kemang', 33_000, { customer_name: 'Third Party', customer_phone: '0819-3333-4444' });
+    await executeRecordWrite(p, { tenantId: t.tenantId, principal: t.owner, entity: 'visit', op: 'create', values: { who: 'visitor@subject.example', order: third.body.id }, correlationId: cid() });
+
+    const exp = await runDsr(p, t.tenantId, t.owner, { kind: 'export', subject: 'visitor@subject.example' }, cid());
+    expect(exp.found.map((f) => `${f.type}:${f.found_by}`).sort()).toEqual(['custom:visit:match', 'ordering:order:link']);
+    const file = JSON.parse((await readFile(t.tenantId, exp.file_id!)).toString());
+    const linked = file.records.find((r: any) => r.type === 'ordering:order').record;
+    expect(linked.id).toBe(third.body.id);
+    expect(linked).not.toHaveProperty('customer_name');
+    expect(JSON.stringify(file)).not.toContain('Third Party');
+
+    // `who` is required: the record pipeline refuses to empty it, so the audited fallback removes it.
+    const er = await runDsr(p, t.tenantId, t.owner, { kind: 'erase', subject: 'visitor@subject.example' }, 'dsr-linked');
+    expect(er.status).toBe('succeeded');
+    const o = await inTenant((tx) => tx.selectFrom('ord_order').select(['customer_name']).where('id', '=', third.body.id).executeTakeFirstOrThrow());
+    expect(o.customer_name).toBe('Third Party');
+    const visit = await inTenant((tx) => tx.selectFrom('custom_record').select('data').where('entity', '=', 'visit').executeTakeFirstOrThrow());
+    expect((visit.data as Record<string, unknown>).who).toBeUndefined();
+    const audit = await inTenant((tx) => tx.selectFrom('audit_log').select(['action', 'resource_type']).where('correlation_id', '=', 'dsr-linked').execute());
+    expect(audit).toEqual(expect.arrayContaining([expect.objectContaining({ action: 'platform:governance.anonymised', resource_type: 'custom::Visit' }), expect.objectContaining({ action: 'platform:dsr.erase' })]));
+  });
+
+  it('pages the audit export on exact timestamps (many entries in one millisecond are neither repeated nor looped)', async () => {
+    await inTenant(async (tx) => {
+      for (let i = 0; i < 620; i++) await writeAudit(tx, { tenantId: t.tenantId, actor: t.owner, action: 'test:burst', resourceType: 'test::Burst', resourceId: String(i), correlationId: 'burst', data: {} });
+    });
+    const r = await exportAuditLog(p, t.tenantId, t.owner, { from: new Date(Date.now() - 86_400_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() }, cid());
+    const lines = (await readFile(t.tenantId, r.file_id)).toString().trim().split('\r\n').slice(1);
+    expect(lines.length).toBe(r.rows);
+    expect(new Set(lines).size).toBe(lines.length);
+    expect(lines.filter((l) => l.includes('test:burst'))).toHaveLength(620);
+  });
+});
+
+describe('review fixes: access to files, schedules, cleanup', () => {
+  it('report files and DSR exports are linked only for people allowed to see them', async () => {
+    const { id } = await inTenant((tx) => saveReport(p, tx, t.tenantId, t.owner, { name: 'Payments only', query: { metrics: ['payments:captured_amount'], range: 'last_7_days', granularity: 'none' } }, cid()));
+    await runReport(p, t.tenantId, t.owner, id, { format: 'csv', trigger: 'manual', correlationId: cid() });
+    const viewer = await roleUser('Orders analyst', ['platform:analytics.read', 'ordering:order.read', 'platform:governance.read']);
+    const cookie = `${SESSION_COOKIE}=${(await inTenant((tx) => createSession(tx, t.tenantId, viewer.userId, 'magic_link'))).cookie}`;
+    const app: FastifyInstance = await buildApp(p);
+    try {
+      const reports = (await app.inject({ url: '/api/reports', headers: { cookie } })).json().reports as any[];
+      const payments = reports.find((r) => r.name === 'Payments only');
+      expect(payments.can_run).toBe(false);
+      expect(payments.runs[0].download_url).toBeNull();
+      const dsr = (await app.inject({ url: '/api/governance/dsr', headers: { cookie } })).json().requests as any[];
+      expect(dsr.filter((r) => r.kind === 'export').every((r) => r.download_url === null)).toBe(true);
+      const owners = (await app.inject({ url: '/api/governance/dsr', headers: { cookie: `${SESSION_COOKIE}=${t.cookie}` } })).json().requests as any[];
+      expect(owners.some((r) => r.kind === 'export' && r.download_url)).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('a schedule whose owner can no longer read analytics records a failed run and produces nothing', async () => {
+    const owner = await roleUser('Report owner', ['platform:analytics.read', 'platform:analytics.manage', 'ordering:order.read']);
+    const { id } = await inTenant((tx) => saveReport(p, tx, t.tenantId, owner.principal, { name: 'Owner lost access', query: { metrics: ['ordering:orders'], range: 'today', granularity: 'none' }, schedule: { every: 'day', hour: 5, format: 'csv' } }, cid()));
+    await inTenant((tx) => tx.updateTable('custom_role').set({ permissions: ['ordering:order.read'] }).where('id', '=', owner.roleId).execute());
+    await inTenant((tx) => tx.updateTable('report').set({ next_run_at: new Date(Date.now() - 1000) }).where('id', '=', id).execute());
+    await runDueSchedules(p);
+    const runs = await inTenant((tx) => tx.selectFrom('report_run').select(['status', 'error', 'file_id']).where('report_id', '=', id).execute());
+    expect(runs).toEqual([{ status: 'failed', error: 'the report owner can no longer read analytics', file_id: null }]);
+  });
+
+  it('an abandoned upload leaves nothing readable, and expired files are deleted with an audit entry', async () => {
+    async function* broken() {
+      yield Buffer.alloc(300 * 1024, 1);
+      throw new Error('producer failed');
+    }
+    await expect(p.ports.files.put(t.tenantId, { name: 'broken.bin', contentType: 'application/octet-stream', purpose: 'test', createdBy: t.ownerId }, broken(), { maxBytes: 10 * 1024 * 1024 })).rejects.toThrow('producer failed');
+    expect(await inTenant((tx) => tx.selectFrom('file_object').select('id').where('name', '=', 'broken.bin').execute())).toEqual([]);
+    const f = await p.ports.files.put(t.tenantId, { name: 'old.csv', contentType: 'text/csv', purpose: 'test', createdBy: t.ownerId, expiresAt: new Date(Date.now() - 1000) }, (async function* () {
+      yield 'a,b\r\n';
+    })(), { maxBytes: 1024 });
+    expect(await purgeExpiredFiles(p)).toBeGreaterThanOrEqual(1);
+    expect(await p.ports.files.open(t.tenantId, f.id)).toBeNull();
+    const audit = await inTenant((tx) => tx.selectFrom('audit_log').select('data').where('action', '=', 'platform:files.expired').execute());
+    expect(JSON.stringify(audit)).toContain(f.id);
+  });
+});
+
+// Last: it adds an order.
+describe('rebuilds and the consumer count each event once', () => {
+  it('overlapping rebuilds (duplicate jobs) and an event handled after a rebuild started', async () => {
+    const job = { tenantId: t.tenantId, metric: 'ordering:orders' };
+    await settle();
+    const before = (await q('ordering:orders')).total;
+    await Promise.all([rebuildMetric(p, job), rebuildMetric(p, job), rebuildMetric(p, job)]);
+    expect((await q('ordering:orders')).total).toBe(before);
+    // Created but not yet handled by the consumer when the rebuild starts: the consumer counts it.
+    await order('Kemang', 1_000);
+    await rebuildMetric(p, job);
+    await settle();
+    expect((await q('ordering:orders')).total).toBe(before + 1);
+    await rebuildMetric(p, job);
+    expect((await q('ordering:orders')).total).toBe(before + 1);
   });
 });

@@ -22,13 +22,42 @@ export function defaultGranularity(from: Date, to: Date): Granularity {
   return days <= 2 ? 'hour' : days <= 92 ? 'day' : days <= 370 ? 'week' : 'month';
 }
 
-/** Throws unless the viewer may see this metric (optionally grouped by `dim`). */
-export function assertCanView(spec: MetricSpec, principal: Principal, dim?: Dimension | null) {
+/**
+ * Throws unless the viewer may see this metric, grouped by `dim` and filtered on
+ * `filtered` dimensions: a hidden dimension can be neither grouped by nor filtered on
+ * (filtering value by value would rebuild the breakdown).
+ */
+export function assertCanView(spec: MetricSpec, principal: Principal, dim?: Dimension | null, filtered: Dimension[] = []) {
   const d = authorize(principal, action(spec.readPermission), { type: spec.resource, id: '*', tenantId: principal.tenantId });
   if (d.decision === 'deny') throw new CommandError(403, 'forbidden', `missing permission ${spec.readPermission}`);
   if (spec.field && d.fields[spec.field] === 'hidden') throw new CommandError(403, 'field_hidden', `${spec.label} aggregates a field hidden for your role`);
-  const dimField = dim ? plainField(spec.dims[dim]) : null;
-  if (dimField && d.fields[dimField] === 'hidden') throw new CommandError(403, 'field_hidden', `${dim} is hidden for your role`);
+  for (const x of new Set([...(dim ? [dim] : []), ...filtered])) {
+    const dimField = plainField(spec.dims[x]);
+    if (dimField && d.fields[dimField] === 'hidden') throw new CommandError(403, 'field_hidden', `${x} is hidden for your role`);
+  }
+}
+
+export const filteredDims = (filters: { store?: string[]; channel?: string[] }): Dimension[] => (['store', 'channel'] as const).filter((k) => filters[k]?.length);
+
+/** Distinct dimension values the viewer may see (filter pickers): visible metrics and dimensions only. */
+export async function visibleDimensionValues(p: Platform, tx: Tx, principal: Principal) {
+  const specs = await visibleMetrics(p, tx, principal);
+  const out: Record<Dimension, string[]> = { store: [], channel: [] };
+  for (const dim of ['store', 'channel'] as const) {
+    const allowed = specs.filter((s) => {
+      if (!s.dims[dim]) return false;
+      try {
+        assertCanView(s, principal, dim);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (!allowed.length) continue;
+    const rows = await tx.selectFrom('metric_bucket').select(dim).distinct().where('metric', 'in', allowed.map((s) => s.id)).where(dim, '<>', '').orderBy(dim).limit(200).execute();
+    out[dim] = rows.map((r) => r[dim] as string);
+  }
+  return out;
 }
 
 /** Metrics the viewer may see (others are left out of pickers and default dashboards). */
@@ -48,7 +77,7 @@ export async function queryMetric(p: Platform, tx: Tx, principal: Principal, q: 
   if (!(await analyticsEnabled(p, tx))) throw new CommandError(403, 'not_in_plan', 'your plan does not include the Analytics package');
   const spec = (await metricSpecs(p, tx)).find((s) => s.id === q.metric);
   if (!spec) throw new CommandError(404, 'unknown_metric', `unknown metric ${q.metric}`);
-  assertCanView(spec, principal, q.group_by ?? null);
+  assertCanView(spec, principal, q.group_by ?? null, filteredDims(q.filters));
   const from = new Date(q.from);
   const to = new Date(q.to);
   const state = await tx.selectFrom('metric_state').select(['status', 'version']).where('metric', '=', spec.id).executeTakeFirst();

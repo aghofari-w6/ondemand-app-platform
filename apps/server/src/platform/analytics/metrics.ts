@@ -26,6 +26,7 @@ import { readPermission } from '../workspace.ts';
 
 export const ANALYTICS_PACKAGE = 'Analytics';
 const BATCH = 500;
+const STUCK_REBUILD_MS = 10 * 60_000;
 
 const hash = (v: unknown) => createHash('sha256').update(JSON.stringify(v)).digest('hex').slice(0, 16);
 
@@ -65,7 +66,9 @@ export async function metricSpecs(p: Platform, tx: Tx): Promise<MetricSpec[]> {
   for (const c of definition.metrics) {
     const ent = definition.entities.find((e) => e.key === c.entity);
     if (!ent) continue;
-    const dims = Object.fromEntries(Object.entries(c.dims).map(([d, k]) => [d, `values.${k}`]));
+    // A deleted record's values are in `previous_values` (record.deleted), so a count goes
+    // back out of the same store/channel it went into.
+    const dims = Object.fromEntries(Object.entries(c.dims).map(([d, k]) => [d, `coalesce(values.${k}, previous_values.${k})`]));
     const filter = `entity == '${c.entity}'`;
     const base = {
       id: `custom:${c.key}`,
@@ -101,8 +104,6 @@ export async function metricSpecs(p: Platform, tx: Tx): Promise<MetricSpec[]> {
  * cache dropped events while an app was being activated). Bounded: memory-safe-code §5.
  */
 const specCache = new BoundedCache<MetricSpec[]>({ max: 2000, ttlMs: 10 * 60_000 });
-/** Kept for callers that change metrics outside the fingerprint; the fingerprint covers the rest. */
-export const forgetSpecs = (tenantId: string) => specCache.delete(tenantId);
 
 async function cachedSpecs(p: Platform, tx: Tx, tenantId: string) {
   const fp = await sql<{ f: string | null }>`
@@ -164,9 +165,11 @@ async function requestRebuild(p: Platform, tenantId: string, metric: string) {
   await p.ports.jobs.send(QUEUES.metricRebuild, { tenantId, metric }, { singletonKey: `${tenantId}:${metric}` });
 }
 
+const CONSUMER = 'platform.metrics';
+
 export function metricsConsumer(p: Platform): Consumer {
   return {
-    name: 'platform.metrics',
+    name: CONSUMER,
     types: ['*'],
     async handle(event, tx) {
       if (event.type.startsWith('workflow.') || event.type.startsWith('approval.')) return;
@@ -179,8 +182,9 @@ export function metricsConsumer(p: Platform): Consumer {
       const points: MetricPoint[] = [];
       for (const spec of specs) {
         const st = states.find((s) => s.metric === spec.id);
-        // A rebuild that has started covers every event up to its `through_seq`.
-        if (st && st.version === spec.version && st.status === 'rebuilding' && seq <= Number(st.through_seq)) continue;
+        // The last rebuild replayed every event this consumer had handled when it started
+        // (`through_seq`); later events are counted here. (Handled once each: processed_event.)
+        if (st && st.version === spec.version && seq <= Number(st.through_seq)) continue;
         // New or changed definition: count the event now and ask for a rebuild; the rebuild
         // resets and replays (under the exclusive lock), so nothing is lost or doubled.
         if (!st || st.version !== spec.version) await requestRebuild(p, event.tenant_id, spec.id);
@@ -205,20 +209,36 @@ export async function rebuildMetric(p: Platform, data: { tenantId: string; metri
         return null;
       }
       await sql`SELECT pg_advisory_xact_lock(${lockKey(tenantId, metric)})`.execute(tx);
-      const max = await tx.selectFrom('event_log').select(sql<string>`coalesce(max(seq), 0)`.as('m')).executeTakeFirstOrThrow();
-      await p.ports.analytics.reset(tx, metric);
+      // Replay exactly what the metrics consumer has already handled (its adds are wiped by
+      // the reset); it counts everything after its cursor itself. The consumer handles
+      // events in seq order and moves its cursor in the same transaction, and an add in
+      // flight holds the shared lock, so this read sees every add the reset removes.
+      const cur = await tx.selectFrom('consumer_cursor').select('last_seq').where('consumer', '=', CONSUMER).executeTakeFirst();
+      const through = Number(cur?.last_seq ?? 0);
+      const rebuildId = newId();
+      const state = { version: spec.version, status: 'rebuilding', through_seq: through, cursor_seq: 0, rebuild_id: rebuildId };
+      // Take over the state row first: this waits for a replay batch in flight (it holds the
+      // row), so the reset below also removes what that batch added.
       await tx
         .insertInto('metric_state')
-        .values({ tenant_id: tenantId, metric, version: spec.version, status: 'rebuilding', through_seq: Number(max.m), cursor_seq: 0 })
-        .onConflict((oc) => oc.columns(['tenant_id', 'metric']).doUpdateSet({ version: spec.version, status: 'rebuilding', through_seq: Number(max.m), cursor_seq: 0, updated_at: new Date() }))
+        .values({ tenant_id: tenantId, metric, ...state })
+        .onConflict((oc) => oc.columns(['tenant_id', 'metric']).doUpdateSet({ ...state, updated_at: new Date() }))
         .execute();
-      return { spec, through: Number(max.m) };
+      await p.ports.analytics.reset(tx, metric);
+      return { spec, through, rebuildId };
     });
     if (!start) return;
     const types = [...new Set(start.spec.events.map((e) => e.type))];
+    // Locks the state row and checks this rebuild is still the one in charge: a newer one
+    // (a duplicate job, a definition change) reset the buckets and replays on its own.
+    const stillMine = async (tx: Tx) => {
+      const st = await tx.selectFrom('metric_state').select('rebuild_id').where('metric', '=', metric).forUpdate().executeTakeFirst();
+      return st?.rebuild_id === start.rebuildId;
+    };
     let cursor = 0;
     for (;;) {
       const n = await p.database.withTenant(tenantId, async (tx) => {
+        if (!(await stillMine(tx))) return -1;
         const batch = await tx.selectFrom('event_log').select(['seq', 'payload']).where('type', 'in', types).where('seq', '>', cursor).where('seq', '<=', start.through).orderBy('seq').limit(BATCH).execute();
         const points = batch.flatMap((r) => pointsFor(start.spec, r.payload as EventEnvelope));
         if (points.length) await p.ports.analytics.add(tx, points);
@@ -226,9 +246,11 @@ export async function rebuildMetric(p: Platform, data: { tenantId: string; metri
         await tx.updateTable('metric_state').set({ cursor_seq: cursor, updated_at: new Date() }).where('metric', '=', metric).execute();
         return batch.length;
       });
+      if (n === -1) return;
       if (n < BATCH) break;
     }
     const done = await p.database.withTenant(tenantId, async (tx) => {
+      if (!(await stillMine(tx))) return true;
       const spec = (await metricSpecs(p, tx)).find((s) => s.id === metric);
       // Changed again while rebuilding: start over.
       if (spec && spec.version !== start.spec.version) return false;
@@ -244,9 +266,19 @@ export async function ensureMetrics(p: Platform, tenantId: string) {
   const stale = await p.database.withTenant(tenantId, async (tx) => {
     if (!(await analyticsEnabled(p, tx))) return [];
     const specs = await metricSpecs(p, tx);
-    const states = await tx.selectFrom('metric_state').select(['metric', 'version']).execute();
+    const states = await tx.selectFrom('metric_state').select(['metric', 'version', 'status', 'updated_at']).execute();
     const gone = states.filter((s) => !specs.some((x) => x.id === s.metric)).map((s) => s.metric);
-    return [...specs.filter((s) => states.find((x) => x.metric === s.id)?.version !== s.version).map((s) => s.id), ...gone];
+    // A rebuild that made no progress for 10 minutes died (retries exhausted): start it again.
+    const stuck = (s: (typeof states)[number]) => s.status === 'rebuilding' && Date.now() - new Date(s.updated_at).getTime() > STUCK_REBUILD_MS;
+    return [
+      ...specs
+        .filter((s) => {
+          const st = states.find((x) => x.metric === s.id);
+          return !st || st.version !== s.version || stuck(st);
+        })
+        .map((s) => s.id),
+      ...gone,
+    ];
   });
   for (const m of stale) await requestRebuild(p, tenantId, m);
   return stale;

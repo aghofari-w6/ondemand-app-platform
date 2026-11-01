@@ -69,7 +69,16 @@ export function setSessionCookie(p: Platform, reply: FastifyReply, value: string
 
 export async function buildApp(p: Platform): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: p.env.NODE_ENV === 'test' ? false : { level: p.env.LOG_LEVEL },
+    logger:
+      p.env.NODE_ENV === 'test'
+        ? false
+        : {
+            level: p.env.LOG_LEVEL,
+            // Signed download tokens are bearer credentials: never write them to logs.
+            serializers: {
+              req: (req: { method: string; url: string; id: string }) => ({ method: req.method, url: req.url.replace(/([?&]token=)[^&]+/g, '$1[redacted]'), id: req.id }),
+            },
+          },
     genReqId: (req) => {
       const h = req.headers['x-correlation-id'];
       return typeof h === 'string' && /^[A-Za-z0-9_.:-]{8,100}$/.test(h) ? h : randomUUID();

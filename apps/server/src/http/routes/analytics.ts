@@ -1,10 +1,10 @@
-import { AnalyticsQuery, CommandError } from '@aod/shared';
+import { AnalyticsQuery, CommandError, type ReportQuery } from '@aod/shared';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { Platform } from '../../platform/context.ts';
 import { deleteDashboard, getDashboard, listDashboards, saveDashboard } from '../../platform/analytics/dashboards.ts';
 import { analyticsEnabled, ensureMetrics } from '../../platform/analytics/metrics.ts';
-import { queryMetric, visibleMetrics } from '../../platform/analytics/query.ts';
+import { assertCanView, filteredDims, queryMetric, visibleDimensionValues, visibleMetrics } from '../../platform/analytics/query.ts';
 import { runReport, saveReport } from '../../platform/analytics/reports.ts';
 import { recordChange } from '../../platform/record.ts';
 import { correlationId, parse, requirePermission } from '../app.ts';
@@ -38,14 +38,10 @@ export function analyticsRoutes(p: Platform) {
       return p.database.withTenant(a.tenantId, (tx) => queryMetric(p, tx, a.principal, q));
     });
 
-    /** Store and channel values for the filter pickers (bounded). */
+    /** Store and channel values for the filter pickers: only dimensions the viewer may see. */
     app.get('/api/analytics/dimensions', async (req) => {
       const a = requirePermission(req, 'platform:analytics.read');
-      return p.database.withTenant(a.tenantId, async (tx) => {
-        const stores = await tx.selectFrom('metric_bucket').select('store').distinct().where('store', '<>', '').orderBy('store').limit(200).execute();
-        const channels = await tx.selectFrom('metric_bucket').select('channel').distinct().where('channel', '<>', '').orderBy('channel').limit(50).execute();
-        return { store: stores.map((s) => s.store as string), channel: channels.map((c) => c.channel as string) };
-      });
+      return p.database.withTenant(a.tenantId, (tx) => visibleDimensionValues(p, tx, a.principal));
     });
 
     // ------------------------------------------------------------ dashboards
@@ -87,9 +83,24 @@ export function analyticsRoutes(p: Platform) {
       const a = requirePermission(req, 'platform:analytics.read');
       return p.database.withTenant(a.tenantId, async (tx) => {
         const reports = await tx.selectFrom('report').selectAll().orderBy('name').limit(200).execute();
+        // Files of a report are only for viewers who could run it themselves (every metric,
+        // its dimension and filters pass the same checks as a live query).
+        const specs = await visibleMetrics(p, tx, a.principal);
+        const canRun = (q: ReportQuery) =>
+          q.metrics.every((m) => {
+            const s = specs.find((x) => x.id === m);
+            if (!s) return false;
+            try {
+              assertCanView(s, a.principal, q.group_by ?? null, filteredDims(q.filters ?? {}));
+              return true;
+            } catch {
+              return false;
+            }
+          });
         const runs = reports.length ? await tx.selectFrom('report_run').selectAll().where('report_id', 'in', reports.map((r) => r.id)).orderBy('started_at', 'desc').limit(500).execute() : [];
         return {
           reports: reports.map((r) => ({
+            can_run: canRun(r.query as ReportQuery),
             id: r.id,
             name: r.name,
             query: r.query,
@@ -100,7 +111,7 @@ export function analyticsRoutes(p: Platform) {
             runs: runs
               .filter((x) => x.report_id === r.id)
               .slice(0, 10)
-              .map((x) => ({ id: x.id, trigger: x.trigger, format: x.format, status: x.status, rows: x.rows, error: x.error, started_at: x.started_at, finished_at: x.finished_at, download_url: x.status === 'succeeded' ? download(a.tenantId, x.file_id as string | null) : null })),
+              .map((x) => ({ id: x.id, trigger: x.trigger, format: x.format, status: x.status, rows: x.rows, error: x.error, started_at: x.started_at, finished_at: x.finished_at, download_url: x.status === 'succeeded' && canRun(r.query as ReportQuery) ? download(a.tenantId, x.file_id as string | null) : null })),
           })),
         };
       });

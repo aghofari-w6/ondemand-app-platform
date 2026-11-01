@@ -1,4 +1,4 @@
-import { CommandError, nextRunAt, ReportInput, resolveRange, type Principal, type ReportQuery } from '@aod/shared';
+import { action, authorize, CommandError, nextRunAt, ReportInput, resolveRange, type Principal, type ReportQuery } from '@aod/shared';
 import { sql } from 'kysely';
 import { principalFor } from '../../auth/principal.ts';
 import { newId, type Tx } from '../../db/database.ts';
@@ -70,10 +70,27 @@ export async function* csvLines(t: { columns: string[]; rows: AsyncIterable<(str
   for await (const r of t.rows) yield `${r.map(csvCell).join(',')}\r\n`;
 }
 
-/** PDF rendering; pdfkit is loaded only when a PDF is asked for (memory-safe-code §6). */
-export async function pdfStream(t: ReportTable): Promise<AsyncIterable<Uint8Array>> {
+/**
+ * PDF rendering, streamed (memory-safe-code §1 and §6): pdfkit is loaded only when a PDF
+ * is asked for, and its output is handed on as it is produced, a page of rows at a time,
+ * instead of building the whole document first.
+ */
+export async function* pdfStream(t: ReportTable): AsyncGenerator<Uint8Array> {
   const { default: PDFDocument } = await import('pdfkit');
   const doc = new PDFDocument({ size: 'A4', margin: 40, info: { Title: t.title, Producer: 'Apps-on-Demand' } });
+  const ready: Buffer[] = [];
+  let ended = false;
+  let failed: unknown = null;
+  doc.on('data', (c: Buffer) => ready.push(c));
+  doc.on('end', () => {
+    ended = true;
+  });
+  doc.on('error', (e: unknown) => {
+    failed = e;
+  });
+  const drain = function* () {
+    while (ready.length) yield ready.shift()!;
+  };
   doc.fontSize(16).text(t.title);
   doc.moveDown(0.3).fontSize(9).fillColor('#5F6672').text(`${t.range.from.slice(0, 10)} to ${t.range.to.slice(0, 10)} (UTC, end exclusive)`);
   doc.moveDown().fillColor('#1B1F27');
@@ -87,10 +104,22 @@ export async function pdfStream(t: ReportTable): Promise<AsyncIterable<Uint8Arra
     doc.x = 40;
   };
   row(t.columns, true);
-  for (const r of t.rows) row(r, false);
+  for (const [i, r] of t.rows.entries()) {
+    row(r, false);
+    if (i % 50 === 49) {
+      // let pdfkit flush, then pass on what it produced
+      await new Promise((res) => setImmediate(res));
+      yield* drain();
+    }
+  }
   if (!t.rows.length) doc.font('Helvetica').text('No data for this period.');
   doc.end();
-  return doc as unknown as AsyncIterable<Uint8Array>;
+  while (!ended && !failed) {
+    await new Promise((res) => setImmediate(res));
+    yield* drain();
+  }
+  if (failed) throw failed;
+  yield* drain();
 }
 
 /** Writes a report file and records the run. */
@@ -114,7 +143,7 @@ export async function runReport(p: Platform, tenantId: string, principal: Princi
         createdBy: principal.id,
         expiresAt: new Date(Date.now() + REPORT_TTL_MS),
       },
-      opts.format === 'csv' ? csvLines(table) : await pdfStream(table),
+      opts.format === 'csv' ? csvLines(table) : pdfStream(table),
       { maxBytes: REPORT_MAX_BYTES },
     );
     await p.database.withTenant(tenantId, async (tx) => {
@@ -167,6 +196,14 @@ export async function saveReport(p: Platform, tx: Tx, tenantId: string, principa
   return { id, next_run_at: next };
 }
 
+async function recordFailedRun(p: Platform, tenantId: string, reportId: string, format: 'csv' | 'pdf', error: string, correlationId: string) {
+  await p.database.withTenant(tenantId, async (tx) => {
+    const runId = newId();
+    await tx.insertInto('report_run').values({ id: runId, tenant_id: tenantId, report_id: reportId, trigger: 'schedule', format, status: 'failed', error, finished_at: new Date() }).execute();
+    await recordChange(p, tx, { tenantId, actor: { type: 'System', id: 'reports' }, action: 'platform:report.failed', resourceType: RESOURCE, resourceId: reportId, correlationId, events: [{ type: 'report.failed', data: { report_id: reportId, run_id: runId, error } }] });
+  });
+}
+
 /** The every-minute job: runs due schedules (claimed across tenants with a lease). */
 export async function runDueSchedules(p: Platform) {
   const due = (await sql<{ tenant_id: string; id: string }>`SELECT * FROM report_claim_due(20, 900)`.execute(p.database.db)).rows;
@@ -177,8 +214,14 @@ export async function runDueSchedules(p: Platform) {
     const schedule = report.schedule as { format: 'csv' | 'pdf' } & Parameters<typeof nextRunAt>[0];
     try {
       const owner = await p.database.withTenant(d.tenant_id, (tx) => tx.selectFrom('app_user').select(['id', 'role', 'status']).where('id', '=', report.owner_id).executeTakeFirst());
-      if (!owner || owner.status !== 'active') throw new CommandError(409, 'owner_inactive', 'the report owner is no longer active; reassign the report');
-      const principal = await p.database.withTenant(d.tenant_id, (tx) => principalFor(tx, p.catalog, d.tenant_id, { id: owner.id, role: owner.role }));
+      const principal = owner?.status === 'active' ? await p.database.withTenant(d.tenant_id, (tx) => principalFor(tx, p.catalog, d.tenant_id, { id: owner.id, role: owner.role })) : null;
+      // A schedule runs only while its owner may still read analytics; otherwise the run is
+      // recorded as failed (audited) and nothing is produced.
+      const allowed = principal && authorize(principal, action('platform:analytics.read'), { type: 'platform::Tenant', id: d.tenant_id, tenantId: d.tenant_id }).decision === 'allow';
+      if (!principal || !allowed) {
+        await recordFailedRun(p, d.tenant_id, report.id, schedule.format, !principal ? 'the report owner is no longer active; reassign the report' : 'the report owner can no longer read analytics', correlationId);
+        continue;
+      }
       await runReport(p, d.tenant_id, principal, report.id, { format: schedule.format, trigger: 'schedule', correlationId });
     } catch (e) {
       p.log.error({ err: String(e), report: d.id }, 'scheduled report failed');

@@ -1,4 +1,4 @@
-import { CommandError } from '@aod/shared';
+import { action, authorize, CommandError } from '@aod/shared';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { Platform } from '../../platform/context.ts';
@@ -46,8 +46,16 @@ export function governanceRoutes(p: Platform) {
       const a = requirePermission(req, 'platform:governance.read');
       return p.database.withTenant(a.tenantId, async (tx) => {
         const rows = await tx.selectFrom('dsr_request').select(['id', 'kind', 'status', 'found', 'file_id', 'requested_by', 'created_at', 'finished_at', 'error']).orderBy('created_at', 'desc').limit(100).execute();
-        // The subject is never returned (stored encrypted); only what was found.
-        return { requests: rows.map((r) => ({ ...r, found_count: (r.found as unknown[]).length, download_url: r.kind === 'export' && r.status === 'succeeded' ? download(a.tenantId, r.file_id as string | null) : null })) };
+        // An export holds a person's personal data: its link goes only to whoever made the
+        // request, or to someone who may run requests. The subject is never returned.
+        const manage = authorize(a.principal, action('platform:governance.manage'), { type: 'platform::Tenant', id: a.tenantId, tenantId: a.tenantId }).decision === 'allow';
+        return {
+          requests: rows.map((r) => ({
+            ...r,
+            found_count: (r.found as unknown[]).length,
+            download_url: r.kind === 'export' && r.status !== 'failed' && (manage || r.requested_by === a.principal.id) ? download(a.tenantId, r.file_id as string | null) : null,
+          })),
+        };
       });
     });
 

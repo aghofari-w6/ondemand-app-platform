@@ -27,6 +27,8 @@ CREATE TABLE metric_state (
   -- events up to this event_log seq are covered by the rebuild; later ones by the consumer
   through_seq bigint NOT NULL DEFAULT 0,
   cursor_seq bigint NOT NULL DEFAULT 0,
+  -- the rebuild in charge; a rebuild that finds another id here was superseded and stops
+  rebuild_id uuid,
   rebuilt_at timestamptz,
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, metric)
@@ -155,7 +157,8 @@ CREATE TABLE dsr_request (
   kind text NOT NULL CHECK (kind IN ('export', 'erase')),
   -- the subject's email / phone, encrypted (Vault); never stored in clear
   subject_enc text NOT NULL,
-  status text NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+  -- partial: the search stopped at its bounds; the result lists what was handled
+  status text NOT NULL CHECK (status IN ('running', 'succeeded', 'partial', 'failed')),
   -- what was found: [{ resource, id, fields }] (no values)
   found jsonb NOT NULL DEFAULT '[]',
   file_id uuid,
@@ -176,10 +179,11 @@ CREATE FUNCTION report_claim_due(p_limit integer, p_lease_seconds integer)
   LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $$
   WITH due AS (
     SELECT r.id FROM report r
+    JOIN tenant t ON t.id = r.tenant_id AND t.status IN ('trial', 'active')
     WHERE r.next_run_at <= now() AND (r.schedule_claimed_until IS NULL OR r.schedule_claimed_until < now())
     ORDER BY r.next_run_at
     LIMIT p_limit
-    FOR UPDATE SKIP LOCKED
+    FOR UPDATE OF r SKIP LOCKED
   )
   UPDATE report r SET schedule_claimed_until = now() + make_interval(secs => p_lease_seconds)
   FROM due WHERE r.id = due.id
@@ -204,16 +208,16 @@ $$;
 REVOKE ALL ON FUNCTION retention_tenants() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION retention_tenants() TO aod_app;
 
--- Deletes expired files across tenants (nightly); returns how many.
-CREATE FUNCTION delete_expired_files() RETURNS integer
+-- Tenants that have expired files (nightly cleanup deletes them per tenant, audited) — ids only.
+CREATE FUNCTION expired_file_tenants() RETURNS TABLE (tenant_id uuid)
   LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $$
-  WITH gone AS (DELETE FROM file_object WHERE expires_at < now() RETURNING 1) SELECT count(*)::int FROM gone
+  SELECT DISTINCT f.tenant_id FROM file_object f WHERE f.expires_at < now()
 $$;
-REVOKE ALL ON FUNCTION delete_expired_files() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION delete_expired_files() TO aod_app;
+REVOKE ALL ON FUNCTION expired_file_tenants() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION expired_file_tenants() TO aod_app;
 
 -- Down Migration
-DROP FUNCTION IF EXISTS delete_expired_files();
+DROP FUNCTION IF EXISTS expired_file_tenants();
 DROP FUNCTION IF EXISTS retention_tenants();
 DROP FUNCTION IF EXISTS metric_tenants();
 DROP FUNCTION IF EXISTS report_claim_due(integer, integer);

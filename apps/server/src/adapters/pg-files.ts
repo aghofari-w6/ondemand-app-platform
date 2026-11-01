@@ -1,6 +1,5 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { sql } from 'kysely';
 import type { Database } from '../db/database.ts';
 import type { FileMeta, Files, Vault } from '../ports/index.ts';
 
@@ -32,18 +31,24 @@ export function createPgFiles(database: Database, vault: Vault): Files {
       const id = randomUUID();
       const hash = createHash('sha256');
       let size = 0;
-      let sha256 = '';
-      await database.withTenant(tenantId, async (tx) => {
-        await tx.insertInto('file_object').values({ id, tenant_id: tenantId, name: meta.name, content_type: meta.contentType, status: 'writing', purpose: meta.purpose, created_by: meta.createdBy, expires_at: meta.expiresAt ?? null }).execute();
+      // No transaction is held while the body is produced (the producer may itself read
+      // the database): the file row and each chunk are written in short transactions, and
+      // the file only becomes readable when it is complete. An abandoned upload stays
+      // `writing` with a one-day expiry, so the nightly cleanup removes it.
+      await database.withTenant(tenantId, (tx) =>
+        tx.insertInto('file_object').values({ id, tenant_id: tenantId, name: meta.name, content_type: meta.contentType, status: 'writing', purpose: meta.purpose, created_by: meta.createdBy, expires_at: new Date(Date.now() + 86_400_000) }).execute(),
+      );
+      try {
         let seq = 0;
         let pending: Buffer[] = [];
         let pendingBytes = 0;
         const flush = async (all: boolean) => {
           while (pendingBytes >= CHUNK_BYTES || (all && pendingBytes > 0)) {
             const joined = Buffer.concat(pending, pendingBytes);
-            const chunk = joined.subarray(0, Math.min(CHUNK_BYTES, joined.length));
+            const chunk = Buffer.from(joined.subarray(0, Math.min(CHUNK_BYTES, joined.length)));
             const rest = joined.subarray(chunk.length);
-            await tx.insertInto('file_chunk').values({ tenant_id: tenantId, file_id: id, seq: seq++, data: chunk }).execute();
+            const n = seq++;
+            await database.withTenant(tenantId, (tx) => tx.insertInto('file_chunk').values({ tenant_id: tenantId, file_id: id, seq: n, data: chunk }).execute());
             pending = rest.length ? [Buffer.from(rest)] : [];
             pendingBytes = rest.length;
           }
@@ -51,7 +56,7 @@ export function createPgFiles(database: Database, vault: Vault): Files {
         for await (const part of body) {
           const buf = typeof part === 'string' ? Buffer.from(part) : Buffer.from(part.buffer, part.byteOffset, part.byteLength);
           size += buf.length;
-          // Reject as soon as the cap is passed: the transaction rolls back, nothing is kept.
+          // Reject as soon as the cap is passed; the partial file is removed below.
           if (size > opts.maxBytes) throw new FileTooLarge(opts.maxBytes);
           hash.update(buf);
           pending.push(buf);
@@ -59,9 +64,12 @@ export function createPgFiles(database: Database, vault: Vault): Files {
           await flush(false);
         }
         await flush(true);
-        sha256 = hash.digest('hex');
-        await tx.updateTable('file_object').set({ status: 'ready', size, sha256 }).where('id', '=', id).execute();
-      });
+      } catch (e) {
+        await database.withTenant(tenantId, (tx) => tx.deleteFrom('file_object').where('id', '=', id).execute());
+        throw e;
+      }
+      const sha256 = hash.digest('hex');
+      await database.withTenant(tenantId, (tx) => tx.updateTable('file_object').set({ status: 'ready', size, sha256, expires_at: meta.expiresAt ?? null }).where('id', '=', id).execute());
       return { id, size, sha256 };
     },
 
@@ -107,10 +115,4 @@ export function createPgFiles(database: Database, vault: Vault): Files {
       }
     },
   };
-}
-
-/** Deletes expired files across tenants (nightly). Uses the narrow definer function. */
-export async function purgeExpiredFiles(database: Database): Promise<number> {
-  const r = await sql<{ n: number }>`SELECT delete_expired_files() AS n`.execute(database.db);
-  return Number(r.rows[0]?.n ?? 0);
 }
