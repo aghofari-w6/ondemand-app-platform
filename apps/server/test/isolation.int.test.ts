@@ -3,12 +3,15 @@ import { sql } from 'kysely';
 import type pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createLoginToken } from '../src/auth/sessions.ts';
-import { Definition, EndpointInput } from '@aod/shared';
+import { Definition, EndpointInput, type WorkflowGraph } from '@aod/shared';
 import { clientCredentialsGrant, createApiKey, createDelegatedToken, createOAuthClient } from '../src/auth/apiauth.ts';
 import { newId } from '../src/db/database.ts';
 import { openDraft, publishDraft, saveDraft, sendJobs } from '../src/platform/datastudio.ts';
 import { applyInbound, saveEndpoint } from '../src/platform/hub.ts';
 import { executeRecordWrite } from '../src/platform/records.ts';
+import { principalFor } from '../src/auth/principal.ts';
+import { decideApproval } from '../src/platform/approvals.ts';
+import { createWorkflow, publishWorkflow } from '../src/platform/workflows/definitions.ts';
 import { admin, closePlatform, cmd, newTenant, runSaga, setPlan, testPlatform, type TestTenant } from './helpers.ts';
 
 /**
@@ -92,6 +95,40 @@ async function populatePhase2(t: TestTenant) {
     await createDelegatedToken(p, tx, t.tenantId, t.owner, { name: 'd', scopes: ['apps:read'], expires_in_minutes: 30 }, c());
     return client;
   }).then((client) => clientCredentialsGrant(p, client.client_id, client.client_secret));
+  await populatePhase3(t);
+}
+
+/** Milestone C tables: a published workflow with a parallel group and an approval, run for real. */
+async function populatePhase3(t: TestTenant) {
+  const graph: WorkflowGraph = {
+    nodes: [
+      { id: 'trigger', type: 'trigger', name: 'When', position: { x: 0, y: 0 }, config: { event: 'order.created' } },
+      { id: 'fork', type: 'parallel', name: 'Fork', position: { x: 0, y: 0 }, config: {} },
+      { id: 'a', type: 'set', name: 'A', position: { x: 0, y: 0 }, config: { vars: { a: 1 } } },
+      { id: 'ok', type: 'approval', name: 'Approve', position: { x: 0, y: 0 }, config: { title: 'Check {{ trigger.data.number }}', approver_roles: ['Manager'] } },
+      { id: 'join', type: 'merge', name: 'Join', position: { x: 0, y: 0 }, config: { parallel: 'fork' } },
+    ],
+    edges: [
+      { id: 'e1', from: 'trigger', port: 'out', to: 'fork' },
+      { id: 'e2', from: 'fork', port: 'out', to: 'a' },
+      { id: 'e3', from: 'fork', port: 'out', to: 'ok' },
+      { id: 'e4', from: 'a', port: 'out', to: 'join' },
+      { id: 'e5', from: 'ok', port: 'approved', to: 'join' },
+    ],
+  };
+  const c = () => randomUUID();
+  const { id } = await p.database.withTenant(t.tenantId, (tx) => createWorkflow(p, tx, t.tenantId, t.owner, { name: 'Iso', graph }, c()));
+  await p.database.withTenant(t.tenantId, (tx) => publishWorkflow(p, tx, t.tenantId, t.owner, id, 1, 'Manager', c()));
+  await cmd(p, t, 'ordering', 'order.create', { channel: 'web', lines: [{ sku: 'W', name: 'W', qty: 1, unit_price: 3 }] });
+  for (let i = 0; i < 5; i++) {
+    await p.ports.eventBus.drain();
+    await p.workers.workflows.drain();
+  }
+  const managerId = newId();
+  await p.database.withTenant(t.tenantId, (tx) => tx.insertInto('app_user').values({ id: managerId, tenant_id: t.tenantId, email: `m-${managerId.slice(0, 6)}@iso.example`, name: 'M', role: 'Manager', status: 'active' }).execute());
+  const manager = await p.database.withTenant(t.tenantId, (tx) => principalFor(tx, p.catalog, t.tenantId, { id: managerId, role: 'Manager' }));
+  const req = await p.database.withTenant(t.tenantId, (tx) => tx.selectFrom('approval_request').select('id').where('status', '=', 'pending').executeTakeFirstOrThrow());
+  await p.database.withTenant(t.tenantId, (tx) => decideApproval(p, tx, t.tenantId, { id: managerId, role: 'Manager', principal: manager }, req.id, 'approve', '', c()));
 }
 
 beforeAll(async () => {

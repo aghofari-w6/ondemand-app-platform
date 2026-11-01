@@ -226,6 +226,8 @@ export interface RecordWrite {
   origin?: EventOrigin;
   correlationId: string;
   causationId?: string | null;
+  workflowHop?: number;
+  workflowChain?: string[];
 }
 
 const targetResource = (p: Platform, link: string) => {
@@ -325,7 +327,7 @@ export async function executeRecordWrite(p: Platform, req: RecordWrite, existing
     const [env] = await writeOutbox(
       tx,
       [{ type: eventType, aggregateType: target, aggregateId: id, data: { entity: req.entity, record_id: id, version: req.op === 'delete' ? null : version, values: plain ? publicData(entity, plain) : null, changed: Object.keys(req.values ?? {}) } }],
-      { tenantId: req.tenantId, app: 'custom', correlationId: req.correlationId, causationId: req.causationId ?? null, traceparent: p.ports.telemetry.traceparent(), origin: req.origin ?? 'user', newId },
+      { tenantId: req.tenantId, app: 'custom', correlationId: req.correlationId, causationId: req.causationId ?? null, traceparent: p.ports.telemetry.traceparent(), origin: req.origin ?? 'user', workflowHop: req.workflowHop ?? 0, workflowChain: req.workflowChain ?? [], newId },
     );
     await syncLinks(p, tx, req.tenantId, entity, id, req.op === 'delete' ? null : plain, env!.id);
     await writeAudit(tx, { tenantId: req.tenantId, actor: req.principal, action: `custom:${req.entity}.${req.op}`, resourceType: customResource(req.entity), resourceId: id, correlationId: req.correlationId, data: { fields: Object.keys(req.values ?? {}), origin: req.origin ?? 'user' } });

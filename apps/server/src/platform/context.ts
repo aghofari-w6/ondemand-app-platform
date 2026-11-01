@@ -4,6 +4,7 @@ import type { Auth, Billing, Channel, EventBus, Files, Jobs, Llm, Metrics, Retri
 import type { Catalog } from './catalog.ts';
 import type { HubDeliverer } from './hub.ts';
 import type { IndexBuilder } from './maintenance.ts';
+import type { WorkflowRunner } from './workflows/engine.ts';
 
 export interface Logger {
   info(obj: unknown, msg?: string): void;
@@ -19,7 +20,7 @@ export interface Platform {
   database: Database;
   log: Logger;
   /** in-process background workers (started by startWorkers) */
-  workers: { hub: HubDeliverer; indexes: IndexBuilder | null };
+  workers: { hub: HubDeliverer; workflows: WorkflowRunner; indexes: IndexBuilder | null };
   ports: {
     eventBus: EventBus;
     search: Search;

@@ -57,6 +57,11 @@ commands:
     permission: payments:payment.refund
     entity: payment
     may_emit: [payment.refunded]
+  - name: payment.refund_by_reference
+    description: Refund the captured payment for a reference (e.g. pos:sale:<id>), for workflows.
+    permission: payments:payment.refund
+    entity: payment
+    may_emit: [payment.refunded]
   - name: settings.update
     description: Change test-mode settings (e.g. make the next capture fail).
     permission: payments:settings.manage

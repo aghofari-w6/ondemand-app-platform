@@ -153,6 +153,18 @@ export function hubFanoutConsumer(_p: Platform): Consumer {
     name: 'platform.hub_fanout',
     types: ['*'],
     async handle(event: EventEnvelope, tx) {
+      // A workflow `hub_send` node addresses exactly one endpoint, whatever it subscribes to.
+      if (event.type === 'workflow.message') {
+        const target = await tx.selectFrom('hub_endpoint').select('id').where('id', '=', String(event.data.endpoint_id)).executeTakeFirst();
+        if (target) {
+          await tx
+            .insertInto('hub_delivery')
+            .values({ id: newId(), tenant_id: event.tenant_id, endpoint_id: target.id, event_id: event.id, event_type: event.type, status: 'pending' })
+            .onConflict((oc) => oc.columns(['endpoint_id', 'event_id']).doNothing())
+            .execute();
+        }
+        return;
+      }
       const endpoints = await tx.selectFrom('hub_endpoint').select(['id', 'event_types', 'filter', 'schema_pins']).where('status', '=', 'active').execute();
       if (!endpoints.length) return;
       const syncs = await tx.selectFrom('hub_sync').select(['id', 'endpoint_id']).execute();
@@ -320,8 +332,28 @@ export class HubDeliverer {
     if (!loaded) return;
     const { d, e, envelope } = loaded;
 
-    const credentials = e.credentials_enc ? JSON.parse(p.ports.vault.decrypt(e.credentials_enc, aadCreds(tenantId, e.id))) : null;
-    const signingSecret = e.signing_secret_enc ? p.ports.vault.decrypt(e.signing_secret_enc, aadSecret(tenantId, e.id)) : null;
+    let credentials: Record<string, any> | null;
+    let signingSecret: string | null;
+    try {
+      credentials = e.credentials_enc ? JSON.parse(p.ports.vault.decrypt(e.credentials_enc, aadCreds(tenantId, e.id))) : null;
+      signingSecret = e.signing_secret_enc ? p.ports.vault.decrypt(e.signing_secret_enc, aadSecret(tenantId, e.id)) : null;
+    } catch {
+      // A key change makes stored secrets unreadable; retrying cannot help, so dead-letter
+      // the delivery with a clear reason instead of failing it forever.
+      await p.database.withTenant(tenantId, async (tx) => {
+        await tx.updateTable('hub_delivery').set({ status: 'dead', last_error: 'stored credentials or signing secret cannot be decrypted; re-enter them on the endpoint', lease_until: null, updated_at: new Date() }).where('id', '=', d.id).execute();
+        await recordChange(p, tx, {
+          tenantId,
+          actor: { type: 'System', id: 'hub' },
+          action: 'platform:hub.dead_lettered',
+          resourceType: 'platform::HubDelivery',
+          resourceId: d.id,
+          correlationId: envelope.correlation_id,
+          events: [{ type: 'hub.delivery_dead', data: { delivery_id: d.id, endpoint_id: e.id, event_id: d.event_id, event_type: d.event_type, attempts: d.attempts, reason: 'undecryptable_secret' } }],
+        });
+      });
+      return;
+    }
     const sync = loaded.sync.find((s) => envelope.type.startsWith('record.') && envelope.data.entity === s.entity) ?? null;
     const body = sync ? syncBody(sync, envelope, loaded.map.find((m) => m.sync_id === sync.id)?.external_id ?? null) : JSON.stringify(envelope);
     const msg: OutboundMessage = { id: envelope.id, type: envelope.type, timestamp: new Date(), body };

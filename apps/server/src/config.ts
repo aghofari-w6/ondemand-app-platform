@@ -38,6 +38,10 @@ const Env = z.object({
   HUB_ALLOW_PRIVATE_HOSTS: z.string().default(''),
   /** Integration Hub deliverer poll interval, ms */
   HUB_INTERVAL_MS: z.coerce.number().default(500),
+  /** workflow runner poll interval, ms */
+  WORKFLOW_INTERVAL_MS: z.coerce.number().default(300),
+  /** loop guard: events this many workflow hops deep never start another workflow */
+  WORKFLOW_MAX_HOPS: z.coerce.number().int().min(1).default(5),
   HUB_MAX_ATTEMPTS: z.coerce.number().int().min(1).default(8),
   HUB_BACKOFF_BASE_MS: z.coerce.number().int().min(1).default(2000),
   HUB_BREAKER_THRESHOLD: z.coerce.number().int().min(1).default(5),
@@ -49,7 +53,15 @@ const Plan = z.object({
   label: z.string(),
   packages: z.array(z.string()),
   app_slots: z.int().positive(),
-  limits: z.object({ custom_entities: z.int().nonnegative(), custom_fields: z.int().nonnegative(), hub_endpoints: z.int().nonnegative(), api_keys: z.int().nonnegative() }),
+  limits: z.object({
+    custom_entities: z.int().nonnegative(),
+    custom_fields: z.int().nonnegative(),
+    hub_endpoints: z.int().nonnegative(),
+    api_keys: z.int().nonnegative(),
+    workflows: z.int().nonnegative(),
+    workflow_nodes: z.int().positive(),
+    workflow_runs_month: z.int().nonnegative(),
+  }),
 });
 const PlatformConfig = z.object({
   trial: z.object({ days: z.int().positive(), purge_after_days: z.int().positive() }),

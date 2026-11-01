@@ -55,7 +55,7 @@ entities:
 events:
   publishes:
     - { type: sale.completed, entity: sale, description: A sale was tendered., data: [sale_id, receipt_no, store, register, total, currency, tender, lines, sold_at, offline] }
-    - { type: sale.voided, entity: sale, description: A sale was voided., data: [sale_id, receipt_no, reason] }
+    - { type: sale.voided, entity: sale, description: A sale was voided., data: [sale_id, receipt_no, reason, total, tender, store] }
     - { type: shift.opened, entity: shift, description: A register shift was opened., data: [shift_id, register, store, opening_float] }
     - { type: shift.closed, entity: shift, description: A register shift was closed., data: [shift_id, expected_cash, counted_cash, variance, sales] }
     - { type: store.created, entity: store, description: A store was added., data: [store_id, name, registers] }

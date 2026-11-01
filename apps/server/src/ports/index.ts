@@ -145,8 +145,18 @@ export interface Sandbox {
   run(code: string, input: unknown, limits: { timeoutMs: number; memoryMb: number }): Promise<unknown>;
 }
 
+export interface PlanLimits {
+  custom_entities: number;
+  custom_fields: number;
+  hub_endpoints: number;
+  api_keys: number;
+  workflows: number;
+  workflow_nodes: number;
+  workflow_runs_month: number;
+}
+
 /** Billing provider later; plans from config/platform.yaml now. */
 export interface Billing {
-  plan(planId: string): { label: string; packages: string[]; appSlots: number; limits: { custom_entities: number; custom_fields: number; hub_endpoints: number; api_keys: number } } | null;
+  plan(planId: string): { label: string; packages: string[]; appSlots: number; limits: PlanLimits } | null;
   trialDays(): number;
 }
