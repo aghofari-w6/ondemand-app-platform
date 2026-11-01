@@ -17,7 +17,8 @@ External services are only called as API clients. Synthetic data only; never com
 | --- | --- | --- |
 | A | Week 0 + phase 1 (journey J1) | merged |
 | B | Phase 2: Data studio, custom entities, link index, Integration Hub, public `/v1` | merged |
-| C | Phase 3: workflows on a visual canvas, Approvals, Trace viewer | this branch |
+| C | Phase 3: workflows on a visual canvas, Approvals, Trace viewer | merged |
+| D | Phase 4: dashboards, reports, data governance | this branch |
 
 Screens for later milestones are in the navigation and show an empty state naming the
 owning package and milestone.
@@ -75,7 +76,7 @@ pnpm test:integration     # creates a fresh aod_test database (TEST_ADMIN_URL)
 ```
 
 ```bash
-pnpm e2e                  # Playwright J1, phase 2 and J3 journeys + axe (needs a migrated `aod` database)
+pnpm e2e                  # Playwright J1, phase 2, J3 and J4 journeys + axe (needs a migrated `aod` database)
 ```
 
 The integration suite includes the contracts that must hold from day one:
@@ -108,6 +109,16 @@ The integration suite includes the contracts that must hold from day one:
   re-delivered trigger, a node processed twice concurrently), parallel/merge, event waits
   and timeouts, the run DLQ (retry from the failed node) and the `error` output, and the
   service principal losing a permission after publish.
+- Phase 4 (`analytics.int.test.ts`, `transports.int.test.ts`): metrics backfilled by a
+  rebuild then followed by the consumer (voids come back out of takings), a rebuild
+  equal to the incremental path, reconciliation finding a corrupted bucket, events that
+  arrive before a metric has state, a deleted tenant's events never stalling the
+  consumer, plan entitlement, read permissions and hidden fields; dashboards (defaults,
+  validation, sharing per role); reports (CSV, PDF, schedules run as the owner, signed
+  downloads incl. tampered/expired/other-tenant tokens); Files (chunking, RLS, size cap);
+  governance (PII inventory, access review, retention anonymising old names, data
+  subject export and erase by phone and email, audit export). Kafka and SFTP run against
+  Redpanda and atmoz/sftp containers in CI.
 
 CI (`.github/workflows/ci.yml`) runs all of it in one job against a Postgres 17 service
 (plus a test-only Redis service for the Redis Streams adapter). The e2e suite has three
@@ -255,6 +266,34 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
   auto-layout, undo/redo and copy/paste. The outline view offers the same editing as an
   ordered list of nodes and outputs, by keyboard and screen reader.
 
+## Phase 4 in one page
+
+- **Metrics** (`platform/analytics/metrics.ts`, `Analytics` port, `adapters/pg-analytics.ts`):
+  manifest `analytics.metrics` name the events that move them (a value, filter and time
+  expression over event data), their dimensions (store, channel) and a reconciliation
+  filter; Data studio adds metrics over custom entities. The `platform.metrics` consumer
+  adds points to hourly `metric_bucket` rows in the event's transaction. A new or changed
+  metric is rebuilt from `event_log` (reset + batched replay up to the seq recorded at
+  the start; consumer adds and rebuild starts share a per-metric advisory lock). A
+  nightly job reconciles bucket totals with the source tables and rebuilds once on drift.
+- **Reading metrics** (`analytics/query.ts`): the plan must include Analytics, the viewer
+  needs the entity's read permission, and a field hidden for the viewer can be neither
+  aggregated nor grouped by. Ranges are capped at 400 days.
+- **Dashboards**: a built-in Overview and one per app, generated from the metrics the
+  viewer may see; saved dashboards are shared per role. Widgets: KPI with comparison, time
+  series, bars by dimension, top list; every chart also has a table view.
+- **Reports**: saved queries exported as CSV (formula-safe) or PDF (pdfkit, loaded only
+  for PDFs), streamed into Files; schedules are claimed every minute across tenants and
+  run as the owner. Email delivery waits for the Gmail channel (Milestone E).
+- **Files** (`adapters/pg-files.ts`): `file_object` + 256 KB `file_chunk` rows under RLS,
+  streamed both ways and size-capped; downloads use signed, expiring tokens
+  (`/api/files/download?token=…`).
+- **Data governance** (`platform/governance.ts`): PII inventory (manifests + Data
+  studio), access review (roles after field rules; API credentials by scope), retention
+  policies (anonymise PII on app entities, anonymise or delete custom records; audited
+  nightly jobs), data subject requests (find by email or phone across apps and the link
+  index; export JSON or erase PII while amounts and the audit log stay), audit-log export.
+
 ## Decisions worth knowing
 
 - **DDL happens at deploy time, not at provision time.** The migrate script (owner role)
@@ -291,6 +330,14 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
   tables later.
 - **`hub_send` nodes publish a `workflow.message` event** addressed to one endpoint, so
   outbound calls keep the Hub's SSRF policy, signatures, retries and dead letters.
+- **Files live in PostgreSQL as chunked `bytea`, not large objects.** `pg_largeobject`
+  is outside row-level security, so tenant isolation would rest on code alone; chunks
+  keep RLS and still stream.
+- **Analytics has its own port.** The existing `Metrics` port counts operations; the
+  plan's "Metrics port" for tenant analytics is `Analytics` (ClickHouse later).
+- **Governance writes app PII columns directly** (anonymise/erase), like Data studio
+  backfills: no app has such a command, only PII columns change, and every run is
+  recorded with `recordChange` without PII.
 - **Notifications go through the outbox:** a `notify` node writes a `workflow.notification`
   event (user ids, never addresses) with its completion; the `platform.notifications`
   consumer calls the Channel port. A crash between send and commit can repeat a send.

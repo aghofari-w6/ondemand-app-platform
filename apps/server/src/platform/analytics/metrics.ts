@@ -94,16 +94,26 @@ export async function metricSpecs(p: Platform, tx: Tx): Promise<MetricSpec[]> {
   return out;
 }
 
-/** Specs per tenant for the consumer (short-lived, bounded: memory-safe-code §5). */
-const specCache = new BoundedCache<MetricSpec[]>({ max: 2000, ttlMs: 15_000 });
-/** Call after a change that alters a tenant's metrics (app activation, Data studio publish). */
+/**
+ * Specs per tenant for the consumer, keyed by a fingerprint of everything that defines
+ * them (installed apps + their versions and status, the published Data studio version).
+ * One cheap query per event; a change takes effect on the very next event (a plain TTL
+ * cache dropped events while an app was being activated). Bounded: memory-safe-code §5.
+ */
+const specCache = new BoundedCache<MetricSpec[]>({ max: 2000, ttlMs: 10 * 60_000 });
+/** Kept for callers that change metrics outside the fingerprint; the fingerprint covers the rest. */
 export const forgetSpecs = (tenantId: string) => specCache.delete(tenantId);
 
 async function cachedSpecs(p: Platform, tx: Tx, tenantId: string) {
-  const hit = specCache.get(tenantId);
+  const fp = await sql<{ f: string | null }>`
+    SELECT concat_ws('|',
+      (SELECT string_agg(app || ':' || version || ':' || status, ',' ORDER BY app) FROM installed_app),
+      (SELECT max(number)::text FROM metadata_version WHERE status = 'published')) AS f`.execute(tx);
+  const key = `${tenantId}|${fp.rows[0]?.f ?? ''}`;
+  const hit = specCache.get(key);
   if (hit) return hit;
   const specs = await metricSpecs(p, tx);
-  specCache.set(tenantId, specs);
+  specCache.set(key, specs);
   return specs;
 }
 
@@ -143,6 +153,13 @@ async function eventSeq(tx: Tx, id: string): Promise<number> {
   return Number(r?.seq ?? 0);
 }
 
+/**
+ * Consumer adds and rebuild starts are serialized per tenant + metric with an advisory
+ * lock (shared for adds, exclusive for a rebuild's reset), so a reset can never interleave
+ * with an add in flight, even before the metric has a state row.
+ */
+const lockKey = (tenantId: string, metric: string) => sql`hashtextextended(${`metric:${tenantId}:${metric}`}, 0)`;
+
 async function requestRebuild(p: Platform, tenantId: string, metric: string) {
   await p.ports.jobs.send(QUEUES.metricRebuild, { tenantId, metric }, { singletonKey: `${tenantId}:${metric}` });
 }
@@ -156,18 +173,17 @@ export function metricsConsumer(p: Platform): Consumer {
       if (!(await analyticsEnabled(p, tx))) return 'skipped';
       const specs = (await cachedSpecs(p, tx, event.tenant_id)).filter((s) => s.events.some((e) => e.type === event.type));
       if (!specs.length) return;
-      // Lock the states (shared) so a rebuild starting now cannot interleave with this add.
-      const states = await tx.selectFrom('metric_state').selectAll().where('metric', 'in', specs.map((s) => s.id)).forShare().execute();
+      for (const spec of specs.sort((a, b) => a.id.localeCompare(b.id))) await sql`SELECT pg_advisory_xact_lock_shared(${lockKey(event.tenant_id, spec.id)})`.execute(tx);
+      const states = await tx.selectFrom('metric_state').selectAll().where('metric', 'in', specs.map((s) => s.id)).execute();
       const seq = await eventSeq(tx, event.id);
       const points: MetricPoint[] = [];
       for (const spec of specs) {
         const st = states.find((s) => s.metric === spec.id);
-        if (!st || st.version !== spec.version) {
-          // New or changed definition: the rebuild replays this event too.
-          await requestRebuild(p, event.tenant_id, spec.id);
-          continue;
-        }
-        if (st.status === 'rebuilding' && seq <= Number(st.through_seq)) continue;
+        // A rebuild that has started covers every event up to its `through_seq`.
+        if (st && st.version === spec.version && st.status === 'rebuilding' && seq <= Number(st.through_seq)) continue;
+        // New or changed definition: count the event now and ask for a rebuild; the rebuild
+        // resets and replays (under the exclusive lock), so nothing is lost or doubled.
+        if (!st || st.version !== spec.version) await requestRebuild(p, event.tenant_id, spec.id);
         points.push(...pointsFor(spec, event));
       }
       if (points.length) await p.ports.analytics.add(tx, points);
@@ -188,7 +204,7 @@ export async function rebuildMetric(p: Platform, data: { tenantId: string; metri
         await tx.deleteFrom('metric_state').where('metric', '=', metric).execute();
         return null;
       }
-      await sql`SELECT 1 FROM metric_state WHERE metric = ${metric} FOR UPDATE`.execute(tx);
+      await sql`SELECT pg_advisory_xact_lock(${lockKey(tenantId, metric)})`.execute(tx);
       const max = await tx.selectFrom('event_log').select(sql<string>`coalesce(max(seq), 0)`.as('m')).executeTakeFirstOrThrow();
       await p.ports.analytics.reset(tx, metric);
       await tx

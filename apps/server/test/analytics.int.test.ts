@@ -145,6 +145,21 @@ describe('metrics pipeline', () => {
     expect(m.series.find((r) => r.key === 'Kemang')!.value).toBe(2);
   });
 
+  it('counts events that arrive before a metric has state, and the rebuild that follows does not double them', async () => {
+    const fresh = await newTenant(p, 'an-race');
+    await setPlan(p, fresh, 'growth');
+    expect((await runSaga(p, fresh, 'ordering')).status).toBe('succeeded');
+    await cmd(p, fresh, 'ordering', 'order.create', { channel: 'web', store: 'X', lines: [{ sku: 'A', name: 'A', qty: 1, unit_price: 10 }] });
+    await p.ports.eventBus.drain(); // consumer only: no rebuild has run yet
+    const total = () => p.database.withTenant(fresh.tenantId, (tx) => queryMetric(p, tx, fresh.owner, { metric: 'ordering:orders', ...range(), filters: {}, compare: false }));
+    expect((await total()).total).toBe(1);
+    await p.jobs.runAll(); // the requested rebuild resets and replays
+    expect((await total()).total).toBe(1);
+    await cmd(p, fresh, 'ordering', 'order.create', { channel: 'web', store: 'X', lines: [{ sku: 'A', name: 'A', qty: 1, unit_price: 10 }] });
+    await settle();
+    expect((await total()).total).toBe(2);
+  });
+
   it('skips (never throws on) events of a tenant that no longer exists, so the consumer cannot stall', async () => {
     const gone = randomUUID();
     const ev = { id: randomUUID(), type: 'order.created', tenant_id: gone, occurred_at: new Date().toISOString(), data: { total: 1 } } as any;
