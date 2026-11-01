@@ -5,6 +5,7 @@
  * an in-process module. Swapping an adapter must not touch call sites.
  */
 import type { EventEnvelope } from '@aod/shared';
+import type { Readable } from 'node:stream';
 import type { RawBuilder, Transaction } from 'kysely';
 
 /** Kafka later; the outbox + event_log tables now. Publishing happens through the outbox only. */
@@ -119,8 +120,10 @@ export interface Vault {
 
 /** S3 later. Not used before Milestone B. */
 export interface Files {
-  put(tenantId: string, key: string, body: Buffer, contentType: string): Promise<{ url: string }>;
-  get(tenantId: string, key: string): Promise<Buffer | null>;
+  /** Streams the body to storage; callers check the size limit before (memory-safe-code §1). */
+  put(tenantId: string, key: string, body: Readable, contentType: string, opts: { maxBytes: number; contentLength?: number }): Promise<{ url: string; size: number }>;
+  /** A stream of the object (never a whole Buffer), or null if missing. */
+  get(tenantId: string, key: string): Promise<{ stream: Readable; contentType: string; contentLength: number | null } | null>;
 }
 
 /** OpenTelemetry. */

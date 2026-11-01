@@ -110,6 +110,8 @@ e2e/               Playwright
   new screens must pass the axe check (add them to an e2e test).
 - Screens not built yet show `PlannedScreen` naming their package and milestone
   (`apps/web/src/screens/admin.tsx`, `PLANNED`).
+- Server code that touches bodies, streams, timers, workers, caches, clients, retries or
+  unbounded loops follows the `memory-safe-code` skill (run its detection greps on review).
 - Claude API model id comes from config (`CLAUDE_MODEL`, default `claude-opus-5-5`); use the `Llm` port.
 
 ## Git

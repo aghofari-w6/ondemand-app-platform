@@ -5,6 +5,7 @@ import type pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PgEventBus } from '../src/adapters/pg-event-bus.ts';
 import { createMetrics } from '../src/adapters/index.ts';
+import { createDatabase } from '../src/db/database.ts';
 import { APP_URL } from './env.ts';
 import { SINK_SCHEMA, sinkConsumer } from './fixtures/sink.ts';
 import { admin, closePlatform, silent, testPlatform } from './helpers.ts';
@@ -97,6 +98,23 @@ describe('outbox + dispatcher', () => {
     } finally {
       await first.stop();
       await second.stop();
+    }
+  });
+
+  it('gives a broken relay-lock connection back to the pool instead of leaking the slot', async () => {
+    const database = createDatabase(APP_URL, { max: 2 });
+    const bus = new PgEventBus({ database, metrics: createMetrics(), log: silent, intervalMs: 20 });
+    try {
+      expect(await (bus as any).tryLead()).toBe(true);
+      expect(database.pool.totalCount).toBe(1);
+      (bus as any).lockClient.emit('error', new Error('connection lost'));
+      expect(bus.isLeader()).toBe(false);
+      expect(database.pool.totalCount).toBe(0); // destroyed, not held forever
+      expect(await (bus as any).tryLead()).toBe(true); // the lock died with the session
+      expect(database.pool.totalCount).toBe(1);
+    } finally {
+      await bus.stop();
+      await database.close();
     }
   });
 });

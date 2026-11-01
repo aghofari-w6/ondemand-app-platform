@@ -1,6 +1,7 @@
 import { backoffMs } from '@aod/shared';
 import { describe, expect, it } from 'vitest';
-import { createDelivery, policedKafkaSocketFactory, signWebhook, verifyWebhook, type ClientFactories } from './delivery.ts';
+import { createServer } from 'node:http';
+import { createDelivery, policedKafkaSocketFactory, readExcerpt, RESPONSE_EXCERPT_BYTES, signWebhook, verifyWebhook, type ClientFactories } from './delivery.ts';
 import { checkHost, isPrivateAddress, policyFrom, safeLookup } from './ssrf.ts';
 
 const strict = policyFrom('', false);
@@ -86,5 +87,43 @@ describe('transports (fake clients)', () => {
   it('refuses http URLs and private targets at check time', async () => {
     await expect(d.checkTarget({ kind: 'webhook', config: { url: 'http://93.184.216.34/x' }, credentials: null })).rejects.toThrow(/https/);
     await expect(d.checkTarget({ kind: 'sftp', config: { host: '192.168.1.1', directory: '/' }, credentials: { username: 'u', password: 'p' } })).rejects.toThrow(/private/);
+  });
+});
+
+describe('response bodies (memory-safe-code §1)', () => {
+  it('keeps at most the excerpt of an endless response and returns without waiting for it', async () => {
+    let written = 0;
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      const chunk = Buffer.alloc(64 * 1024, 'x');
+      const timer = setInterval(() => {
+        if (res.destroyed) return clearInterval(timer);
+        written += chunk.length;
+        res.write(chunk);
+      }, 5);
+      res.on('close', () => clearInterval(timer));
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const port = (server.address() as { port: number }).port;
+      const d = createDelivery(policyFrom('127.0.0.1', false), { production: false });
+      const started = Date.now();
+      const r = await d.deliver({ kind: 'webhook', config: { url: `http://127.0.0.1:${port}/endless` }, credentials: null, signingSecret: null }, msg);
+      expect(r.ok).toBe(true);
+      expect(r.response).toHaveLength(RESPONSE_EXCERPT_BYTES);
+      expect(Date.now() - started).toBeLessThan(5000); // the 10 s body timeout was not needed
+      const at = written;
+      await new Promise((res) => setTimeout(res, 100));
+      expect(written - at).toBeLessThanOrEqual(64 * 1024); // the transfer was cancelled
+    } finally {
+      server.closeAllConnections();
+      await new Promise((r) => server.close(r));
+    }
+  });
+
+  it('reads short bodies whole and never splits a character', async () => {
+    expect(await readExcerpt(new Response('{"ok":true}'))).toBe('{"ok":true}');
+    expect(await readExcerpt(new Response(null))).toBe('');
+    expect(await readExcerpt(new Response('é'.repeat(10)), 5)).toBe('éé');
   });
 });
