@@ -93,6 +93,17 @@ const payments: TemplateModule = {
         return { id: input.id, version: row.version };
       },
     }),
+    'payment.refund_by_reference': defineCommand({
+      input: z.object({ reference: z.string().min(1).max(120), reason: z.string().max(200).optional() }),
+      async handle(ctx, input) {
+        const p = await ctx.tx.selectFrom('pay_payment').selectAll().where('reference', '=', input.reference).where('status', '=', 'captured').orderBy('created_at', 'desc').executeTakeFirst();
+        if (!p) throw notFound(`captured payment for ${input.reference}`);
+        await fakeProvider(async () => false).refund({ providerRef: p.provider_ref, amount: Number(p.amount) });
+        const row = await updateVersioned(ctx.tx, 'pay_payment', p.id, p.version, { status: 'refunded' });
+        ctx.emit({ type: 'payment.refunded', aggregateType: 'payment', aggregateId: p.id, data: { payment_id: p.id, reference: p.reference, amount: Number(p.amount) } });
+        return { id: p.id, version: row.version, refunded: Number(p.amount) };
+      },
+    }),
     'settings.update': defineCommand({
       input: z.object({ fail_next_capture: z.boolean() }),
       async handle(ctx, input) {

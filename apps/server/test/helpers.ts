@@ -69,6 +69,7 @@ export function cmd(p: Platform, t: TestTenant, app: string, command: string, in
 
 export async function closePlatform(p: Platform) {
   await p.workers.hub.stop();
+  await p.workers.workflows.stop();
   await p.ports.eventBus.stop();
   await p.database.close();
 }

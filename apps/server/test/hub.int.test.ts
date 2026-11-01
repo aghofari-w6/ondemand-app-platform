@@ -116,6 +116,19 @@ describe('Integration Hub', () => {
     expect((await deliveries(ep.id))[0]!.replays).toBe(1);
   });
 
+  it('dead-letters at once when the stored signing secret cannot be decrypted (key changed)', async () => {
+    const ep = await endpoint({ kind: 'webhook', name: 'rekeyed', event_types: ['order.created'], config: { url: `${base}/rekeyed` } });
+    // Simulate a VAULT_KEY change: the ciphertext no longer authenticates.
+    await p.database.withTenant(t.tenantId, (tx) => tx.updateTable('hub_endpoint').set({ signing_secret_enc: p.ports.vault.encrypt('whsec_x', 'some-other-aad') }).where('id', '=', ep.id).execute());
+    await order();
+    await until(async () => (await deliveries(ep.id))[0]?.status === 'dead');
+    const [d] = await deliveries(ep.id);
+    expect(d!.attempts).toBe(0);
+    expect(d!.last_error).toMatch(/cannot be decrypted/);
+    expect(received('/rekeyed')).toHaveLength(0);
+    await p.database.withTenant(t.tenantId, (tx) => tx.updateTable('hub_endpoint').set({ status: 'paused' }).where('id', '=', ep.id).execute());
+  });
+
   it('opens the circuit breaker after consecutive failures and closes it after a successful trial', async () => {
     plan.set('/breaker', [500]);
     const ep = await endpoint({ kind: 'webhook', name: 'breaker', event_types: ['order.created'], config: { url: `${base}/breaker` } });

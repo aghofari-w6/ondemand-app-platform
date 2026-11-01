@@ -25,6 +25,9 @@ export interface CommandRequest {
   origin?: EventOrigin;
   correlationId: string;
   causationId?: string | null;
+  /** set when a workflow runs the command (loop protection) */
+  workflowHop?: number;
+  workflowChain?: string[];
   /** override the clock (demo seed back-dating) */
   now?: () => Date;
 }
@@ -130,6 +133,8 @@ export async function executeCommand(p: Platform, req: CommandRequest, existingT
       causationId: req.causationId ?? null,
       traceparent: p.ports.telemetry.traceparent(),
       origin: req.origin ?? 'user',
+      workflowHop: req.workflowHop ?? 0,
+      workflowChain: req.workflowChain ?? [],
       now,
       newId,
     });

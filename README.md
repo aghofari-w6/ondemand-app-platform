@@ -16,7 +16,8 @@ External services are only called as API clients. Synthetic data only; never com
 | Milestone | Scope | State |
 | --- | --- | --- |
 | A | Week 0 + phase 1 (journey J1) | merged |
-| B | Phase 2: Data studio, custom entities, link index, Integration Hub, public `/v1` | this branch |
+| B | Phase 2: Data studio, custom entities, link index, Integration Hub, public `/v1` | merged |
+| C | Phase 3: workflows on a visual canvas, Approvals, Trace viewer | this branch |
 
 Screens for later milestones are in the navigation and show an empty state naming the
 owning package and milestone.
@@ -74,7 +75,7 @@ pnpm test:integration     # creates a fresh aod_test database (TEST_ADMIN_URL)
 ```
 
 ```bash
-pnpm e2e                  # Playwright J1 journey + axe (needs a migrated `aod` database)
+pnpm e2e                  # Playwright J1, phase 2 and J3 journeys + axe (needs a migrated `aod` database)
 ```
 
 The integration suite includes the contracts that must hold from day one:
@@ -99,11 +100,22 @@ The integration suite includes the contracts that must hold from day one:
   SSRF refusals, encrypted credentials, sandboxed connectors, Redis Streams, two-way sync
   with conflicts and loop prevention), and the public API (scopes, OAuth client
   credentials, delegated tokens, OpenAPI). Kafka, SFTP and SQS are tested with fake clients.
+- Phase 3 (`workflows.int.test.ts`): the J3 workflow end to end (test run on a past void,
+  a real void pausing at Approvals, a second manager approving, refund + notification,
+  trace by correlation, run and record id), rejection and expiry outputs, publishing
+  (invalid graphs, service role above the publisher or too narrow), rollback, the loop
+  guard (two workflows ping-pong once, then stop) and the hop guard, exactly-once (a
+  re-delivered trigger, a node processed twice concurrently), parallel/merge, event waits
+  and timeouts, the run DLQ (retry from the failed node) and the `error` output, and the
+  service principal losing a permission after publish.
 
 CI (`.github/workflows/ci.yml`) runs all of it in one job against a Postgres 17 service
-(plus a test-only Redis service for the Redis Streams adapter). The e2e suite has two
-journeys: J1 and the phase 2 journey (Data studio → custom records with a rule, a
-formula and a board → signed webhook → dead letter → replay → API key), with axe checks.
+(plus a test-only Redis service for the Redis Streams adapter). The e2e suite has three
+journeys: J1, the phase 2 journey (Data studio → custom records with a rule, a formula and
+a board → signed webhook → dead letter → replay → API key) and J3 (canvas + keyboard-only
+outline → test run → publish → approval by a second manager → execution view → trace),
+with axe checks on every screen. A second CI job builds the Docker image, runs it against
+a migrated database and waits for `/api/health`.
 
 ## Layout
 
@@ -205,6 +217,44 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
   through the same authorize/RLS/idempotency/outbox/audit paths. `/v1/openapi.json` is
   generated per tenant from active apps and the published data model.
 
+## Phase 3 in one page
+
+- **Graph** (`packages/shared/src/workflow.ts`): a DAG with one trigger; edges leave from
+  named outputs (`true`/`false`, switch cases, `approved`/`rejected`/`expired`,
+  `event`/`timeout`, `error` on action nodes). The validator rejects cycles, zero or several
+  triggers, unreachable nodes, a port feeding two nodes (use a parallel node), parallel
+  branches meeting anywhere but their merge, unknown events/commands/entities/endpoints/
+  roles, invalid expressions, and a command that can emit the workflow's own trigger
+  without a filter. `{{ }}` templates use the expression language over `trigger`,
+  `steps.<node>.output`, `vars` (and `event` in a wait filter).
+- **Lifecycle** (`platform/workflows/definitions.ts`): the Data studio pattern — one draft,
+  publish validates and supersedes, rollback re-publishes as a new number. Publishing picks
+  the role the workflow acts as; it may not exceed the publisher's permissions or field
+  access, and must cover every node (`hub_send` needs `platform:hub.send`). At run time
+  the principal holds (the role's permissions now) ∩ (the snapshot taken at publish).
+  Enabling a workflow or retrying its run needs the actor to hold that snapshot too.
+- **Run data and field rules:** the execution view and test runs mask any key hidden from
+  the viewer by a field rule; test runs replay only past events of the trigger's type.
+- **Engine** (`platform/workflows/engine.ts`): see the module comment. A consumer starts
+  runs in the transaction that marks the event processed; an in-process runner claims
+  node executions with a lease; command/record nodes commit with their node, keyed
+  `wf:<node run>`. Waits and approval expiries are due node runs; event waits are resolved
+  by the consumer. Failed runs keep their state for retry from the failed node.
+- **Loop protection:** events written by a run carry `origin: workflow`, the run's hop and
+  chain; an event at hop 5, or whose chain holds the workflow, records a cancelled run
+  with the reason instead of starting one.
+- **Approvals** (`platform/approvals.ts`): a platform service (workflows now, assistant
+  tools in E). Approver roles, quorum (any rejection rejects), expiry; every decision is
+  audited under the request's correlation id. The user whose change started the chain
+  (from the audit log) cannot approve its requests.
+- **Trace viewer** (`platform/trace.ts`): everything under a correlation id — audit,
+  events (metadata only), consumers, runs and nodes, Hub deliveries, approvals and
+  decisions — found from a correlation, event, record, run or approval id.
+- **UI:** the canvas is our own editor on React Flow (`@xyflow/react`, MIT; attribution
+  hidden, credited here) with a palette, labelled output ports, inline problems,
+  auto-layout, undo/redo and copy/paste. The outline view offers the same editing as an
+  ordered list of nodes and outputs, by keyboard and screen reader.
+
 ## Decisions worth knowing
 
 - **DDL happens at deploy time, not at provision time.** The migrate script (owner role)
@@ -235,3 +285,12 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
 - **API keys and OAuth clients carry scopes, not roles:** field rules apply to users and
   delegated tokens; machine credentials see every field their scopes allow.
 - Formulas and rollups are computed on read, so they need no backfill.
+- **Workflow nodes are advanced by an in-process claim loop, not pg-boss jobs.** Node runs
+  are rows claimed with a lease (`workflow_claim_nodes`, like Hub deliveries), which keeps
+  completion and successors in one transaction. Temporal can replace it behind the same
+  tables later.
+- **`hub_send` nodes publish a `workflow.message` event** addressed to one endpoint, so
+  outbound calls keep the Hub's SSRF policy, signatures, retries and dead letters.
+- **Notifications go through the outbox:** a `notify` node writes a `workflow.notification`
+  event (user ids, never addresses) with its completion; the `platform.notifications`
+  consumer calls the Channel port. A crash between send and commit can repeat a send.

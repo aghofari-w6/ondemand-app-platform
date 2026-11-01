@@ -15,17 +15,17 @@ plans:
     label: Trial
     packages: [Apps]
     app_slots: 3
-    limits: { custom_entities: 2, custom_fields: 20, hub_endpoints: 2, api_keys: 2 }
+    limits: { custom_entities: 2, custom_fields: 20, hub_endpoints: 2, api_keys: 2, workflows: 3, workflow_nodes: 25, workflow_runs_month: 1000 }
   starter:
     label: Starter
     packages: [Apps]
     app_slots: 4
-    limits: { custom_entities: 5, custom_fields: 60, hub_endpoints: 5, api_keys: 5 }
+    limits: { custom_entities: 5, custom_fields: 60, hub_endpoints: 5, api_keys: 5, workflows: 10, workflow_nodes: 50, workflow_runs_month: 20000 }
   growth:
     label: Growth
     packages: [Apps, Analytics, Bot, Omnichannel]
     app_slots: 12
-    limits: { custom_entities: 25, custom_fields: 400, hub_endpoints: 25, api_keys: 25 }
+    limits: { custom_entities: 25, custom_fields: 400, hub_endpoints: 25, api_keys: 25, workflows: 100, workflow_nodes: 200, workflow_runs_month: 500000 }
 
 # Release channels: which manifest release each channel serves.
 channels:

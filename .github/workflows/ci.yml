@@ -52,7 +52,7 @@ jobs:
       - run: pnpm typecheck
       - name: Unit tests
         run: pnpm test
-      - name: Integration tests (RLS isolation, outbox crash, sagas, Data studio, Hub, /v1)
+      - name: Integration tests (RLS isolation, outbox crash, sagas, Data studio, Hub, /v1, workflows)
         run: pnpm test:integration
       - name: Prepare e2e database
         run: |
@@ -60,7 +60,7 @@ jobs:
           pnpm db:migrate
       - run: pnpm --filter @aod/web build
       - run: pnpm exec playwright install --with-deps chromium
-      - name: E2E (J1 and phase 2 journeys + axe)
+      - name: E2E (J1, phase 2 and J3 journeys + axe)
         run: pnpm e2e
       - uses: actions/upload-artifact@v4
         if: failure()
@@ -68,3 +68,51 @@ jobs:
           name: playwright-report
           path: playwright-report
           retention-days: 7
+
+  docker:
+    name: Docker image + /api/health smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+      DATABASE_URL: postgres://aod_app:aod_app_dev@localhost:5432/aod
+      MIGRATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/aod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Migrate a fresh database
+        run: |
+          psql "$ADMIN_URL" -c 'CREATE DATABASE aod'
+          pnpm db:migrate
+      - name: Build the image
+        run: docker build -t apps-on-demand:ci .
+      - name: Run it and wait for /api/health
+        run: |
+          # A throwaway key generated for this run only; never stored.
+          docker run -d --name aod --network host \
+            -e DATABASE_URL="$DATABASE_URL" -e PUBLIC_URL=http://localhost:3000 \
+            -e VAULT_KEY="$(openssl rand -base64 32)" apps-on-demand:ci
+          for i in $(seq 1 45); do
+            if curl -fsS http://localhost:3000/api/health; then echo; docker inspect --format '{{.State.Health.Status}}' aod; exit 0; fi
+            sleep 2
+          done
+          docker logs aod
+          exit 1
+      - name: The SPA is served from the image
+        run: curl -fsS http://localhost:3000/ | grep -q '<div id="root">'

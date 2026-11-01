@@ -15,6 +15,7 @@ import { appRoutes } from './routes/apps.ts';
 import { authRoutes } from './routes/auth.ts';
 import { dataStudioRoutes } from './routes/datastudio.ts';
 import { hubRoutes } from './routes/hub.ts';
+import { workflowRoutes } from './routes/workflows.ts';
 import { opsRoutes } from './routes/ops.ts';
 import { tenantRoutes } from './routes/tenant.ts';
 import { userRoutes } from './routes/users.ts';
@@ -116,6 +117,7 @@ export async function buildApp(p: Platform): Promise<FastifyInstance> {
   await app.register(appRoutes(p));
   await app.register(dataStudioRoutes(p));
   await app.register(hubRoutes(p));
+  await app.register(workflowRoutes(p));
   await app.register(apiKeyRoutes(p));
   await app.register(v1Routes(p));
 

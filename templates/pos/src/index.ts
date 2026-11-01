@@ -112,11 +112,11 @@ const pos: TemplateModule = {
     'sale.void': defineCommand({
       input: z.object({ id: z.uuid(), version: z.int().positive(), reason: z.string().min(1).max(200) }),
       async handle(ctx, input) {
-        const s = await ctx.tx.selectFrom('pos_sale').select(['status', 'receipt_no']).where('id', '=', input.id).executeTakeFirst();
+        const s = await ctx.tx.selectFrom('pos_sale').select(['status', 'receipt_no', 'total', 'tender', 'store']).where('id', '=', input.id).executeTakeFirst();
         if (!s) throw notFound('sale');
         if (s.status === 'voided') throw conflict('sale is already voided');
         const row = await updateVersioned(ctx.tx, 'pos_sale', input.id, input.version, { status: 'voided', void_reason: input.reason });
-        ctx.emit({ type: 'sale.voided', aggregateType: 'sale', aggregateId: input.id, data: { sale_id: input.id, receipt_no: s.receipt_no, reason: input.reason } });
+        ctx.emit({ type: 'sale.voided', aggregateType: 'sale', aggregateId: input.id, data: { sale_id: input.id, receipt_no: s.receipt_no, reason: input.reason, total: Number(s.total), tender: s.tender, store: s.store } });
         return { id: input.id, version: row.version };
       },
     }),

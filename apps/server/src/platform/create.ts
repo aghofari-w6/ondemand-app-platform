@@ -15,6 +15,7 @@ import { IndexBuilder, runBackfill } from './maintenance.ts';
 import { handleStepJob } from './provisioning.ts';
 import { QUEUES } from './queues.ts';
 import { TEMPLATES } from './templates.ts';
+import { notificationsConsumer, WorkflowRunner, workflowsConsumer } from './workflows/engine.ts';
 import { handleLifecycleJob, lifecycleSweep } from './tenants.ts';
 
 const consoleLogger: Logger = {
@@ -57,7 +58,9 @@ export function createPlatform(opts: { env?: Partial<Record<keyof Env, string>>;
   for (const c of templateConsumers(p)) p.ports.eventBus.subscribe(c);
   p.ports.eventBus.subscribe(linkIndexConsumer(p));
   p.ports.eventBus.subscribe(hubFanoutConsumer(p));
-  p.workers = { hub: new HubDeliverer(p), indexes: null };
+  p.ports.eventBus.subscribe(workflowsConsumer(p));
+  p.ports.eventBus.subscribe(notificationsConsumer(p));
+  p.workers = { hub: new HubDeliverer(p), workflows: new WorkflowRunner(p), indexes: null };
   return p;
 }
 
@@ -71,6 +74,7 @@ export async function startWorkers(p: Platform) {
   await p.ports.jobs.work<{ tenantId: string; runId: string }>(QUEUES.backfill, (data) => runBackfill(p, data));
   await p.ports.eventBus.start();
   p.workers.hub.start();
+  p.workers.workflows.start();
   const ownerUrl = p.env.INDEX_DATABASE_URL ?? p.env.MIGRATION_DATABASE_URL;
   if (ownerUrl) {
     const builder = new IndexBuilder(p, ownerUrl);
@@ -88,6 +92,7 @@ let indexTimer: NodeJS.Timeout | null = null;
 export async function stopPlatform(p: Platform) {
   if (indexTimer) clearTimeout(indexTimer);
   await p.workers.hub.stop();
+  await p.workers.workflows.stop();
   await p.ports.eventBus.stop();
   await p.ports.jobs.stop();
   await p.database.close();

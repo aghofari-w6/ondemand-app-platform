@@ -39,6 +39,10 @@ export const PLATFORM_PERMISSIONS: PermissionDef[] = [
   { id: 'platform:hub.read', label: 'See Integration Hub endpoints and deliveries', level: 'manage' },
   { id: 'platform:hub.manage', label: 'Configure the Integration Hub and replay deliveries', level: 'admin' },
   { id: 'platform:apikeys.manage', label: 'Manage API keys and OAuth clients', level: 'admin' },
+  { id: 'platform:workflows.read', label: 'See workflows and their runs', level: 'manage' },
+  { id: 'platform:workflows.manage', label: 'Build, publish and run workflows', level: 'manage' },
+  { id: 'platform:trace.read', label: 'Use the trace viewer', level: 'manage' },
+  { id: 'platform:hub.send', label: 'Send messages to Hub endpoints from workflows', level: 'admin' },
 ];
 
 export const ROLE_PRESETS = ['Owner', 'Admin', 'Manager', 'Staff', 'Viewer'] as const;
@@ -83,7 +87,8 @@ export interface EntityUid {
 }
 
 export interface Principal extends EntityUid {
-  type: 'User' | 'ApiClient' | 'System';
+  /** `Workflow`: a published workflow acting with its (capped) service role */
+  type: 'User' | 'ApiClient' | 'Workflow' | 'System';
   tenantId: string;
   roles: ResolvedRole[];
 }
