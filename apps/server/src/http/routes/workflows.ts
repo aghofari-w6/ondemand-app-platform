@@ -248,7 +248,7 @@ export function workflowRoutes(p: Platform) {
         if (!run) throw new CommandError(404, 'not_found', 'run not found');
         const w = await tx.selectFrom('workflow').select(['id', 'name']).where('id', '=', run.workflow_id).executeTakeFirstOrThrow();
         const v = await tx.selectFrom('workflow_version').select('graph').where('workflow_id', '=', run.workflow_id).where('number', '=', run.version_number).executeTakeFirstOrThrow();
-        const nodes = await tx.selectFrom('workflow_node_run').select(['id', 'node_id', 'status', 'attempt', 'input', 'output', 'port', 'error', 'state', 'created_at', 'started_at', 'finished_at', 'not_before']).where('run_id', '=', id).orderBy('created_at').execute();
+        const nodes = await tx.selectFrom('workflow_node_run').select(['id', 'node_id', 'status', 'attempt', 'input', 'output', 'port', 'error', 'state', 'created_at', 'started_at', 'finished_at', 'not_before']).where('run_id', '=', id).orderBy('created_at').orderBy(sql`started_at NULLS LAST`).orderBy('node_id').execute();
         const approvals = await tx.selectFrom('approval_request').select(['id', 'source_ref', 'title', 'status']).where('source', '=', 'workflow').where('source_ref', 'in', [...nodes.map((n) => n.id), '00000000-0000-0000-0000-000000000000']).execute();
         return { run, workflow: w, graph: v.graph, nodes, approvals };
       });

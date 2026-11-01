@@ -15,6 +15,7 @@ import { createPlatform } from './platform/create.ts';
 import { enqueueStep, handleStepJob, SAGAS, startRun } from './platform/provisioning.ts';
 import { QUEUES } from './platform/queues.ts';
 import { changeTenantStatus, signup } from './platform/tenants.ts';
+import { createWorkflow, publishWorkflow } from './platform/workflows/definitions.ts';
 import { newId } from './db/database.ts';
 
 const SLUG = 'acme-coffee';
@@ -74,6 +75,27 @@ export async function seedAcme(opts: { reset?: boolean; adminUrl?: string; env?:
         ),
       );
     }
+    // Workflow (J3): large voids need a manager's approval before the card refund.
+    await p.database.withTenant(tenantId, async (tx) => {
+      const n = (id: string, type: string, name: string, x: number, y: number, config: Record<string, unknown>) => ({ id, type, name, position: { x, y }, config });
+      const graph = {
+        nodes: [
+          n('trigger', 'trigger', 'Large void', 0, 0, { event: 'sale.voided', filter: 'trigger.data.total > 1000000' }),
+          n('approve', 'approval', 'Manager approval', 300, 0, { title: 'Refund voided sale {{ trigger.data.receipt_no }}', details: 'Total {{ trigger.data.total }} at {{ trigger.data.store }}. Reason: {{ trigger.data.reason }}', approver_roles: ['Manager'], quorum: 1, expires_in_hours: 24 }),
+          n('refund', 'command', 'Refund payment', 600, -90, { app: 'payments', command: 'payment.refund_by_reference', input: { reference: 'pos:sale:{{ trigger.data.sale_id }}', reason: 'voided: {{ trigger.data.reason }}' } }),
+          n('notify_store', 'notify', 'Notify store', 900, -90, { roles: ['Manager'], subject: 'Refund issued for {{ trigger.data.receipt_no }}', message: 'Refunded {{ steps.refund.output.refunded }}.' }),
+          n('notify_cashier', 'notify', 'Notify cashier', 600, 120, { roles: ['Staff'], subject: 'Void refund rejected', message: 'The refund for {{ trigger.data.receipt_no }} was rejected.' }),
+        ],
+        edges: [
+          { id: 'e1', from: 'trigger', port: 'out', to: 'approve' },
+          { id: 'e2', from: 'approve', port: 'approved', to: 'refund' },
+          { id: 'e3', from: 'refund', port: 'out', to: 'notify_store' },
+          { id: 'e4', from: 'approve', port: 'rejected', to: 'notify_cashier' },
+        ],
+      };
+      const { id } = await createWorkflow(p, tx, tenantId, owner, { name: 'Large void refund', description: 'Voids over Rp 1,000,000 need a manager before the card is refunded.', graph }, randomUUID());
+      await publishWorkflow(p, tx, tenantId, owner, id, 1, 'Manager', randomUUID());
+    });
     // Deliver events now unless a running server is the dispatcher (it will deliver them).
     await p.ports.eventBus.drain().catch(() => console.log('A running server holds the dispatcher lock; it will deliver the seed events.'));
     console.log(`Seeded "Acme Coffee" (${SLUG}). Sign in with workspace "${SLUG}" and ${OWNER}.`);

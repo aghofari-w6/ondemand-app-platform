@@ -8,6 +8,8 @@ import { DataStudioScreen } from './screens/datastudio';
 import { EndpointScreen, HubScreen } from './screens/hub';
 import { PosScreen, SaleDetailScreen } from './screens/pos';
 import { RecordDetailScreen, RecordsIndexScreen, RecordsScreen } from './screens/records';
+import { ApprovalsScreen, TraceViewerScreen } from './screens/operations';
+import { WorkflowEditorScreen, WorkflowRunScreen, WorkflowsScreen } from './screens/workflows';
 
 const root = createRootRoute({ component: () => <Outlet /> });
 
@@ -43,6 +45,11 @@ const routeTree = root.addChildren([
     r('/data/$entity/$id', RecordDetailScreen),
     r('/integration-hub', HubScreen),
     r('/integration-hub/endpoints/$id', EndpointScreen),
+    r('/workflows', WorkflowsScreen),
+    r('/workflows/$id', WorkflowEditorScreen),
+    r('/workflow-runs/$runId', WorkflowRunScreen),
+    r('/approvals', ApprovalsScreen),
+    r('/trace-viewer', TraceViewerScreen),
     ...Object.keys(PLANNED).map((path) => r(path, () => <PlannedScreen path={path} />)),
   ]),
 ]);

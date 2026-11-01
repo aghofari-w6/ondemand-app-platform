@@ -15,6 +15,7 @@ import {
   Select as AriaSelect,
   SelectValue,
   Text,
+  TextArea as AriaTextArea,
   TextField as AriaTextField,
   type ButtonProps,
 } from 'react-aria-components';
@@ -68,6 +69,21 @@ export function TextField(props: {
         inputMode={props.inputMode}
         className="min-h-11 rounded-lg border border-line bg-white px-3 text-base text-ink placeholder:text-muted invalid:border-bad"
       />
+      {props.description && (
+        <Text slot="description" className="text-sm text-muted">
+          {props.description}
+        </Text>
+      )}
+      <FieldError className="text-sm text-bad">{props.error}</FieldError>
+    </AriaTextField>
+  );
+}
+
+export function TextArea(props: { label: string; value: string; onChange: (v: string) => void; description?: string; error?: string | undefined; rows?: number; className?: string; mono?: boolean }) {
+  return (
+    <AriaTextField className={`flex flex-col gap-1 ${props.className ?? ''}`} value={props.value} onChange={props.onChange} isInvalid={Boolean(props.error)}>
+      <Label className="text-sm font-medium text-ink">{props.label}</Label>
+      <AriaTextArea rows={props.rows ?? 4} className={`min-h-11 rounded-lg border border-line bg-white px-3 py-2 text-base text-ink ${props.mono ? 'font-mono text-sm' : ''}`} />
       {props.description && (
         <Text slot="description" className="text-sm text-muted">
           {props.description}
@@ -159,6 +175,14 @@ export function Card(props: { children: ReactNode; className?: string; title?: s
 const tones: Record<string, string> = {
   active: 'bg-ok-soft text-ok',
   succeeded: 'bg-ok-soft text-ok',
+  approved: 'bg-ok-soft text-ok',
+  published: 'bg-ok-soft text-ok',
+  pending: 'bg-accent-soft text-accent',
+  waiting: 'bg-warn-soft text-warn',
+  draft: 'bg-warn-soft text-warn',
+  rejected: 'bg-bad-soft text-bad',
+  expired: 'bg-bad-soft text-bad',
+  disabled: 'bg-bad-soft text-bad',
   done: 'bg-ok-soft text-ok',
   completed: 'bg-ok-soft text-ok',
   delivered: 'bg-ok-soft text-ok',

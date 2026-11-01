@@ -368,7 +368,8 @@ async function startRuns(p: Platform, tx: Tx, event: EventEnvelope) {
     const run = await lockRun(tx, runId);
     const nrId = newId();
     const output = computePure(trigger, { trigger: event }, null).output;
-    await tx.insertInto('workflow_node_run').values({ id: nrId, tenant_id: event.tenant_id, run_id: runId, node_id: trigger.id, status: 'succeeded', attempt: 1, groups: [], input: null, output: json(output), port: 'out', started_at: new Date(), finished_at: new Date() }).execute();
+    // created a moment earlier than its successors (same transaction, same now()) so it lists first
+    await tx.insertInto('workflow_node_run').values({ id: nrId, tenant_id: event.tenant_id, run_id: runId, node_id: trigger.id, status: 'succeeded', attempt: 1, groups: [], input: null, output: json(output), port: 'out', created_at: sql`now() - interval '1 millisecond'`, started_at: new Date(), finished_at: new Date() }).execute();
     await advance(tx, run, graph, { node_id: trigger.id, groups: [] }, 'out', output);
     await maybeComplete(p, tx, run);
   }
