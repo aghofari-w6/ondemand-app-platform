@@ -26,6 +26,18 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* Respect reduced motion (WCAG 2.3.3): no transitions or animations. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0s !important;
+    animation-duration: 0s !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* Visible keyboard focus everywhere (WCAG 2.4.7). */
 :focus-visible,
 [data-focus-visible] {
