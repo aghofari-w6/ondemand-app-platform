@@ -16,6 +16,34 @@ import { BlockedAddressError, checkHost, isPrivateAddress, safeLookup, type Ssrf
  */
 
 const TIMEOUT_MS = 10_000;
+/** Bytes of a remote response kept for the delivery log; the rest is never read. */
+export const RESPONSE_EXCERPT_BYTES = 2048;
+
+/**
+ * Reads at most `maxBytes` of a response body, then cancels the stream, so a remote
+ * endpoint cannot make us hold a large (or endless) body in memory.
+ */
+export async function readExcerpt(res: Response, maxBytes = RESPONSE_EXCERPT_BYTES): Promise<string> {
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (size < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const take = value.subarray(0, maxBytes - size);
+      chunks.push(take);
+      size += take.length;
+    }
+  } catch {
+    // a body that fails mid-way still yields what was read
+  } finally {
+    // Stop the transfer; the connection is not reused for the rest of the body.
+    await reader.cancel().catch(() => undefined);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks)).replace(/\uFFFD$/, '');
+}
 
 /** Standard Webhooks signature: base64(HMAC-SHA256(secret, `${id}.${timestamp}.${body}`)). */
 export function signWebhook(secret: string, id: string, timestamp: number, body: string): string {
@@ -85,7 +113,7 @@ export function createDelivery(policy: SsrfPolicy, opts: { production: boolean; 
   async function http(url: string, method: string, body: string, headers: Record<string, string>): Promise<Omit<DeliveryResult, 'durationMs'>> {
     await checkUrl(url);
     const res = await fetch(url, { method, body, headers: { 'content-type': 'application/json', 'user-agent': 'apps-on-demand-hub/1', ...headers }, dispatcher: agent, redirect: 'manual', signal: AbortSignal.timeout(TIMEOUT_MS) });
-    const text = (await res.text().catch(() => '')).slice(0, 2048);
+    const text = await readExcerpt(res);
     if (res.status >= 300 && res.status < 400) return { ok: false, status: res.status, error: 'redirects are not followed', response: text };
     return { ok: res.status >= 200 && res.status < 300, status: res.status, response: text, ...(res.ok ? {} : { error: `HTTP ${res.status}` }) };
   }

@@ -29,6 +29,8 @@ interface Options {
 export class PgEventBus implements EventBus {
   private consumers: Consumer[] = [];
   private lockClient: pg.PoolClient | null = null;
+  /** lock clients already returned to the pool (a client may error after we released it) */
+  private released = new WeakSet<pg.PoolClient>();
   private timer: NodeJS.Timeout | null = null;
   private running = false;
   private ticking: Promise<void> | null = null;
@@ -82,8 +84,11 @@ export class PgEventBus implements EventBus {
     try {
       const r = await client.query<{ ok: boolean }>('SELECT pg_try_advisory_lock($1) AS ok', [RELAY_LOCK_KEY]);
       if (r.rows[0]?.ok) {
-        client.on('error', () => {
-          this.lockClient = null;
+        // A broken lock connection is given back to the pool (destroyed), never just
+        // forgotten: forgetting it would leak one pool slot per lost connection.
+        client.on('error', (err) => {
+          if (this.lockClient === client) this.lockClient = null;
+          this.dropClient(client, err);
         });
         this.lockClient = client;
         this.o.log.info({}, 'event bus: acquired relay lock (leader)');
@@ -97,15 +102,22 @@ export class PgEventBus implements EventBus {
     return false;
   }
 
+  /** Returns a lock client to the pool exactly once (`err` destroys the connection). */
+  private dropClient(c: pg.PoolClient, err?: Error | boolean) {
+    if (this.released.has(c)) return;
+    this.released.add(c);
+    c.release(err);
+  }
+
   private async releaseLock() {
     const c = this.lockClient;
     this.lockClient = null;
     if (!c) return;
     try {
       await c.query('SELECT pg_advisory_unlock($1)', [RELAY_LOCK_KEY]);
-      c.release();
+      this.dropClient(c);
     } catch {
-      c.release(true);
+      this.dropClient(c, true);
     }
   }
 
@@ -115,8 +127,9 @@ export class PgEventBus implements EventBus {
     try {
       await this.lockClient!.query('SELECT 1');
     } catch {
-      this.lockClient?.release(true);
+      const c = this.lockClient;
       this.lockClient = null;
+      if (c) this.dropClient(c, true);
       return;
     }
     await this.relay();

@@ -5,6 +5,7 @@ import { context, metrics as otelMetrics, propagation, trace, SpanStatusCode } f
 import { sql } from 'kysely';
 import * as oidc from 'openid-client';
 import type { PlatformConfig } from '../config.ts';
+import { BoundedCache } from './bounded-cache.ts';
 import type { Auth, Billing, Channel, Files, Llm, Metrics, OidcSettings, Retriever, SamlSettings, Search, Telemetry, Vault } from '../ports/index.ts';
 
 // ------------------------------------------------------------------ Search
@@ -126,11 +127,12 @@ export function createChannel(demoMode: boolean, log: (m: string) => void): Chan
 // ------------------------------------------------------------------ Auth (OIDC + SAML)
 
 export function createAuth(opts: { allowInsecureIssuers?: boolean } = {}): Auth {
-  const cache = new Map<string, { at: number; cfg: oidc.Configuration }>();
+  // Keyed by tenant-supplied issuers: bounded in size and age.
+  const cache = new BoundedCache<oidc.Configuration>({ max: 500, ttlMs: 10 * 60_000 });
   async function config(s: OidcSettings) {
     const k = `${s.issuer}|${s.clientId}`;
     const hit = cache.get(k);
-    if (hit && Date.now() - hit.at < 10 * 60_000) return hit.cfg;
+    if (hit) return hit;
     const cfg = await oidc.discovery(
       new URL(s.issuer),
       s.clientId,
@@ -138,7 +140,7 @@ export function createAuth(opts: { allowInsecureIssuers?: boolean } = {}): Auth 
       s.clientSecret ? oidc.ClientSecretPost(s.clientSecret) : oidc.None(),
       opts.allowInsecureIssuers ? { execute: [oidc.allowInsecureRequests] } : undefined,
     );
-    cache.set(k, { at: Date.now(), cfg });
+    cache.set(k, cfg);
     return cfg;
   }
   const saml = (s: SamlSettings, callbackUrl: string) =>
@@ -191,11 +193,13 @@ export function createAuth(opts: { allowInsecureIssuers?: boolean } = {}): Auth 
 
 // ------------------------------------------------------------------ Llm (Claude)
 
-export function createLlm(apiKey: string | undefined, model: string): Llm {
+export function createLlm(apiKey: string | undefined, model: string, make: (apiKey: string) => Anthropic = (k) => new Anthropic({ apiKey: k })): Llm {
+  // One client (and connection pool) per process, created on first use.
+  let client: Anthropic | null = null;
   return {
     async complete(p) {
       if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not configured');
-      const client = new Anthropic({ apiKey });
+      client ??= make(apiKey);
       const res = await client.messages.create({
         model,
         max_tokens: p.maxTokens ?? 1024,

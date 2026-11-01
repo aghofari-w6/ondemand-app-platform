@@ -238,15 +238,14 @@ grep -nE "^\s+void [a-zA-Z_.]+\(|\.catch\(\(\) => \{\}\)" <files>
 
 For every hit, the PR must show the bound, the cleanup, or a one-line justification.
 
-## Known gaps (found when this skill was added; fix in a dedicated change)
+## Fixed when this skill was added (use as references)
 
-- `adapters/delivery.ts` `http()` reads the whole response with `res.text()` before
-  slicing to 2 KB (§1). The timeout bounds the time, not the bytes.
-- `createAuth` in `adapters/index.ts` keeps OIDC configurations in an unbounded `Map`
-  keyed by the tenant-supplied issuer. The TTL is checked on read but never evicts (§5).
-- `createLlm` in `adapters/index.ts` creates a new Anthropic client on every call (§3).
-- `PgEventBus.tryLead()` (`adapters/pg-event-bus.ts`): the lock client's `error` handler
-  drops the client without `release(err)`, so each lost lock connection leaks a pool slot
-  (§3).
-- The `Files` port's `put()` takes a `Buffer` (§1). Change it to a stream when the port
-  is implemented (Milestone D).
+- §1 `readExcerpt()` in `adapters/delivery.ts`: Hub responses are read up to
+  `RESPONSE_EXCERPT_BYTES` and the stream is cancelled (was `res.text()` then slice).
+- §5 `BoundedCache` (`adapters/bounded-cache.ts`): max size plus a TTL that evicts on
+  write. Used for OIDC configurations, which are keyed by tenant-supplied issuers.
+- §3 `createLlm`: one Anthropic client per process, created on first use.
+- §3 `PgEventBus`: a broken relay-lock connection is released to the pool (destroyed)
+  exactly once, instead of being forgotten with its pool slot.
+- §1 The `Files` port streams: `put(…, body: Readable, …, { maxBytes })` and
+  `get() → { stream, … }`. Its adapter (Milestone D) must keep that shape.
