@@ -45,6 +45,22 @@ body {
   outline-offset: 2px;
 }
 
+/* Canvas ports: a small visible dot with a 44×44 px pointer target (project 44 px rule;
+   WCAG 2.5.5) at 100% zoom. Ports are 44 px apart, so targets never overlap and a press
+   never starts the wrong connection. The target is a transparent pseudo-element of the
+   handle itself (drag, or click-to-connect). Like everything on the canvas it scales with
+   the zoom; the outline view is the zoom-independent alternative. */
+.react-flow__handle.aod-port::before {
+  content: '';
+  position: absolute;
+  width: 44px;
+  height: 44px;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  border-radius: 9999px;
+}
+
 .skip-link {
   position: absolute;
   left: -9999px;
