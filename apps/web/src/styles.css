@@ -1,0 +1,47 @@
+@import 'tailwindcss';
+@import '@fontsource-variable/inter';
+
+@theme {
+  --font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+  --color-ground: #f6f7f9;
+  --color-ink: #1b1f27;
+  --color-muted: #5f6672;
+  --color-line: #e3e6eb;
+  --color-accent: #2856d9;
+  --color-accent-hover: #1f47b8;
+  --color-accent-soft: #eaf0fd;
+  --color-ok: #146c43;
+  --color-ok-soft: #e7f4ec;
+  --color-warn: #8a5300;
+  --color-warn-soft: #fdf3e1;
+  --color-bad: #b42318;
+  --color-bad-soft: #fdecea;
+}
+
+html,
+body {
+  background: var(--color-ground);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Visible keyboard focus everywhere (WCAG 2.4.7). */
+:focus-visible,
+[data-focus-visible] {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+}
+.skip-link:focus {
+  left: 1rem;
+  top: 1rem;
+  z-index: 50;
+  background: white;
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+}

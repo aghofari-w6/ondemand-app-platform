@@ -1,0 +1,108 @@
+id: ordering
+name: Ordering
+description: Take, track and fulfil customer orders across channels.
+package: Apps
+version: 1.1.0
+releases:
+  - version: 1.0.0
+    channel: stable
+    migrations: [20261101100001_ordering.sql]
+    notes: First release.
+  - version: 1.1.0
+    channel: canary
+    migrations: [20261101100001_ordering.sql, 20261101100002_ordering_pickup_eta.sql]
+    notes: Adds an optional pickup ETA to orders (expand-only).
+dependencies:
+  requires: []
+  optional: [payments, pos, logistics]
+
+entities:
+  - name: order
+    label: Order
+    resource: ordering::Order
+    table: ord_order
+    custom_fields: true
+    default_sort: -number
+    events: [order.created, order.status_changed, order.updated, order.cancelled]
+    fields:
+      - { key: number, label: Number, type: number, sortable: true, searchable: true }
+      - { key: status, label: Status, type: select, options: [new, confirmed, preparing, ready, completed, cancelled], facet: true, sortable: true }
+      - { key: channel, label: Channel, type: select, options: [web, phone, pos, marketplace], facet: true }
+      - { key: store, label: Store, type: text, facet: true, searchable: true }
+      - { key: customer_name, label: Customer, type: text, pii: true, sortable: true, searchable: true }
+      - { key: customer_phone, label: Phone, type: text, pii: true }
+      - { key: total, label: Total, type: money, sortable: true }
+      - { key: placed_at, label: Placed, type: datetime, sortable: true }
+      - { key: notes, label: Notes, type: text, searchable: true }
+
+events:
+  publishes:
+    - { type: order.created, entity: order, description: An order was placed., data: [order_id, number, channel, store, total, currency, lines, source_ref] }
+    - { type: order.status_changed, entity: order, description: An order moved to another status., data: [order_id, number, from, to] }
+    - { type: order.updated, entity: order, description: Order details or custom fields changed., data: [order_id, number, changes] }
+    - { type: order.cancelled, entity: order, description: An order was cancelled., data: [order_id, number, reason] }
+  consumes:
+    - { type: sale.completed, consumer: pos_sales, capability: pos_sales_to_orders }
+    - { type: sale.voided, consumer: pos_voids, capability: pos_sales_to_orders }
+
+commands:
+  - name: order.create
+    description: Place a new order.
+    permission: ordering:order.create
+    entity: order
+    may_emit: [order.created]
+  - name: order.advance
+    description: Move an order to its next status.
+    permission: ordering:order.fulfil
+    entity: order
+    may_emit: [order.status_changed]
+  - name: order.cancel
+    description: Cancel an order.
+    permission: ordering:order.cancel
+    entity: order
+    may_emit: [order.cancelled, order.status_changed]
+  - name: order.update
+    description: Change notes, customer details or custom fields.
+    permission: ordering:order.update
+    entity: order
+    may_emit: [order.updated]
+
+views:
+  - { name: open, label: Open orders, entity: order, filter: { status: [new, confirmed, preparing] }, sort: placed_at }
+  - { name: ready, label: Ready for pickup, entity: order, filter: { status: [ready] }, sort: placed_at }
+  - { name: pos_sales, label: POS sales, entity: order, filter: { channel: [pos] }, sort: -placed_at }
+  - { name: all, label: All orders, entity: order, sort: -number }
+
+workflows:
+  templates:
+    - name: auto_confirm_small
+      label: Auto-confirm small web orders
+      trigger: order.created
+      condition: "channel == 'web' && total < 100000"
+      action: order.advance
+
+analytics:
+  metrics:
+    - { name: orders, label: Orders, entity: order, aggregate: count }
+    - { name: revenue, label: Revenue, entity: order, aggregate: sum, field: total }
+
+assistant:
+  tools:
+    - { name: list_open_orders, description: List open orders., risk: read, view: open }
+    - { name: advance_order, description: Move an order to its next status., risk: low, command: order.advance }
+    - { name: cancel_order, description: Cancel an order., risk: high, command: order.cancel }
+
+telemetry:
+  spans: [ordering.command, ordering.consumer]
+  metrics: [ordering_orders_created_total, ordering_order_value]
+
+permissions:
+  - { id: "ordering:order.read", label: See orders, level: read }
+  - { id: "ordering:order.create", label: Place orders, level: operate }
+  - { id: "ordering:order.fulfil", label: Advance order status, level: operate }
+  - { id: "ordering:order.update", label: Edit orders, level: operate }
+  - { id: "ordering:order.cancel", label: Cancel orders, level: manage }
+
+config:
+  currency: IDR
+  number_start: 1001

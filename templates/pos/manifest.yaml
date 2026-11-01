@@ -1,0 +1,123 @@
+id: pos
+name: POS
+description: Point of sale for stores — registers, cart, tender, voids, shifts, and offline sales.
+package: Apps
+version: 1.0.0
+releases:
+  - version: 1.0.0
+    channel: stable
+    migrations: [20261101120001_pos.sql]
+dependencies:
+  requires: []
+  optional: [ordering, payments]
+
+entities:
+  - name: sale
+    label: Sale
+    resource: pos::Sale
+    table: pos_sale
+    custom_fields: true
+    default_sort: -sold_at
+    events: [sale.completed, sale.voided]
+    fields:
+      - { key: receipt_no, label: Receipt, type: text, searchable: true, sortable: true }
+      - { key: status, label: Status, type: select, options: [completed, voided], facet: true }
+      - { key: store, label: Store, type: text, facet: true, searchable: true }
+      - { key: tender, label: Tender, type: select, options: [cash, card, qris], facet: true }
+      - { key: total, label: Total, type: money, sortable: true }
+      - { key: offline, label: Rung up offline, type: boolean, facet: true }
+      - { key: sold_at, label: Sold, type: datetime, sortable: true }
+  - name: shift
+    label: Shift
+    resource: pos::Shift
+    table: pos_shift
+    read_permission: "pos:sale.read"
+    default_sort: -opened_at
+    events: [shift.opened, shift.closed]
+    fields:
+      - { key: register, label: Register, type: text, facet: true, searchable: true }
+      - { key: store, label: Store, type: text, facet: true, searchable: true }
+      - { key: status, label: Status, type: select, options: [open, closed], facet: true }
+      - { key: opened_at, label: Opened, type: datetime, sortable: true }
+      - { key: expected_cash, label: Expected cash, type: money }
+      - { key: counted_cash, label: Counted cash, type: money }
+  - name: store
+    label: Store
+    resource: pos::Store
+    table: pos_store
+    read_permission: "pos:sale.read"
+    workspace: false
+    events: [store.created]
+    fields:
+      - { key: name, label: Name, type: text }
+
+events:
+  publishes:
+    - { type: sale.completed, entity: sale, description: A sale was tendered., data: [sale_id, receipt_no, store, register, total, currency, tender, lines, sold_at, offline] }
+    - { type: sale.voided, entity: sale, description: A sale was voided., data: [sale_id, receipt_no, reason] }
+    - { type: shift.opened, entity: shift, description: A register shift was opened., data: [shift_id, register, store, opening_float] }
+    - { type: shift.closed, entity: shift, description: A register shift was closed., data: [shift_id, expected_cash, counted_cash, variance, sales] }
+    - { type: store.created, entity: store, description: A store was added., data: [store_id, name, registers] }
+
+commands:
+  - name: sale.complete
+    description: Tender a cart. Idempotent on the client-generated sale id (offline sync).
+    permission: pos:sale.ring
+    entity: sale
+    may_emit: [sale.completed]
+  - name: sale.void
+    description: Void a completed sale.
+    permission: pos:sale.void
+    entity: sale
+    may_emit: [sale.voided]
+  - name: shift.open
+    description: Open a shift on a register.
+    permission: pos:shift.operate
+    entity: shift
+    may_emit: [shift.opened]
+  - name: shift.close
+    description: Close a shift and count the drawer.
+    permission: pos:shift.operate
+    entity: shift
+    may_emit: [shift.closed]
+  - name: store.create
+    description: Add a store with its registers.
+    permission: pos:store.manage
+    entity: store
+    may_emit: [store.created]
+
+views:
+  - { name: today, label: Sales, entity: sale, sort: -sold_at }
+  - { name: offline, label: Synced from offline, entity: sale, filter: { offline: ["true"] }, sort: -sold_at }
+  - { name: open_shifts, label: Open shifts, entity: shift, filter: { status: [open] } }
+
+analytics:
+  metrics:
+    - { name: sales, label: Sales, entity: sale, aggregate: count }
+    - { name: takings, label: Takings, entity: sale, aggregate: sum, field: total }
+
+assistant:
+  tools:
+    - { name: list_open_shifts, description: List open shifts., risk: read, view: open_shifts }
+    - { name: void_sale, description: Void a sale., risk: high, command: sale.void }
+
+telemetry:
+  spans: [pos.sale, pos.offline_sync]
+  metrics: [pos_sales_total, pos_offline_sales_synced_total]
+
+permissions:
+  - { id: "pos:sale.read", label: See sales and shifts, level: read }
+  - { id: "pos:sale.ring", label: Ring up sales, level: operate }
+  - { id: "pos:shift.operate", label: Open and close shifts, level: operate }
+  - { id: "pos:sale.void", label: Void sales, level: manage }
+  - { id: "pos:store.manage", label: Manage stores and registers, level: admin }
+
+config:
+  currency: IDR
+  products:
+    - { sku: ESP, name: Espresso, price: 25000 }
+    - { sku: LAT, name: Caffè latte, price: 38000 }
+    - { sku: KSU, name: Es kopi susu, price: 32000 }
+    - { sku: MAT, name: Matcha latte, price: 42000 }
+    - { sku: CRO, name: Butter croissant, price: 28000 }
+    - { sku: BAN, name: Banana bread, price: 30000 }

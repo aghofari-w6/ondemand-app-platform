@@ -1,0 +1,31 @@
+# Local prototype stack: one app container + one PostgreSQL database.
+# Copy .env.example to .env first (VAULT_KEY etc.). Synthetic data only.
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: aod
+    ports: ['5432:5432']
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d aod']
+      interval: 2s
+      retries: 30
+
+  app:
+    build: .
+    depends_on:
+      db: { condition: service_healthy }
+    env_file: [{ path: .env, required: false }]
+    environment:
+      DATABASE_URL: postgres://aod_app:${APP_DB_PASSWORD:-aod_app_dev}@db:5432/aod
+      MIGRATION_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/aod
+      PUBLIC_URL: http://localhost:3000
+      DEMO_MODE: 'true'
+    # Migrations run as the owner role; the server itself connects as aod_app (no BYPASSRLS).
+    command: sh -c "node apps/server/src/db/migrate.ts && node apps/server/src/seed.ts && node apps/server/src/main.ts"
+    ports: ['3000:3000']
+
+volumes:
+  pgdata:

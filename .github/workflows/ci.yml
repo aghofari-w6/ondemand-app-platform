@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Lint, type-check, unit + integration + e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      CI: 'true'
+      TEST_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+      DATABASE_URL: postgres://aod_app:aod_app_dev@localhost:5432/aod
+      MIGRATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/aod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - name: Unit tests
+        run: pnpm test
+      - name: Integration tests (RLS isolation, outbox crash, sagas, API)
+        run: pnpm test:integration
+      - name: Prepare e2e database
+        run: |
+          psql "$TEST_ADMIN_URL" -c 'CREATE DATABASE aod'
+          pnpm db:migrate
+      - run: pnpm --filter @aod/web build
+      - run: pnpm exec playwright install --with-deps chromium
+      - name: E2E (J1 journey + axe)
+        run: pnpm e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: playwright-report
+          retention-days: 7
