@@ -27,7 +27,8 @@ export async function setTenant(tx: Tx, tenantId: string) {
 }
 
 export function createDatabase(connectionString: string, opts: { max?: number; applicationName?: string } = {}): Database {
-  const pool = new pg.Pool({ connectionString, max: opts.max ?? 10, application_name: opts.applicationName ?? 'aod' });
+  // Never wait forever for a connection (memory-safe-code §3): a starved pool fails fast instead of hanging every worker.
+  const pool = new pg.Pool({ connectionString, max: opts.max ?? 10, application_name: opts.applicationName ?? 'aod', connectionTimeoutMillis: 30_000 });
   const db = new Kysely<any>({ dialect: new PostgresDialect({ pool }) });
   return {
     db,

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { CustomMetric } from './analytics.ts';
 import { parse as parseExpr, references } from './expr/index.ts';
 
 /**
@@ -89,10 +90,12 @@ export const Definition = z.object({
   entities: z.array(CustomEntity).default([]),
   layouts: z.array(Layout).default([]),
   field_access: z.array(FieldAccessRule).default([]),
+  /** analytics metrics over custom entities */
+  metrics: z.array(CustomMetric).max(50).default([]),
 });
 export type Definition = z.infer<typeof Definition>;
 
-export const emptyDefinition = (): Definition => ({ app_fields: [], entities: [], layouts: [], field_access: [] });
+export const emptyDefinition = (): Definition => ({ app_fields: [], entities: [], layouts: [], field_access: [], metrics: [] });
 
 /** What the validator needs to know about the rest of the platform. */
 export interface DefinitionContext {
@@ -219,6 +222,23 @@ export function validateDefinition(def: Definition, ctx: DefinitionContext): str
     const fields = fieldsOf(a.target);
     if (!fields) p.push(`field access: unknown target ${a.target}`);
     else if (!fields.has(a.field)) p.push(`field access ${a.target}: unknown field ${a.field}`);
+  }
+
+  for (const m of def.metrics) {
+    const ent = def.entities.find((e) => e.key === m.entity);
+    if (!ent) {
+      p.push(`metric ${m.key}: unknown custom entity ${m.entity}`);
+      continue;
+    }
+    const f = m.field ? ent.fields.find((x) => x.key === m.field) : undefined;
+    if (m.aggregate === 'sum' && (!f || f.type !== 'number')) p.push(`metric ${m.key}: sum needs a number field of ${m.entity}`);
+    if (f?.pii) p.push(`metric ${m.key}: cannot aggregate the PII field ${f.key}`);
+    for (const [d, k] of Object.entries(m.dims)) {
+      const df = ent.fields.find((x) => x.key === k);
+      if (!df) p.push(`metric ${m.key}: dimension ${d} uses unknown field ${k}`);
+      else if (df.pii) p.push(`metric ${m.key}: dimension ${d} cannot use the PII field ${k}`);
+    }
+    if (def.metrics.filter((x) => x.key === m.key).length > 1) p.push(`metric ${m.key}: defined twice`);
   }
 
   const customFieldCount = def.app_fields.reduce((n, s) => n + s.fields.length, 0) + def.entities.reduce((n, e) => n + e.fields.length, 0);

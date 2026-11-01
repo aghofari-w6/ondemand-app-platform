@@ -9,6 +9,8 @@ import { EndpointScreen, HubScreen } from './screens/hub';
 import { PosScreen, SaleDetailScreen } from './screens/pos';
 import { RecordDetailScreen, RecordsIndexScreen, RecordsScreen } from './screens/records';
 import { ApprovalsScreen, TraceViewerScreen } from './screens/operations';
+import { DashboardsScreen, ReportsScreen } from './screens/analytics';
+import { DataGovernanceScreen } from './screens/governance';
 import { WorkflowEditorScreen, WorkflowRunScreen, WorkflowsScreen } from './screens/workflows';
 
 const root = createRootRoute({ component: () => <Outlet /> });
@@ -50,6 +52,9 @@ const routeTree = root.addChildren([
     r('/workflow-runs/$runId', WorkflowRunScreen),
     r('/approvals', ApprovalsScreen),
     r('/trace-viewer', TraceViewerScreen),
+    r('/dashboards', DashboardsScreen),
+    r('/reports', ReportsScreen),
+    r('/data-governance', DataGovernanceScreen),
     ...Object.keys(PLANNED).map((path) => r(path, () => <PlannedScreen path={path} />)),
   ]),
 ]);

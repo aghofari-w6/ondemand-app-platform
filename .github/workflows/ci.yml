@@ -52,7 +52,27 @@ jobs:
       - run: pnpm typecheck
       - name: Unit tests
         run: pnpm test
-      - name: Integration tests (RLS isolation, outbox crash, sagas, Data studio, Hub, /v1, workflows)
+      # Test-only containers for the Hub transports (GitHub service containers cannot pass
+      # the arguments these need). The SFTP password is generated for this run only.
+      - name: Start Redpanda (Kafka) and SFTP test containers
+        run: |
+          SFTP_PASSWORD=$(openssl rand -hex 12)
+          echo "::add-mask::$SFTP_PASSWORD"
+          echo "TEST_SFTP_PASSWORD=$SFTP_PASSWORD" >> "$GITHUB_ENV"
+          docker run -d --name redpanda -p 9092:9092 docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
+            redpanda start --mode dev-container --smp 1 --overprovisioned \
+            --kafka-addr PLAINTEXT://0.0.0.0:9092 --advertise-kafka-addr PLAINTEXT://localhost:9092
+          docker run -d --name sftp -p 2222:22 atmoz/sftp:alpine "aod:$SFTP_PASSWORD:::upload"
+          for i in $(seq 1 60); do
+            if docker exec redpanda rpk cluster health 2>/dev/null | grep -Eq 'Healthy:\s+true'; then break; fi
+            sleep 2
+          done
+          for i in $(seq 1 30); do (echo > /dev/tcp/127.0.0.1/2222) 2>/dev/null && break; sleep 1; done
+      - name: Integration tests (RLS isolation, outbox crash, sagas, Data studio, Hub, /v1, workflows, analytics, governance, live Kafka + SFTP)
+        env:
+          TEST_KAFKA_BROKERS: localhost:9092
+          TEST_SFTP: 127.0.0.1:2222
+          TEST_SFTP_USER: aod
         run: pnpm test:integration
       - name: Prepare e2e database
         run: |
@@ -60,7 +80,7 @@ jobs:
           pnpm db:migrate
       - run: pnpm --filter @aod/web build
       - run: pnpm exec playwright install --with-deps chromium
-      - name: E2E (J1, phase 2 and J3 journeys + axe)
+      - name: E2E (J1, phase 2, J3 and J4 journeys + axe)
         run: pnpm e2e
       - uses: actions/upload-artifact@v4
         if: failure()

@@ -20,7 +20,7 @@ Synthetic data only. Never commit secrets or keys.
 | Demo tenant "Acme Coffee" | `pnpm seed` (`-- --reset` to re-create) |
 | Build SPA + run server on :3000 | `pnpm --filter @aod/web build && pnpm start` |
 | Dev (API :3000, Vite :5173) | `pnpm dev` |
-| E2E (J1, phase 2, J3) + axe | `pnpm e2e` (needs a migrated `aod` DB and a built SPA) |
+| E2E (J1, phase 2, J3, J4) + axe | `pnpm e2e` (needs a migrated `aod` DB and a built SPA) |
 | Redis for the Streams test | `redis-server --daemonize yes` (or set `TEST_REDIS_URL`) |
 
 Run `pnpm lint && pnpm typecheck && pnpm test && pnpm test:integration` before every
@@ -38,7 +38,8 @@ apps/server/src/
                provisioning (sagas), tenants (lifecycle), workspace (list/detail), fields,
                datastudio (metadata versions), records (custom entities), links, hub,
                maintenance (backfills, index builder), openapi, workflows/ (definitions,
-               engine, dry run), approvals, trace
+               engine, dry run), approvals, trace, analytics/ (metrics, query, dashboards,
+               reports, jobs), governance
   http/        app.ts (hooks, errors, auth helpers) + routes/
 apps/web/src/  React SPA: components/ (ui, shell, workspace), screens/, lib/ (api, offline)
 packages/shared/src/  envelope, manifest (schema + validator), permissions (authorize),
@@ -112,6 +113,9 @@ e2e/               Playwright
   (`apps/web/src/screens/admin.tsx`, `PLANNED`).
 - Server code that touches bodies, streams, timers, workers, caches, clients, retries or
   unbounded loops follows the `memory-safe-code` skill (run its detection greps on review).
+- Analytics reads go through `queryMetric()` (plan entitlement, read permission, hidden
+  fields never aggregated); files go through the `Files` port (streamed, size-capped,
+  signed download tokens), never a whole Buffer.
 - Promises follow the `promise-safety` skill: every promise is awaited, returned or caught
   with a log; no unhandled `.finally()`, no empty `.catch`. `pnpm lint` enforces it.
 - Claude API model id comes from config (`CLAUDE_MODEL`, default `claude-opus-5-5`); use the `Llm` port.

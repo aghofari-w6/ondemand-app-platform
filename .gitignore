@@ -13,3 +13,5 @@ blob-report/
 .vite/
 *.tsbuildinfo
 .data/
+# Redis writes this when the Streams test server runs in the repo directory
+dump.rdb

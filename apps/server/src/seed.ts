@@ -16,6 +16,7 @@ import { enqueueStep, handleStepJob, SAGAS, startRun } from './platform/provisio
 import { QUEUES } from './platform/queues.ts';
 import { changeTenantStatus, signup } from './platform/tenants.ts';
 import { createWorkflow, publishWorkflow } from './platform/workflows/definitions.ts';
+import { ensureMetrics, rebuildMetric } from './platform/analytics/metrics.ts';
 import { newId } from './db/database.ts';
 
 const SLUG = 'acme-coffee';
@@ -98,6 +99,10 @@ export async function seedAcme(opts: { reset?: boolean; adminUrl?: string; env?:
     });
     // Deliver events now unless a running server is the dispatcher (it will deliver them).
     await p.ports.eventBus.drain().catch(() => console.log('A running server holds the dispatcher lock; it will deliver the seed events.'));
+    // Analytics: backfill the metric buckets from the seeded history (growth plan includes Analytics).
+    await jobs.work(QUEUES.metricRebuild, (d: { tenantId: string; metric: string }) => rebuildMetric(p, d));
+    await ensureMetrics(p, tenantId);
+    await jobs.runAll();
     console.log(`Seeded "Acme Coffee" (${SLUG}). Sign in with workspace "${SLUG}" and ${OWNER}.`);
     return { tenantId, created: true };
   } finally {

@@ -16,6 +16,8 @@ import { authRoutes } from './routes/auth.ts';
 import { dataStudioRoutes } from './routes/datastudio.ts';
 import { hubRoutes } from './routes/hub.ts';
 import { workflowRoutes } from './routes/workflows.ts';
+import { analyticsRoutes, fileRoutes } from './routes/analytics.ts';
+import { governanceRoutes } from './routes/governance.ts';
 import { opsRoutes } from './routes/ops.ts';
 import { tenantRoutes } from './routes/tenant.ts';
 import { userRoutes } from './routes/users.ts';
@@ -67,7 +69,16 @@ export function setSessionCookie(p: Platform, reply: FastifyReply, value: string
 
 export async function buildApp(p: Platform): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: p.env.NODE_ENV === 'test' ? false : { level: p.env.LOG_LEVEL },
+    logger:
+      p.env.NODE_ENV === 'test'
+        ? false
+        : {
+            level: p.env.LOG_LEVEL,
+            // Signed download tokens are bearer credentials: never write them to logs.
+            serializers: {
+              req: (req: { method: string; url: string; id: string }) => ({ method: req.method, url: req.url.replace(/([?&]token=)[^&]+/g, '$1[redacted]'), id: req.id }),
+            },
+          },
     genReqId: (req) => {
       const h = req.headers['x-correlation-id'];
       return typeof h === 'string' && /^[A-Za-z0-9_.:-]{8,100}$/.test(h) ? h : randomUUID();
@@ -118,6 +129,9 @@ export async function buildApp(p: Platform): Promise<FastifyInstance> {
   await app.register(dataStudioRoutes(p));
   await app.register(hubRoutes(p));
   await app.register(workflowRoutes(p));
+  await app.register(analyticsRoutes(p));
+  await app.register(governanceRoutes(p));
+  await app.register(fileRoutes(p));
   await app.register(apiKeyRoutes(p));
   await app.register(v1Routes(p));
 

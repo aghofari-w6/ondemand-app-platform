@@ -84,8 +84,20 @@ workflows:
 
 analytics:
   metrics:
-    - { name: orders, label: Orders, entity: order, aggregate: count }
-    - { name: revenue, label: Revenue, entity: order, aggregate: sum, field: total }
+    - name: orders
+      label: Orders
+      entity: order
+      aggregate: count
+      events: [{ type: order.created }]
+      dims: { store: store, channel: channel }
+    - name: revenue
+      label: Revenue
+      entity: order
+      aggregate: sum
+      field: total
+      unit: money
+      events: [{ type: order.created, value: total }]
+      dims: { store: store, channel: channel }
 
 assistant:
   tools:

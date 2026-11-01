@@ -94,8 +94,23 @@ views:
 
 analytics:
   metrics:
-    - { name: sales, label: Sales, entity: sale, aggregate: count }
-    - { name: takings, label: Takings, entity: sale, aggregate: sum, field: total }
+    # Net of voids: a void takes the sale back out (at the time of the void).
+    - name: sales
+      label: Sales
+      entity: sale
+      aggregate: count
+      events: [{ type: sale.completed, time: sold_at }, { type: sale.voided, value: "-1" }]
+      dims: { store: store, channel: "'pos'" }
+      where: { status: [completed] }
+    - name: takings
+      label: Takings
+      entity: sale
+      aggregate: sum
+      field: total
+      unit: money
+      events: [{ type: sale.completed, value: total, time: sold_at }, { type: sale.voided, value: "-total" }]
+      dims: { store: store, channel: "'pos'" }
+      where: { status: [completed] }
 
 assistant:
   tools:
