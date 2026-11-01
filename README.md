@@ -113,18 +113,24 @@ The integration suite includes the contracts that must hold from day one:
   rebuild then followed by the consumer (voids come back out of takings), a rebuild
   equal to the incremental path, reconciliation finding a corrupted bucket, events that
   arrive before a metric has state, a deleted tenant's events never stalling the
-  consumer, plan entitlement, read permissions and hidden fields; dashboards (defaults,
+  consumer, overlapping rebuild jobs counting each event once, a dead rebuild restarted,
+  plan entitlement, read permissions and hidden fields (incl. filters and filter values);
+  dashboards (defaults,
   validation, sharing per role); reports (CSV, PDF, schedules run as the owner, signed
   downloads incl. tampered/expired/other-tenant tokens); Files (chunking, RLS, size cap);
-  governance (PII inventory, access review, retention anonymising old names, data
-  subject export and erase by phone and email, audit export). Kafka and SFTP run against
+  governance (PII inventory, access review, retention anonymising old names with a
+  per-record audit, data subject export and erase by phone and email, linked records
+  exported without PII and left untouched by an erase, audit export paging), and links
+  to report files and exports only for those allowed to see them. Kafka and SFTP run against
   Redpanda and atmoz/sftp containers in CI.
 
 CI (`.github/workflows/ci.yml`) runs all of it in one job against a Postgres 17 service
-(plus a test-only Redis service for the Redis Streams adapter). The e2e suite has three
+(plus a test-only Redis service for the Redis Streams adapter). The e2e suite has four
 journeys: J1, the phase 2 journey (Data studio → custom records with a rule, a formula and
 a board → signed webhook → dead letter → replay → API key) and J3 (canvas + keyboard-only
-outline → test run → publish → approval by a second manager → execution view → trace),
+outline → test run → publish → approval by a second manager → execution view → trace) and
+J4 (dashboards with a store filter → scheduled report and CSV export → retention → data
+subject export and erase → audit export),
 with axe checks on every screen. A second CI job builds the Docker image, runs it against
 a migrated database and waits for `/api/health`.
 
