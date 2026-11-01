@@ -3,7 +3,12 @@ import { sql } from 'kysely';
 import type pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createLoginToken } from '../src/auth/sessions.ts';
+import { Definition, EndpointInput } from '@aod/shared';
+import { clientCredentialsGrant, createApiKey, createDelegatedToken, createOAuthClient } from '../src/auth/apiauth.ts';
 import { newId } from '../src/db/database.ts';
+import { openDraft, publishDraft, saveDraft, sendJobs } from '../src/platform/datastudio.ts';
+import { applyInbound, saveEndpoint } from '../src/platform/hub.ts';
+import { executeRecordWrite } from '../src/platform/records.ts';
 import { admin, closePlatform, cmd, newTenant, runSaga, setPlan, testPlatform, type TestTenant } from './helpers.ts';
 
 /**
@@ -45,6 +50,48 @@ async function populate(t: TestTenant) {
   await cmd(p, t, 'logistics', 'carrier.connect', { carrier: 'jne' });
   await p.ports.eventBus.drain();
   await cmd(p, t, 'logistics', 'shipment.create', { order_id: order.body.id, carrier: 'jne' });
+  await populatePhase2(t);
+}
+
+/** Milestone B tables, through the real code paths. */
+async function populatePhase2(t: TestTenant) {
+  const c = () => randomUUID();
+  // Data studio: mark the existing custom field as PII (backfill), add an indexed field,
+  // a custom entity with a link field, field access and a layout; then publish.
+  const r = await p.database.withTenant(t.tenantId, async (tx) => {
+    const draft = await openDraft(p, tx, t.tenantId, t.owner, c());
+    const def = Definition.parse(draft.definition);
+    const set = def.app_fields.find((s) => s.app === 'ordering' && s.entity === 'order')!;
+    set.fields[0]!.pii = true;
+    set.fields.push({ key: 'lane', label: 'Lane', type: 'text', options: [], required: false, pii: false, indexed: true, default: null });
+    def.entities.push({ key: 'supplier', label: 'Supplier', title_field: 'name', fields: [{ key: 'name', label: 'Name', type: 'text', options: [], required: true, pii: false, indexed: false, default: null }, { key: 'order', label: 'Order', type: 'link', link: 'ordering:order', options: [], required: false, pii: false, indexed: false, default: null }], rollups: [], rules: [] });
+    def.field_access.push({ role: 'Staff', target: 'ordering:order', field: 'total', access: 'hidden' });
+    def.layouts.push({ target: 'custom:supplier', kind: 'list', columns: ['name'], sections: [], card_fields: [] });
+    const saved = await saveDraft(p, tx, t.tenantId, t.owner, def, draft.version, undefined, c());
+    return publishDraft(p, tx, t.tenantId, t.owner, saved.version, c());
+  });
+  await sendJobs(p, r.jobs);
+  await p.jobs.runAll();
+  const order = await p.database.withTenant(t.tenantId, (tx) => tx.selectFrom('ord_order').select('id').executeTakeFirstOrThrow());
+  await executeRecordWrite(p, { tenantId: t.tenantId, principal: t.owner, entity: 'supplier', op: 'create', values: { name: 'Kopi Nusantara', order: order.id }, correlationId: c() });
+  // Integration Hub: connector, endpoint (unreachable on purpose: produces an attempt), sync with one mapped record.
+  await p.database.withTenant(t.tenantId, async (tx) => {
+    await tx.insertInto('hub_connector').values({ id: c(), tenant_id: t.tenantId, name: 'noop', spec: JSON.stringify({ steps: [{ kind: 'map', fields: { id: 'id' } }] }) }).execute();
+    const ep = await saveEndpoint(p, tx, t.tenantId, t.owner, EndpointInput.parse({ kind: 'webhook', name: 'iso', event_types: ['order.*'], config: { url: 'http://127.0.0.1:9/hook' } }), c());
+    await tx.insertInto('hub_sync').values({ id: c(), tenant_id: t.tenantId, name: 'erp', entity: 'supplier', endpoint_id: ep.id, conflict_rule: 'platform_wins' }).execute();
+  });
+  const sync = await p.database.withTenant(t.tenantId, (tx) => tx.selectFrom('hub_sync').select('id').executeTakeFirstOrThrow());
+  await applyInbound(p, t.tenantId, t.owner, sync.id, { external_id: 'ERP-1', updated_at: new Date().toISOString(), data: { name: 'From ERP' }, deleted: false }, 'iso');
+  await cmd(p, t, 'ordering', 'order.create', { channel: 'web', lines: [{ sku: 'A', name: 'A', qty: 1, unit_price: 10 }] });
+  await p.ports.eventBus.drain();
+  await p.workers.hub.drain();
+  // Public API credentials.
+  await p.database.withTenant(t.tenantId, async (tx) => {
+    await createApiKey(p, tx, t.tenantId, t.owner, { name: 'k', scopes: ['records:read'] }, c());
+    const client = await createOAuthClient(p, tx, t.tenantId, t.owner, { name: 'cl', scopes: ['apps:read'] }, c());
+    await createDelegatedToken(p, tx, t.tenantId, t.owner, { name: 'd', scopes: ['apps:read'], expires_in_minutes: 30 }, c());
+    return client;
+  }).then((client) => clientCredentialsGrant(p, client.client_id, client.client_secret));
 }
 
 beforeAll(async () => {

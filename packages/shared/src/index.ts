@@ -3,4 +3,6 @@ export * from './permissions.ts';
 export * from './manifest.ts';
 export * from './template.ts';
 export * from './api.ts';
+export * from './datastudio.ts';
+export * from './hub.ts';
 export * as expr from './expr/index.ts';

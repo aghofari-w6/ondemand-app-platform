@@ -6,6 +6,7 @@ import { consumeLoginToken, createSession, splitToken } from '../src/auth/sessio
 import { executeCommand } from '../src/platform/commands.ts';
 import type { Logger, Platform } from '../src/platform/context.ts';
 import { createPlatform } from '../src/platform/create.ts';
+import { runBackfill } from '../src/platform/maintenance.ts';
 import { enqueueStep, handleStepJob, SAGAS, startRun, type RunKind } from '../src/platform/provisioning.ts';
 import { QUEUES } from '../src/platform/queues.ts';
 import { changeTenantStatus, handleLifecycleJob, signup } from '../src/platform/tenants.ts';
@@ -17,11 +18,12 @@ export { InlineJobs as MemJobs } from '../src/adapters/inline-jobs.ts';
 import { InlineJobs as MemJobs } from '../src/adapters/inline-jobs.ts';
 
 export function testPlatform(): Platform & { jobs: MemJobs } {
-  const p = createPlatform({ env: { DATABASE_URL: APP_URL, MIGRATION_DATABASE_URL: ADMIN_URL, NODE_ENV: 'test', DEMO_MODE: 'true', PUBLIC_URL: 'http://localhost:3000' }, log: silent });
+  const p = createPlatform({ env: { DATABASE_URL: APP_URL, MIGRATION_DATABASE_URL: ADMIN_URL, NODE_ENV: 'test', DEMO_MODE: 'true', PUBLIC_URL: 'http://localhost:3000', HUB_ALLOW_PRIVATE_HOSTS: 'localhost,127.0.0.1', HUB_BACKOFF_BASE_MS: '10', HUB_BREAKER_COOLDOWN_MS: '200', HUB_MAX_ATTEMPTS: '3', HUB_BREAKER_THRESHOLD: '3' }, log: silent });
   const jobs = new MemJobs();
   p.ports.jobs = jobs;
   void jobs.work(QUEUES.provisionStep, (d: any, j: any) => handleStepJob(p, d, j.retryCount));
   void jobs.work(QUEUES.tenantLifecycle, (d: any) => handleLifecycleJob(p, d));
+  void jobs.work(QUEUES.backfill, (d: any) => runBackfill(p, d));
   return Object.assign(p, { jobs });
 }
 
@@ -66,6 +68,7 @@ export function cmd(p: Platform, t: TestTenant, app: string, command: string, in
 }
 
 export async function closePlatform(p: Platform) {
+  await p.workers.hub.stop();
   await p.ports.eventBus.stop();
   await p.database.close();
 }

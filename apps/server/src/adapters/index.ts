@@ -5,7 +5,7 @@ import { context, metrics as otelMetrics, propagation, trace, SpanStatusCode } f
 import { sql } from 'kysely';
 import * as oidc from 'openid-client';
 import type { PlatformConfig } from '../config.ts';
-import type { Auth, Billing, Channel, Files, Llm, Metrics, OidcSettings, Retriever, SamlSettings, Sandbox, Search, Telemetry, Vault, Webhooks } from '../ports/index.ts';
+import type { Auth, Billing, Channel, Files, Llm, Metrics, OidcSettings, Retriever, SamlSettings, Search, Telemetry, Vault } from '../ports/index.ts';
 
 // ------------------------------------------------------------------ Search
 
@@ -214,7 +214,7 @@ export function createBilling(cfg: PlatformConfig): Billing {
   return {
     plan(id) {
       const p = cfg.plans[id];
-      return p ? { label: p.label, packages: p.packages, appSlots: p.app_slots } : null;
+      return p ? { label: p.label, packages: p.packages, appSlots: p.app_slots, limits: p.limits } : null;
     },
     trialDays: () => cfg.trial.days,
   };
@@ -226,7 +226,5 @@ const notYet = (port: string, milestone: string) => () => {
   throw new Error(`${port} port has no adapter before ${milestone}`);
 };
 
-export const stubWebhooks: Webhooks = { deliver: notYet('Webhooks', 'Milestone B (Integration Hub)') };
-export const stubFiles: Files = { put: notYet('Files', 'Milestone B'), get: notYet('Files', 'Milestone B') };
+export const stubFiles: Files = { put: notYet('Files', 'a later milestone'), get: notYet('Files', 'a later milestone') };
 export const stubRetriever: Retriever = { retrieve: notYet('Retriever', 'the assistant milestone') };
-export const stubSandbox: Sandbox = { run: notYet('Sandbox', 'Milestone B (custom connectors)') };

@@ -150,7 +150,7 @@ export class PgEventBus implements EventBus {
     const rows = await sql<{ seq: number; id: string; tenant_id: string; type: string; payload: EventEnvelope }>`
       SELECT * FROM event_log_after(${last}, 200)`.execute(db);
     for (const ev of rows.rows) {
-      if (!c.types.includes(ev.type)) {
+      if (!c.types.includes(ev.type) && !c.types.includes('*')) {
         last = ev.seq;
         continue;
       }

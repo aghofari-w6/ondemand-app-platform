@@ -18,6 +18,7 @@ entities:
     table: lgx_shipment
     custom_fields: true
     default_sort: -created_at
+    title_field: tracking_no
     events: [shipment.created, shipment.status_changed, shipment.delivered, shipment.exception]
     fields:
       - { key: tracking_no, label: Tracking no., type: text, searchable: true, sortable: true }
@@ -94,6 +95,9 @@ permissions:
   - { id: "logistics:shipment.create", label: Create shipments, level: operate }
   - { id: "logistics:shipment.update", label: Update shipment status, level: operate }
   - { id: "logistics:carrier.manage", label: Connect carriers, level: admin }
+
+links:
+  - { on: shipment.created, from: { resource: "logistics::Shipment", id: data.shipment_id }, to: { resource: "ordering::Order", id: data.order_id }, rel: ships }
 
 config:
   carriers: [jne, sicepat, gosend, internal]

@@ -10,11 +10,15 @@ import { principalFor } from '../auth/principal.ts';
 import { readSession, SESSION_COOKIE, type SessionUser } from '../auth/sessions.ts';
 import { ROOT } from '../config.ts';
 import type { Platform } from '../platform/context.ts';
+import { apiKeyRoutes } from './routes/apikeys.ts';
 import { appRoutes } from './routes/apps.ts';
 import { authRoutes } from './routes/auth.ts';
+import { dataStudioRoutes } from './routes/datastudio.ts';
+import { hubRoutes } from './routes/hub.ts';
 import { opsRoutes } from './routes/ops.ts';
 import { tenantRoutes } from './routes/tenant.ts';
 import { userRoutes } from './routes/users.ts';
+import { v1Routes } from './routes/v1.ts';
 
 export interface AuthContext extends SessionUser {
   principal: Principal;
@@ -110,6 +114,10 @@ export async function buildApp(p: Platform): Promise<FastifyInstance> {
   await app.register(tenantRoutes(p));
   await app.register(userRoutes(p));
   await app.register(appRoutes(p));
+  await app.register(dataStudioRoutes(p));
+  await app.register(hubRoutes(p));
+  await app.register(apiKeyRoutes(p));
+  await app.register(v1Routes(p));
 
   const dist = `${ROOT}apps/web/dist`;
   if (existsSync(dist)) {

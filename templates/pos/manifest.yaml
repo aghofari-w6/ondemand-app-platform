@@ -18,6 +18,7 @@ entities:
     table: pos_sale
     custom_fields: true
     default_sort: -sold_at
+    title_field: receipt_no
     events: [sale.completed, sale.voided]
     fields:
       - { key: receipt_no, label: Receipt, type: text, searchable: true, sortable: true }

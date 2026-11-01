@@ -32,10 +32,25 @@ const Env = z.object({
   LOG_LEVEL: z.string().default('info'),
   /** poll interval for the outbox dispatcher, ms */
   DISPATCH_INTERVAL_MS: z.coerce.number().default(200),
+  /** owner-role connection used only by the index builder (CREATE INDEX CONCURRENTLY); defaults to MIGRATION_DATABASE_URL */
+  INDEX_DATABASE_URL: z.string().optional(),
+  /** Integration Hub: comma-separated hosts exempt from the private-address check (dev/test only; ignored in production) */
+  HUB_ALLOW_PRIVATE_HOSTS: z.string().default(''),
+  /** Integration Hub deliverer poll interval, ms */
+  HUB_INTERVAL_MS: z.coerce.number().default(500),
+  HUB_MAX_ATTEMPTS: z.coerce.number().int().min(1).default(8),
+  HUB_BACKOFF_BASE_MS: z.coerce.number().int().min(1).default(2000),
+  HUB_BREAKER_THRESHOLD: z.coerce.number().int().min(1).default(5),
+  HUB_BREAKER_COOLDOWN_MS: z.coerce.number().int().min(1).default(60_000),
 });
 export type Env = z.infer<typeof Env>;
 
-const Plan = z.object({ label: z.string(), packages: z.array(z.string()), app_slots: z.int().positive() });
+const Plan = z.object({
+  label: z.string(),
+  packages: z.array(z.string()),
+  app_slots: z.int().positive(),
+  limits: z.object({ custom_entities: z.int().nonnegative(), custom_fields: z.int().nonnegative(), hub_endpoints: z.int().nonnegative(), api_keys: z.int().nonnegative() }),
+});
 const PlatformConfig = z.object({
   trial: z.object({ days: z.int().positive(), purge_after_days: z.int().positive() }),
   deprovision: z.object({ retain_days: z.int().positive() }),

@@ -2,6 +2,7 @@ import { action, authorize, CommandError, maskFields, type Decision, type Entity
 import { sql, type SelectQueryBuilder } from 'kysely';
 import type { Tx } from '../db/database.ts';
 import type { Platform } from './context.ts';
+import { decryptAll } from './fields.ts';
 
 /**
  * Generic list/detail over any manifest entity: facets, full-text search through the
@@ -121,7 +122,7 @@ export async function listEntity(p: Platform, tx: Tx, principal: Principal, app:
   }
 
   return {
-    items: page.map((r) => maskFields(clean(r), decision)),
+    items: page.map((r) => maskFields(clean(r, (c) => decryptAll(p.ports.vault, principal.tenantId, `${app}:${entity.name}`, c)), decision)),
     nextCursor,
     facets,
     applied: { filters, sort: sortSpec, q: q.q ?? '' },
@@ -129,8 +130,9 @@ export async function listEntity(p: Platform, tx: Tx, principal: Principal, app:
   };
 }
 
-function clean(row: Record<string, unknown>) {
+function clean(row: Record<string, unknown>, decrypt?: (custom: Record<string, unknown>) => Record<string, unknown>) {
   const { search: _search, tenant_id: _t, ...rest } = row;
+  if (decrypt && rest.custom && typeof rest.custom === 'object') rest.custom = decrypt(rest.custom as Record<string, unknown>);
   return rest;
 }
 
@@ -147,7 +149,7 @@ export async function getEntity(p: Platform, tx: Tx, principal: Principal, app: 
     SELECT id, type, payload, created_at, true AS pending FROM outbox_event WHERE aggregateid = ${id} AND relayed_at IS NULL
     ORDER BY created_at, id`.execute(tx);
   return {
-    item: maskFields(clean(row), decision),
+    item: maskFields(clean(row, (c) => decryptAll(p.ports.vault, principal.tenantId, `${app}:${entity.name}`, c)), decision),
     events: events.rows.map((e) => ({
       id: e.id,
       type: e.type,

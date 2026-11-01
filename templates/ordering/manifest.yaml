@@ -23,6 +23,7 @@ entities:
     table: ord_order
     custom_fields: true
     default_sort: -number
+    title_field: number
     events: [order.created, order.status_changed, order.updated, order.cancelled]
     fields:
       - { key: number, label: Number, type: number, sortable: true, searchable: true }
@@ -37,7 +38,7 @@ entities:
 
 events:
   publishes:
-    - { type: order.created, entity: order, description: An order was placed., data: [order_id, number, channel, store, total, currency, lines, source_ref] }
+    - { type: order.created, entity: order, description: An order was placed., data: [order_id, number, channel, store, total, currency, lines, source_ref, pos_sale_id] }
     - { type: order.status_changed, entity: order, description: An order moved to another status., data: [order_id, number, from, to] }
     - { type: order.updated, entity: order, description: Order details or custom fields changed., data: [order_id, number, changes] }
     - { type: order.cancelled, entity: order, description: An order was cancelled., data: [order_id, number, reason] }
@@ -102,6 +103,9 @@ permissions:
   - { id: "ordering:order.fulfil", label: Advance order status, level: operate }
   - { id: "ordering:order.update", label: Edit orders, level: operate }
   - { id: "ordering:order.cancel", label: Cancel orders, level: manage }
+
+links:
+  - { on: order.created, from: { resource: "ordering::Order", id: data.order_id }, to: { resource: "pos::Sale", id: data.pos_sale_id }, rel: from_sale }
 
 config:
   currency: IDR

@@ -18,6 +18,7 @@ entities:
     table: pay_payment
     custom_fields: true
     default_sort: -created_at
+    title_field: reference
     events: [payment.captured, payment.failed, payment.refunded]
     fields:
       - { key: reference, label: Reference, type: text, searchable: true }
@@ -38,7 +39,7 @@ entities:
 
 events:
   publishes:
-    - { type: payment.captured, entity: payment, description: A payment was captured., data: [payment_id, reference, amount, currency, method, provider_ref] }
+    - { type: payment.captured, entity: payment, description: A payment was captured., data: [payment_id, reference, amount, currency, method, provider_ref, pos_sale_id] }
     - { type: payment.failed, entity: payment, description: A capture was declined by the provider., data: [payment_id, reference, amount, currency, reason] }
     - { type: payment.refunded, entity: payment, description: A payment was refunded., data: [payment_id, reference, amount] }
     - { type: payment_settings.updated, entity: settings, description: Test-mode settings changed., data: [fail_next_capture] }
@@ -85,6 +86,9 @@ permissions:
   - { id: "payments:payment.capture", label: Capture payments, level: operate }
   - { id: "payments:payment.refund", label: Refund payments, level: manage }
   - { id: "payments:settings.manage", label: Change payment settings, level: admin }
+
+links:
+  - { on: payment.captured, from: { resource: "payments::Payment", id: data.payment_id }, to: { resource: "pos::Sale", id: data.pos_sale_id }, rel: pays }
 
 config:
   currency: IDR

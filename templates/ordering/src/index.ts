@@ -95,7 +95,7 @@ async function insertOrder(
     type: 'order.created',
     aggregateType: 'order',
     aggregateId: id,
-    data: { order_id: id, number, channel: o.channel, store: o.store ?? null, total, currency, lines: o.lines, source_ref: o.source_ref ?? null },
+    data: { order_id: id, number, channel: o.channel, store: o.store ?? null, total, currency, lines: o.lines, source_ref: o.source_ref ?? null, pos_sale_id: o.source_ref?.startsWith('pos:sale:') ? o.source_ref.slice(9) : null },
   });
   return { id, number, version: 1, total };
 }

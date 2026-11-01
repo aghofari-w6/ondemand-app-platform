@@ -8,11 +8,11 @@ import {
   type EventOrigin,
   type Principal,
 } from '@aod/shared';
-import { sql } from 'kysely';
 import { newId, type Tx } from '../db/database.ts';
 import { writeAudit } from './audit.ts';
 import type { Platform } from './context.ts';
-import { fieldDefinitions, validateCustomValues } from './fields.ts';
+import { encryptPii, fieldDefinitions, validateCustomValues } from './fields.ts';
+import { assertIdempotencyKey, claimIdempotencyKey, storeIdempotentResponse } from './idempotency.ts';
 import { writeOutbox } from './outbox.ts';
 
 export interface CommandRequest {
@@ -34,8 +34,6 @@ export interface CommandResponse {
   body: CommandResult;
   replayed: boolean;
 }
-
-const IDEMPOTENCY_KEY = /^[A-Za-z0-9_.:-]{8,200}$/;
 
 export const requestHash = (app: string, command: string, input: unknown) =>
   createHash('sha256').update(JSON.stringify([app, command, input])).digest('hex');
@@ -62,9 +60,7 @@ export async function executeCommand(p: Platform, req: CommandRequest, existingT
   const found = p.catalog.command(req.app, req.command);
   if (!found) throw new CommandError(404, 'unknown_command', `unknown command ${req.app}/${req.command}`);
   const { def, spec, entity } = found;
-  if (req.idempotencyKey !== undefined && !IDEMPOTENCY_KEY.test(req.idempotencyKey)) {
-    throw new CommandError(400, 'invalid_idempotency_key', 'Idempotency-Key must be 8–200 characters of [A-Za-z0-9_.:-]');
-  }
+  assertIdempotencyKey(req.idempotencyKey);
 
   const run = async (tx: Tx): Promise<CommandResponse> => {
     await assertWritableTenant(tx);
@@ -81,22 +77,8 @@ export async function executeCommand(p: Platform, req: CommandRequest, existingT
 
     const hash = requestHash(req.app, req.command, req.input);
     if (req.idempotencyKey) {
-      const scope = `${req.app}/${req.command}`;
-      await tx.deleteFrom('idempotency_key').where('key', '=', req.idempotencyKey).where('expires_at', '<', sql<Date>`now()`).execute();
-      const inserted = await tx
-        .insertInto('idempotency_key')
-        .values({ tenant_id: req.tenantId, key: req.idempotencyKey, scope, request_hash: hash })
-        .onConflict((oc) => oc.columns(['tenant_id', 'key']).doNothing())
-        .returning('key')
-        .executeTakeFirst();
-      if (!inserted) {
-        const prior = await tx.selectFrom('idempotency_key').selectAll().where('key', '=', req.idempotencyKey).executeTakeFirstOrThrow();
-        if (prior.request_hash !== hash || prior.scope !== scope) {
-          throw new CommandError(422, 'idempotency_key_reused', 'this Idempotency-Key was used for a different request');
-        }
-        if (prior.response) return { status: prior.status_code, body: prior.response, replayed: true };
-        throw new CommandError(409, 'idempotency_in_progress', 'a request with this Idempotency-Key is still in progress');
-      }
+      const prior = await claimIdempotencyKey(tx, req.tenantId, req.idempotencyKey, `${req.app}/${req.command}`, hash);
+      if (prior) return { status: prior.status, body: prior.body, replayed: true };
     }
 
     const parsed = spec.input.safeParse(req.input);
@@ -132,7 +114,9 @@ export async function executeCommand(p: Platform, req: CommandRequest, existingT
               if (values && Object.keys(values).length) throw new CommandError(422, 'invalid_custom_fields', `${entityName} has no custom fields`);
               return existing ?? {};
             }
-            return validateCustomValues(await fieldDefinitions(tx, req.app, entityName), values, existing);
+            const defs = await fieldDefinitions(tx, req.app, entityName);
+            // PII values are encrypted at rest (AES-256-GCM, Vault port).
+            return encryptPii(p.ports.vault, req.tenantId, `${req.app}:${entityName}`, defs, validateCustomValues(defs, values, existing));
           },
         },
         parsed.data,
@@ -159,13 +143,7 @@ export async function executeCommand(p: Platform, req: CommandRequest, existingT
       data: { events: envelopes.map((e) => e.type), input_fields: Object.keys((req.input as object) ?? {}), origin: req.origin ?? 'user' },
     });
     const status = result.duplicate ? 200 : (result.created ?? typeof rawId !== 'string') ? 201 : 200;
-    if (req.idempotencyKey) {
-      await tx
-        .updateTable('idempotency_key')
-        .set({ status_code: status, response: JSON.stringify(result) })
-        .where('key', '=', req.idempotencyKey)
-        .execute();
-    }
+    if (req.idempotencyKey) await storeIdempotentResponse(tx, req.idempotencyKey, status, result);
     p.ports.metrics.increment('aod_commands_total', { app: req.app, command: req.command });
     return { status, body: result, replayed: false };
   };
