@@ -9,37 +9,12 @@ import { createPlatform } from '../src/platform/create.ts';
 import { enqueueStep, handleStepJob, SAGAS, startRun, type RunKind } from '../src/platform/provisioning.ts';
 import { QUEUES } from '../src/platform/queues.ts';
 import { changeTenantStatus, handleLifecycleJob, signup } from '../src/platform/tenants.ts';
-import type { Jobs } from '../src/ports/index.ts';
 import { ADMIN_URL, APP_URL } from './env.ts';
 
 export const silent: Logger = { info: () => {}, warn: () => {}, error: () => {} };
 
-/** Deterministic in-memory Jobs port: `runAll()` processes queued jobs (with retries). */
-export class MemJobs implements Jobs {
-  queue: { queue: string; data: any; retry: number }[] = [];
-  handlers = new Map<string, (d: any, j: { id: string; retryCount: number }) => Promise<void>>();
-  async send(queue: string, data: object) {
-    this.queue.push({ queue, data, retry: 0 });
-    return randomUUID();
-  }
-  async work(queue: string, h: any) {
-    this.handlers.set(queue, h);
-  }
-  async schedule() {}
-  async start() {}
-  async stop() {}
-  async runAll() {
-    while (this.queue.length) {
-      const j = this.queue.shift()!;
-      try {
-        await this.handlers.get(j.queue)!(j.data, { id: randomUUID(), retryCount: j.retry });
-      } catch (e) {
-        if (j.retry >= 2) throw e;
-        this.queue.push({ ...j, retry: j.retry + 1 });
-      }
-    }
-  }
-}
+export { InlineJobs as MemJobs } from '../src/adapters/inline-jobs.ts';
+import { InlineJobs as MemJobs } from '../src/adapters/inline-jobs.ts';
 
 export function testPlatform(): Platform & { jobs: MemJobs } {
   const p = createPlatform({ env: { DATABASE_URL: APP_URL, MIGRATION_DATABASE_URL: ADMIN_URL, NODE_ENV: 'test', DEMO_MODE: 'true', PUBLIC_URL: 'http://localhost:3000' }, log: silent });

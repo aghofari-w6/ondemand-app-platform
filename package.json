@@ -6,7 +6,7 @@
   "engines": { "node": ">=24" },
   "scripts": {
     "lint": "eslint .",
-    "typecheck": "pnpm -r --parallel run typecheck",
+    "typecheck": "tsc -p tsconfig.json && pnpm -r --parallel run typecheck",
     "test": "vitest run --project unit",
     "test:integration": "vitest run --project integration",
     "test:all": "vitest run",
