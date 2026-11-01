@@ -13,12 +13,11 @@ import { sql } from 'kysely';
 import { newId, type Tx } from '../../db/database.ts';
 import type { Consumer } from '../../ports/index.ts';
 import { publishedFieldRules, resolveRole } from '../../auth/principal.ts';
-import { writeAudit } from '../audit.ts';
 import { executeCommand } from '../commands.ts';
 import type { Platform } from '../context.ts';
-import { writeOutbox } from '../outbox.ts';
 import { recordChange } from '../record.ts';
 import { executeRecordWrite } from '../records.ts';
+import { assertActorCovers } from './definitions.ts';
 
 /**
  * Workflow engine.
@@ -58,7 +57,10 @@ export interface RunRow {
   hop: number;
   chain: string[];
   vars: Record<string, unknown>;
+  initiated_by: string | null;
 }
+
+const workflowEnvelope = (run: RunRow) => ({ origin: 'workflow' as const, causationId: run.trigger_event_id, workflowHop: run.hop, workflowChain: run.chain });
 
 export interface NodeRunRow {
   id: string;
@@ -181,7 +183,7 @@ export async function servicePrincipal(p: Platform, tx: Tx, tenantId: string, wo
 
 // ------------------------------------------------------------------ run bookkeeping (inside a tx)
 
-async function lockRun(tx: Tx, runId: string): Promise<RunRow> {
+export async function lockRun(tx: Tx, runId: string): Promise<RunRow> {
   const r = await sql<RunRow>`SELECT * FROM workflow_run WHERE id = ${runId} FOR UPDATE`.execute(tx);
   return r.rows[0]!;
 }
@@ -248,7 +250,8 @@ export async function finishNode(p: Platform, tx: Tx, run: RunRow, graph: Workfl
   await maybeComplete(p, tx, run);
 }
 
-async function cancelOpen(tx: Tx, runId: string, reason: string, exceptId?: string) {
+async function cancelOpen(p: Platform, tx: Tx, run: Pick<RunRow, 'id' | 'tenant_id' | 'correlation_id'>, reason: string, exceptId?: string) {
+  const runId = run.id;
   const rows = await tx
     .updateTable('workflow_node_run')
     .set({ status: 'cancelled', error: reason, lease_until: null, finished_at: new Date() })
@@ -258,13 +261,17 @@ async function cancelOpen(tx: Tx, runId: string, reason: string, exceptId?: stri
     .returning('id')
     .execute();
   if (rows.length) {
-    await tx
+    const cancelled = await tx
       .updateTable('approval_request')
       .set({ status: 'cancelled', decided_at: new Date(), version: sql`version + 1` })
       .where('source', '=', 'workflow')
       .where('source_ref', 'in', rows.map((r) => r.id))
       .where('status', '=', 'pending')
+      .returning('id')
       .execute();
+    for (const a of cancelled) {
+      await recordChange(p, tx, { tenantId: run.tenant_id, actor: { type: 'System', id: 'workflows' }, action: 'platform:approval.cancelled', resourceType: 'platform::ApprovalRequest', resourceId: a.id, correlationId: run.correlation_id, events: [{ type: 'approval.resolved', data: { request_id: a.id, status: 'cancelled', reason } }], data: { reason } });
+    }
   }
   return rows.map((r) => r.id);
 }
@@ -277,7 +284,7 @@ async function failNode(p: Platform, tx: Tx, run: RunRow, graph: WorkflowGraph, 
     return;
   }
   await tx.updateTable('workflow_node_run').set({ status: 'failed', error: err.message, lease_until: null, finished_at: new Date() }).where('id', '=', nr.id).execute();
-  const cancelled = await cancelOpen(tx, run.id, 'run failed', nr.id);
+  const cancelled = await cancelOpen(p, tx, run, 'run failed', nr.id);
   if (cancelled.length) await tx.updateTable('workflow_node_run').set({ state: sql`state || '{"revive": true}'::jsonb` }).where('id', 'in', cancelled).execute();
   await tx.updateTable('workflow_run').set({ status: 'failed', error: `${node.id}: ${err.message}`, finished_at: new Date(), version: sql`version + 1` }).where('id', '=', run.id).execute();
   p.ports.metrics.increment('aod_workflow_runs_total', { status: 'failed' });
@@ -290,6 +297,26 @@ async function failNode(p: Platform, tx: Tx, run: RunRow, graph: WorkflowGraph, 
     correlationId: run.correlation_id,
     events: [{ type: 'workflow.run_failed', data: { run_id: run.id, workflow_id: run.workflow_id, node: node.id, error: err.message } }],
   });
+}
+
+// ------------------------------------------------------------------ notifications (consumer)
+
+/**
+ * Sends `workflow.notification` events through the Channel port. Runs once per event
+ * (processed_event); a crash between send and commit can repeat a send.
+ */
+export function notificationsConsumer(p: Platform): Consumer {
+  return {
+    name: 'platform.notifications',
+    types: ['workflow.notification'],
+    async handle(event, tx) {
+      const d = event.data as { users: string[]; subject: string; message: string };
+      if (!d.users?.length) return;
+      const users = await tx.selectFrom('app_user').select(['id', 'email']).where('id', 'in', d.users).where('status', '=', 'active').execute();
+      for (const u of users) await p.ports.channel.send({ tenantId: event.tenant_id, to: u.email, subject: d.subject, body: d.message });
+      p.ports.metrics.increment('aod_workflow_notifications_total', {}, users.length);
+    },
+  };
 }
 
 // ------------------------------------------------------------------ start + event waits (consumer)
@@ -339,6 +366,10 @@ async function startRuns(p: Platform, tx: Tx, event: EventEnvelope) {
       const used = await tx.selectFrom('workflow_run').select(sql<number>`count(*)::int`.as('n')).where('status', '<>', 'cancelled').where('started_at', '>=', sql<Date>`date_trunc('month', now())`).executeTakeFirstOrThrow();
       if (used.n >= limit) guard = `plan limit: ${limit} workflow runs per month`;
     }
+    // The user whose change started this chain may not approve its approval requests.
+    const initiator = guard
+      ? null
+      : await tx.selectFrom('audit_log').select('actor_id').where('correlation_id', '=', event.correlation_id).where('actor_type', '=', 'User').orderBy('at').limit(1).executeTakeFirst();
     const runId = newId();
     const inserted = await tx
       .insertInto('workflow_run')
@@ -353,6 +384,7 @@ async function startRuns(p: Platform, tx: Tx, event: EventEnvelope) {
         correlation_id: event.correlation_id,
         hop: event.workflow_hop + 1,
         chain: [...event.workflow_chain, wf.id],
+        initiated_by: initiator?.actor_id ?? null,
         error: guard,
         ...(guard ? { finished_at: new Date() } : {}),
       })
@@ -569,40 +601,45 @@ export class WorkflowRunner {
         return this.complete(tenantId, nr, graph, async (tx) => {
           const e = await tx.selectFrom('hub_endpoint').select(['id', 'status']).where('id', '=', c.endpoint_id).executeTakeFirst();
           if (!e) throw new NodeError('Hub endpoint not found', false, 'not_found');
-          const [env] = await writeOutbox(tx, [{ type: 'workflow.message', aggregateType: 'platform::WorkflowRun', aggregateId: run.id, data: { endpoint_id: e.id, workflow_id: run.workflow_id, run_id: run.id, node: node.id, body: body as Record<string, unknown> } }], {
+          await recordChange(p, tx, {
             tenantId,
-            app: 'platform',
+            actor: { type: 'Workflow', id: run.workflow_id },
+            action: 'platform:workflow.hub_sent',
+            resourceType: 'platform::WorkflowRun',
+            resourceId: run.id,
             correlationId: run.correlation_id,
-            causationId: run.trigger_event_id,
-            traceparent: p.ports.telemetry.traceparent(),
-            origin: 'workflow',
-            workflowHop: run.hop,
-            workflowChain: run.chain,
-            newId,
+            events: [{ type: 'workflow.message', data: { endpoint_id: e.id, workflow_id: run.workflow_id, run_id: run.id, node: node.id, body: body as Record<string, unknown> } }],
+            data: { node: node.id, endpoint_id: e.id },
+            envelope: workflowEnvelope(run),
           });
-          return { port: 'out', output: { event_id: env!.id, endpoint_id: e.id } };
+          return { port: 'out', output: { endpoint_id: e.id, queued: true } };
         });
       }
       case 'notify': {
         const subject = String(render(c.subject, scope));
         const message = String(render(c.message, scope));
-        const recipients = await p.database.withTenant(tenantId, (tx) =>
-          tx
+        // Queued through the outbox with the node's completion; the notifications consumer
+        // calls the Channel port. Event data carries user ids, never addresses.
+        return this.complete(tenantId, nr, graph, async (tx) => {
+          const recipients = await tx
             .selectFrom('app_user')
-            .select(['id', 'email'])
+            .select(['id'])
             .where('status', '=', 'active')
             .where((eb) => eb.or([eb('role', 'in', [...(c.roles ?? []), '__none__']), eb('id', 'in', [...(c.users ?? []), '00000000-0000-0000-0000-000000000000'])]))
-            .execute(),
-        );
-        // Delivery is at-least-once: a crash between send and commit re-sends.
-        const sent: { user_id: string; via: string }[] = [];
-        for (const r of recipients) {
-          const res = await p.ports.channel.send({ tenantId, to: r.email, subject, body: message });
-          sent.push({ user_id: r.id, via: res.via });
-        }
-        return this.complete(tenantId, nr, graph, async (tx) => {
-          await writeAudit(tx, { tenantId, actor: { type: 'Workflow', id: run.workflow_id }, action: 'platform:workflow.notified', resourceType: 'platform::WorkflowRun', resourceId: run.id, correlationId: run.correlation_id, data: { node: node.id, subject, recipients: sent.length } });
-          return { port: 'out', output: { subject, message, recipients: sent } };
+            .execute();
+          const users = recipients.map((r) => r.id as string);
+          await recordChange(p, tx, {
+            tenantId,
+            actor: { type: 'Workflow', id: run.workflow_id },
+            action: 'platform:workflow.notified',
+            resourceType: 'platform::WorkflowRun',
+            resourceId: run.id,
+            correlationId: run.correlation_id,
+            events: [{ type: 'workflow.notification', data: { workflow_id: run.workflow_id, run_id: run.id, node: node.id, users, subject, message } }],
+            data: { node: node.id, subject, recipients: users.length },
+            envelope: workflowEnvelope(run),
+          });
+          return { port: 'out', output: { subject, message, recipients: users } };
         });
       }
       case 'wait': {
@@ -624,7 +661,7 @@ export class WorkflowRunner {
           const requestId = newId();
           const ins = await tx
             .insertInto('approval_request')
-            .values({ id: requestId, tenant_id: tenantId, source: 'workflow', source_ref: nr.id, title, details, approver_roles: c.approver_roles, quorum: c.quorum ?? 1, correlation_id: run.correlation_id, requested_by: `workflow:${run.workflow_id}`, expires_at: expires })
+            .values({ id: requestId, tenant_id: tenantId, source: 'workflow', source_ref: nr.id, title, details, approver_roles: c.approver_roles, quorum: c.quorum ?? 1, correlation_id: run.correlation_id, requested_by: run.initiated_by ?? `workflow:${run.workflow_id}`, expires_at: expires })
             .onConflict((oc) => oc.columns(['tenant_id', 'source', 'source_ref']).doNothing())
             .returning(['id', 'expires_at'])
             .executeTakeFirst();
@@ -687,6 +724,7 @@ export async function retryRun(p: Platform, tx: Tx, tenantId: string, actor: Pri
   const run = await lockRun(tx, runId);
   if (!run) throw new CommandError(404, 'not_found', 'run not found');
   if (run.status !== 'failed') throw new CommandError(409, 'not_failed', 'only failed runs can be retried');
+  await assertActorCovers(p, tx, actor, run.workflow_id, run.version_number);
   const again = await tx
     .selectFrom('workflow_node_run')
     .select(['node_id', 'groups', 'input'])
@@ -704,7 +742,7 @@ export async function cancelRun(p: Platform, tx: Tx, tenantId: string, actor: Pr
   const run = await lockRun(tx, runId);
   if (!run) throw new CommandError(404, 'not_found', 'run not found');
   if (run.status !== 'running' && run.status !== 'failed') throw new CommandError(409, 'not_cancellable', `the run is ${run.status}`);
-  await cancelOpen(tx, runId, 'cancelled by a user');
+  await cancelOpen(p, tx, run, 'cancelled by a user');
   await tx.updateTable('workflow_run').set({ status: 'cancelled', finished_at: new Date(), version: sql`version + 1` }).where('id', '=', runId).execute();
   await recordChange(p, tx, { tenantId, actor, action: 'platform:workflow.run_cancelled', resourceType: 'platform::WorkflowRun', resourceId: runId, correlationId, data: { run_correlation: run.correlation_id } });
 }

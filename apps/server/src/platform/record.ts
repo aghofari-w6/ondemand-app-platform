@@ -1,4 +1,4 @@
-import type { EventDraft, Principal } from '@aod/shared';
+import type { EventDraft, EventOrigin, Principal } from '@aod/shared';
 import { newId, type Tx } from '../db/database.ts';
 import { writeAudit } from './audit.ts';
 import type { Platform } from './context.ts';
@@ -20,6 +20,8 @@ export async function recordChange(
     correlationId: string;
     events?: Omit<EventDraft, 'aggregateType' | 'aggregateId'>[];
     data?: Record<string, unknown>;
+    /** set by workflow runs: the events keep the run's origin, hop and chain */
+    envelope?: { origin: EventOrigin; causationId?: string | null; workflowHop: number; workflowChain: string[] };
   },
 ) {
   await writeOutbox(
@@ -30,7 +32,8 @@ export async function recordChange(
       app: 'platform',
       correlationId: c.correlationId,
       traceparent: p.ports.telemetry.traceparent(),
-      origin: c.actor.type === 'System' ? 'system' : 'user',
+      origin: c.envelope?.origin ?? (c.actor.type === 'System' ? 'system' : 'user'),
+      ...(c.envelope ? { causationId: c.envelope.causationId ?? null, workflowHop: c.envelope.workflowHop, workflowChain: c.envelope.workflowChain } : {}),
       newId,
     },
   );

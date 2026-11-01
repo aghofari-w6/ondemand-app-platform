@@ -27,6 +27,8 @@ export interface DryRunOptions {
 }
 
 const MAX_STEPS = 500;
+/** wall-clock budget for one test run (code nodes run in the sandbox) */
+const MAX_MS = 10_000;
 
 export async function dryRun(p: Platform, graph: WorkflowGraph, event: EventEnvelope, opts: DryRunOptions = {}): Promise<{ matched: boolean; steps: DryRunStep[]; path: string[]; error: string | null }> {
   const byId = new Map(graph.nodes.map((n) => [n.id, n]));
@@ -43,6 +45,7 @@ export async function dryRun(p: Platform, graph: WorkflowGraph, event: EventEnve
   const steps: DryRunStep[] = [];
   const scope: Record<string, any> = { trigger: event, steps: {}, vars: {}, run: { id: 'test-run', workflow_id: 'test', hop: event.workflow_hop + 1, correlation_id: event.correlation_id } };
   let failed: string | null = null;
+  const deadline = Date.now() + MAX_MS;
 
   const exec = async (node: WorkflowNode, input: unknown): Promise<{ port: string; output: unknown } | null> => {
     const started = Date.now();
@@ -125,7 +128,20 @@ export async function dryRun(p: Platform, graph: WorkflowGraph, event: EventEnve
     while (id) {
       if (failed || steps.length >= MAX_STEPS) return { arrivedFrom: null };
       if (id === stopAt) return { arrivedFrom: prev };
-      const node: WorkflowNode = byId.get(id)!;
+      // A node runs at most once (a cycle in an unvalidated draft would loop).
+      if (scope.steps[id] !== undefined) {
+        failed = `${id}: reached twice; the workflow contains a loop`;
+        return { arrivedFrom: null };
+      }
+      if (Date.now() > deadline) {
+        failed = `test run stopped after ${MAX_MS / 1000} s`;
+        return { arrivedFrom: null };
+      }
+      const node: WorkflowNode | undefined = byId.get(id);
+      if (!node) {
+        failed = `edge to unknown node ${id}`;
+        return { arrivedFrom: null };
+      }
       const r = await exec(node, carry);
       if (!r) return { arrivedFrom: null };
       if (node.type === 'parallel') {

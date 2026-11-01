@@ -15,7 +15,7 @@ import { IndexBuilder, runBackfill } from './maintenance.ts';
 import { handleStepJob } from './provisioning.ts';
 import { QUEUES } from './queues.ts';
 import { TEMPLATES } from './templates.ts';
-import { WorkflowRunner, workflowsConsumer } from './workflows/engine.ts';
+import { notificationsConsumer, WorkflowRunner, workflowsConsumer } from './workflows/engine.ts';
 import { handleLifecycleJob, lifecycleSweep } from './tenants.ts';
 
 const consoleLogger: Logger = {
@@ -59,6 +59,7 @@ export function createPlatform(opts: { env?: Partial<Record<keyof Env, string>>;
   p.ports.eventBus.subscribe(linkIndexConsumer(p));
   p.ports.eventBus.subscribe(hubFanoutConsumer(p));
   p.ports.eventBus.subscribe(workflowsConsumer(p));
+  p.ports.eventBus.subscribe(notificationsConsumer(p));
   p.workers = { hub: new HubDeliverer(p), workflows: new WorkflowRunner(p), indexes: null };
   return p;
 }

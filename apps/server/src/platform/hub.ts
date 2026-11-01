@@ -153,6 +153,8 @@ export function hubFanoutConsumer(_p: Platform): Consumer {
     name: 'platform.hub_fanout',
     types: ['*'],
     async handle(event: EventEnvelope, tx) {
+      // Internal notifications to users never leave through the Hub.
+      if (event.type === 'workflow.notification') return;
       // A workflow `hub_send` node addresses exactly one endpoint, whatever it subscribes to.
       if (event.type === 'workflow.message') {
         const target = await tx.selectFrom('hub_endpoint').select('id').where('id', '=', String(event.data.endpoint_id)).executeTakeFirst();
@@ -341,7 +343,8 @@ export class HubDeliverer {
       // A key change makes stored secrets unreadable; retrying cannot help, so dead-letter
       // the delivery with a clear reason instead of failing it forever.
       await p.database.withTenant(tenantId, async (tx) => {
-        await tx.updateTable('hub_delivery').set({ status: 'dead', last_error: 'stored credentials or signing secret cannot be decrypted; re-enter them on the endpoint', lease_until: null, updated_at: new Date() }).where('id', '=', d.id).execute();
+        const won = await tx.updateTable('hub_delivery').set({ status: 'dead', last_error: 'stored credentials or signing secret cannot be decrypted; re-enter them on the endpoint', lease_until: null, updated_at: new Date() }).where('id', '=', d.id).where('status', '=', 'delivering').returning('id').executeTakeFirst();
+        if (!won) return;
         await recordChange(p, tx, {
           tenantId,
           actor: { type: 'System', id: 'hub' },

@@ -229,9 +229,12 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
   `steps.<node>.output`, `vars` (and `event` in a wait filter).
 - **Lifecycle** (`platform/workflows/definitions.ts`): the Data studio pattern — one draft,
   publish validates and supersedes, rollback re-publishes as a new number. Publishing picks
-  the role the workflow acts as; it may not exceed the publisher's permissions and must
-  cover every command/record node. At run time the principal holds (the role's
-  permissions now) ∩ (the snapshot taken at publish).
+  the role the workflow acts as; it may not exceed the publisher's permissions or field
+  access, and must cover every node (`hub_send` needs `platform:hub.send`). At run time
+  the principal holds (the role's permissions now) ∩ (the snapshot taken at publish).
+  Enabling a workflow or retrying its run needs the actor to hold that snapshot too.
+- **Run data and field rules:** the execution view and test runs mask any key hidden from
+  the viewer by a field rule; test runs replay only past events of the trigger's type.
 - **Engine** (`platform/workflows/engine.ts`): see the module comment. A consumer starts
   runs in the transaction that marks the event processed; an in-process runner claims
   node executions with a lease; command/record nodes commit with their node, keyed
@@ -242,7 +245,8 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
   with the reason instead of starting one.
 - **Approvals** (`platform/approvals.ts`): a platform service (workflows now, assistant
   tools in E). Approver roles, quorum (any rejection rejects), expiry; every decision is
-  audited under the request's correlation id.
+  audited under the request's correlation id. The user whose change started the chain
+  (from the audit log) cannot approve its requests.
 - **Trace viewer** (`platform/trace.ts`): everything under a correlation id — audit,
   events (metadata only), consumers, runs and nodes, Hub deliveries, approvals and
   decisions — found from a correlation, event, record, run or approval id.
@@ -287,4 +291,6 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
   tables later.
 - **`hub_send` nodes publish a `workflow.message` event** addressed to one endpoint, so
   outbound calls keep the Hub's SSRF policy, signatures, retries and dead letters.
-- **Notifications are at-least-once:** the Channel port is called before the node commits.
+- **Notifications go through the outbox:** a `notify` node writes a `workflow.notification`
+  event (user ids, never addresses) with its completion; the `platform.notifications`
+  consumer calls the Channel port. A crash between send and commit can repeat a send.

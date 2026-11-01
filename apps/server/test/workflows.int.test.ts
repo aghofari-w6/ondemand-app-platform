@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { EventEnvelope, Principal, WorkflowGraph } from '@aod/shared';
+import { EndpointInput, type EventEnvelope, type Principal, type WorkflowGraph } from '@aod/shared';
 import { sql } from 'kysely';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
@@ -10,9 +10,10 @@ import { newId, type Tx } from '../src/db/database.ts';
 import { decideApproval } from '../src/platform/approvals.ts';
 import { writeOutbox } from '../src/platform/outbox.ts';
 import { traceQuery } from '../src/platform/trace.ts';
-import { createWorkflow, publishWorkflow, rollbackWorkflow, saveDraft } from '../src/platform/workflows/definitions.ts';
+import { createWorkflow, publishWorkflow, rollbackWorkflow, saveDraft, setWorkflowStatus } from '../src/platform/workflows/definitions.ts';
 import { dryRun } from '../src/platform/workflows/dryrun.ts';
-import { retryRun, workflowsConsumer } from '../src/platform/workflows/engine.ts';
+import { cancelRun, retryRun, workflowsConsumer } from '../src/platform/workflows/engine.ts';
+import { saveEndpoint } from '../src/platform/hub.ts';
 import { closePlatform, cmd, newTenant, runSaga, setPlan, testPlatform, type TestTenant } from './helpers.ts';
 
 const p = testPlatform();
@@ -74,6 +75,13 @@ const J3: WorkflowGraph = {
     node('notify_cashier', 'notify', { roles: ['Staff'], subject: 'Void refund rejected', message: 'The refund for {{ trigger.data.receipt_no }} was rejected.' }),
   ],
   edges: [edge('trigger', 'out', 'approve'), edge('approve', 'approved', 'refund'), edge('refund', 'out', 'notify_store'), edge('approve', 'rejected', 'notify_cashier')],
+};
+
+const sent: { to: string; subject: string }[] = [];
+const realSend = p.ports.channel.send.bind(p.ports.channel);
+p.ports.channel.send = async (m) => {
+  sent.push({ to: m.to, subject: m.subject });
+  return realSend(m);
 };
 
 beforeAll(async () => {
@@ -138,6 +146,9 @@ describe('J3: approval-gated refund', () => {
     // Staff cannot decide; a Manager can.
     const staff = await inTenant((tx) => principalFor(tx, p.catalog, t.tenantId, { id: t.ownerId, role: 'Staff' }));
     await expect(inTenant((tx) => decideApproval(p, tx, t.tenantId, { id: newId(), role: 'Staff', principal: staff }, req!.id, 'approve', '', cid()))).rejects.toMatchObject({ code: 'not_an_approver' });
+    // The user whose void started the chain cannot approve its refund.
+    expect(req!.requested_by).toBe(t.ownerId);
+    await expect(inTenant((tx) => decideApproval(p, tx, t.tenantId, { id: t.ownerId, role: 'Owner', principal: t.owner }, req!.id, 'approve', '', cid()))).rejects.toMatchObject({ code: 'own_request' });
     const decided = await inTenant((tx) => decideApproval(p, tx, t.tenantId, { id: managerB.id, role: 'Manager', principal: managerB.principal }, req!.id, 'approve', 'ok, receipt checked', cid()));
     expect(decided.status).toBe('approved');
     await expect(inTenant((tx) => decideApproval(p, tx, t.tenantId, { id: managerA.id, role: 'Manager', principal: managerA.principal }, req!.id, 'approve', '', cid()))).rejects.toMatchObject({ code: 'already_resolved' });
@@ -147,7 +158,15 @@ describe('J3: approval-gated refund', () => {
     expect(done.status).toBe('succeeded');
     const nodes = await nodesOf(done.id);
     expect(nodes.filter((n) => n.status === 'succeeded').map((n) => `${n.node_id}:${n.port}`)).toEqual(['trigger:out', 'approve:approved', 'refund:out', 'notify_store:out']);
-    expect(nodes.find((n) => n.node_id === 'notify_store')!.output).toMatchObject({ subject: expect.stringContaining('Refund issued'), recipients: expect.arrayContaining([expect.objectContaining({ via: 'screen' })]) });
+    const notified = nodes.find((n) => n.node_id === 'notify_store')!.output as { subject: string; recipients: string[] };
+    expect(notified.subject).toContain('Refund issued');
+    expect(notified.recipients).toEqual(expect.arrayContaining([managerA.id, managerB.id]));
+    // Sent through the outbox: one workflow.notification event, delivered by its consumer.
+    const note = await inTenant((tx) => tx.selectFrom('event_log').select(['id', 'payload']).where('type', '=', 'workflow.notification').where(sql<string>`payload ->> 'correlation_id'`, '=', correlationId).execute());
+    expect(note).toHaveLength(1);
+    expect(note[0]!.payload).toMatchObject({ origin: 'workflow', workflow_hop: 1, workflow_chain: [workflowId] });
+    expect(JSON.stringify(note[0]!.payload)).not.toContain('@'); // user ids, never addresses
+    expect(sent.filter((m) => m.subject.startsWith('Refund issued'))).toHaveLength(notified.recipients.length);
     const pay = await inTenant((tx) => tx.selectFrom('pay_payment').select('status').where('reference', '=', `pos:sale:${s.id}`).executeTakeFirstOrThrow());
     expect(pay.status).toBe('refunded');
 
@@ -428,6 +447,11 @@ describe('HTTP: workflows, approvals, trace', () => {
     expect(test.json().path).toEqual(['trigger', 'check', 'action']);
     expect(test.json().steps[2]).toMatchObject({ status: 'failed', error: expect.stringContaining('id') }); // template has no input yet
 
+    // Only past events of the trigger's own type can be replayed (no reading arbitrary events).
+    const other = await inTenant((tx) => tx.selectFrom('event_log').select('id').where('type', '<>', 'order.created').limit(1).executeTakeFirstOrThrow());
+    const wrong = await app.inject({ method: 'POST', url: `/api/workflows/${id}/test`, headers: json(ownerCookie), payload: { event_id: other.id } });
+    expect(wrong.statusCode).toBe(404);
+
     const v = await app.inject({ method: 'POST', url: '/api/workflows/validate', headers: json(ownerCookie), payload: { graph: { nodes: [{ id: 'a', type: 'set', name: 'A', config: { vars: { x: 1 } } }], edges: [] } } });
     expect(v.json().problems).toContain('a workflow needs exactly one trigger (has 0)');
 
@@ -453,5 +477,59 @@ describe('HTTP: workflows, approvals, trace', () => {
     const tr = (await app.inject({ url: `/api/trace?q=${runs[0].trigger_event_id}`, headers: { cookie: ownerCookie } })).json();
     expect(tr.correlation_ids).toEqual([runs[0].correlation_id]);
     expect(tr.items.some((i: any) => i.kind === 'run')).toBe(true);
+  });
+});
+
+describe('authorization of what a workflow may do', () => {
+  const noop = (event: string): WorkflowGraph => ({ nodes: [node('trigger', 'trigger', { event }), node('s', 'set', { vars: { x: 1 } })], edges: [edge('trigger', 'out', 's')] });
+
+  it('refuses a service role with looser field access than the publisher', async () => {
+    const strict: Principal = { ...managerA.principal, roles: managerA.principal.roles.map((r) => ({ ...r, fieldRules: [...r.fieldRules, { resource: 'payments::Payment', field: 'amount', access: 'hidden' as const }] })) };
+    const { id } = await inTenant((tx) => createWorkflow(p, tx, t.tenantId, strict, { name: 'Field cap', graph: noop('payment.refunded') }, cid()));
+    await expect(inTenant((tx) => publishWorkflow(p, tx, t.tenantId, strict, id, 1, 'Manager', cid()))).rejects.toMatchObject({ status: 403, code: 'role_exceeds_publisher', message: expect.stringContaining('payments::Payment.amount') });
+  });
+
+  it('hub_send needs platform:hub.send, is audited, and keeps the run hop and chain', async () => {
+    const ep = await inTenant((tx) => saveEndpoint(p, tx, t.tenantId, t.owner, EndpointInput.parse({ kind: 'webhook', name: 'erp', event_types: ['order.cancelled'], config: { url: 'http://127.0.0.1:9/hook' } }), cid()));
+    const g: WorkflowGraph = {
+      nodes: [node('trigger', 'trigger', { event: 'store.created' }), node('send', 'hub_send', { endpoint_id: ep.id, body: { store: '{{ trigger.data.name }}' } })],
+      edges: [edge('trigger', 'out', 'send')],
+    };
+    const { id } = await inTenant((tx) => createWorkflow(p, tx, t.tenantId, t.owner, { name: 'Send shifts', graph: g }, cid()));
+    await expect(inTenant((tx) => publishWorkflow(p, tx, t.tenantId, t.owner, id, 1, 'Manager', cid()))).rejects.toMatchObject({ code: 'role_too_narrow', message: expect.stringContaining('platform:hub.send') });
+    await inTenant((tx) => publishWorkflow(p, tx, t.tenantId, t.owner, id, 1, 'Admin', cid()));
+    await cmd(p, t, 'pos', 'store.create', { name: 'Hub test store' });
+    await settle();
+    const [run] = await runsOf(id);
+    expect(run?.status).toBe('succeeded');
+    const msg = await inTenant((tx) => tx.selectFrom('event_log').select('payload').where('type', '=', 'workflow.message').where(sql<string>`payload ->> 'correlation_id'`, '=', run!.correlation_id).executeTakeFirstOrThrow());
+    expect(msg.payload).toMatchObject({ origin: 'workflow', workflow_hop: 1, workflow_chain: [id], data: { endpoint_id: ep.id } });
+    const audit = await inTenant((tx) => tx.selectFrom('audit_log').select(['action', 'actor_type']).where('correlation_id', '=', run!.correlation_id).where('action', '=', 'platform:workflow.hub_sent').execute());
+    expect(audit).toEqual([{ action: 'platform:workflow.hub_sent', actor_type: 'Workflow' }]);
+    expect((await inTenant((tx) => tx.selectFrom('hub_delivery').select('endpoint_id').where('event_type', '=', 'workflow.message').execute())).map((d) => d.endpoint_id)).toEqual([ep.id]);
+    await inTenant((tx) => tx.updateTable('workflow').set({ status: 'disabled' }).where('id', '=', id).execute());
+    await inTenant((tx) => tx.updateTable('hub_endpoint').set({ status: 'paused' }).where('id', '=', ep.id).execute());
+  });
+
+  it('enabling or retrying needs everything the workflow may do; cancelling a run cancels its approvals, audited', async () => {
+    const { id } = await inTenant((tx) => createWorkflow(p, tx, t.tenantId, t.owner, { name: 'Owner powered', graph: noop('shift.closed') }, cid()));
+    await inTenant((tx) => publishWorkflow(p, tx, t.tenantId, t.owner, id, 1, 'Owner', cid()));
+    await inTenant((tx) => setWorkflowStatus(p, tx, t.tenantId, t.owner, id, 'disabled', cid()));
+    await expect(inTenant((tx) => setWorkflowStatus(p, tx, t.tenantId, managerA.principal, id, 'active', cid()))).rejects.toMatchObject({ status: 403, code: 'role_exceeds_actor' });
+
+    // A failed Owner-role run cannot be retried by a Manager.
+    const runId = newId();
+    await inTenant((tx) => tx.insertInto('workflow_run').values({ id: runId, tenant_id: t.tenantId, workflow_id: id, version_number: 1, status: 'failed', trigger_event_id: newId(), trigger: '{}', correlation_id: 'retry-guard', hop: 1, chain: [id] }).execute());
+    await expect(inTenant((tx) => retryRun(p, tx, t.tenantId, managerA.principal, runId, cid()))).rejects.toMatchObject({ code: 'role_exceeds_actor' });
+
+    // Cancel a run waiting at Approvals.
+    const s = await sale(1_300_000);
+    const correlationId = await voidSale(s);
+    const run = (await inTenant((tx) => tx.selectFrom('workflow_run').selectAll().where('correlation_id', '=', correlationId).executeTakeFirstOrThrow()));
+    await inTenant((tx) => cancelRun(p, tx, t.tenantId, t.owner, run.id, cid()));
+    const req = await inTenant((tx) => tx.selectFrom('approval_request').select(['id', 'status']).where('correlation_id', '=', correlationId).executeTakeFirstOrThrow());
+    expect(req.status).toBe('cancelled');
+    const audit = await inTenant((tx) => tx.selectFrom('audit_log').select('action').where('resource_id', '=', req.id).execute());
+    expect(audit.map((a) => a.action)).toContain('platform:approval.cancelled');
   });
 });

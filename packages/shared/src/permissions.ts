@@ -42,6 +42,7 @@ export const PLATFORM_PERMISSIONS: PermissionDef[] = [
   { id: 'platform:workflows.read', label: 'See workflows and their runs', level: 'manage' },
   { id: 'platform:workflows.manage', label: 'Build, publish and run workflows', level: 'manage' },
   { id: 'platform:trace.read', label: 'Use the trace viewer', level: 'manage' },
+  { id: 'platform:hub.send', label: 'Send messages to Hub endpoints from workflows', level: 'admin' },
 ];
 
 export const ROLE_PRESETS = ['Owner', 'Admin', 'Manager', 'Staff', 'Viewer'] as const;

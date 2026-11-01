@@ -95,8 +95,10 @@ e2e/               Playwright
     stored encrypted and never returned by an API.
 13. **Workflows** act only through `executeCommand()` / `executeRecordWrite()` (inside the
     node's transaction, idempotency key `wf:<node run>`) and the outbox, with the run's
-    `workflowHop`/`workflowChain`; outbound sends go through the Hub. Their principal is
-    the service role capped at publish (`servicePrincipal()`), never `System`.
+    `workflowHop`/`workflowChain`; outbound sends go through the Hub and notifications
+    through a `workflow.notification` outbox event. Their principal is the service role
+    capped at publish (`servicePrincipal()`), never `System`; run data shown to a viewer
+    is masked with `redact()`.
 
 ## Conventions
 

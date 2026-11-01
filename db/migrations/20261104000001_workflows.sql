@@ -54,6 +54,9 @@ CREATE TABLE workflow_run (
   correlation_id text NOT NULL,
   hop integer NOT NULL,
   chain text[] NOT NULL,
+  -- the user whose change started this chain (from the audit log), if any:
+  -- they may not approve the run's own approval requests
+  initiated_by text,
   vars jsonb NOT NULL DEFAULT '{}',
   error text,
   started_at timestamptz NOT NULL DEFAULT now(),

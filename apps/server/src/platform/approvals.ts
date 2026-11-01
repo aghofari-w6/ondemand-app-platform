@@ -3,7 +3,7 @@ import { sql } from 'kysely';
 import { newId, type Tx } from '../db/database.ts';
 import type { Platform } from './context.ts';
 import { recordChange } from './record.ts';
-import { resolveApprovalNode } from './workflows/engine.ts';
+import { lockRun, resolveApprovalNode } from './workflows/engine.ts';
 
 /**
  * Approvals: a platform service. Workflows request approvals today; high-risk assistant
@@ -41,6 +41,13 @@ export async function listApprovals(tx: Tx, approver: Approver, status: 'pending
 }
 
 export async function decideApproval(p: Platform, tx: Tx, tenantId: string, approver: Approver, requestId: string, decision: 'approve' | 'reject', comment: string, correlationId: string) {
+  // Lock order matches the engine (run, then request), so deciding never deadlocks with
+  // a cancel, a failure or an expiry of the same run.
+  const ref = await tx.selectFrom('approval_request').select(['source', 'source_ref']).where('id', '=', requestId).executeTakeFirst();
+  if (ref?.source === 'workflow') {
+    const nr = await tx.selectFrom('workflow_node_run').select('run_id').where('id', '=', ref.source_ref).executeTakeFirst();
+    if (nr) await lockRun(tx, nr.run_id);
+  }
   const r = (await sql<any>`SELECT * FROM approval_request WHERE id = ${requestId} FOR UPDATE`.execute(tx)).rows[0];
   if (!r) throw new CommandError(404, 'not_found', 'approval request not found');
   if (!canDecide(approver, r.approver_roles)) throw new CommandError(403, 'not_an_approver', 'this request is not addressed to your role');

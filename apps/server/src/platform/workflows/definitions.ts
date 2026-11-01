@@ -1,7 +1,7 @@
-import { CommandError, graphFromTemplate, presetPermissions, ROLE_PRESETS, validateGraph, WorkflowGraph, type Principal, type WorkflowContext } from '@aod/shared';
+import { CommandError, graphFromTemplate, type FieldAccess, presetPermissions, ROLE_PRESETS, validateGraph, WorkflowGraph, type Principal, type WorkflowContext } from '@aod/shared';
 import { sql } from 'kysely';
 import { newId, type Tx } from '../../db/database.ts';
-import { resolveRole } from '../../auth/principal.ts';
+import { publishedFieldRules, resolveRole } from '../../auth/principal.ts';
 import { activeApps } from '../commands.ts';
 import type { Platform } from '../context.ts';
 import { publishedDefinition } from '../datastudio.ts';
@@ -128,7 +128,7 @@ export async function saveDraft(p: Platform, tx: Tx, tenantId: string, actor: Pr
 }
 
 /** Permissions of a principal (an Owner holds everything). */
-function heldPermissions(p: Platform, principal: Principal): Set<string> {
+export function heldPermissions(p: Platform, principal: Principal): Set<string> {
   if (principal.type === 'System') return new Set(p.catalog.permissions.map((x) => x.id));
   const out = new Set<string>();
   for (const r of principal.roles) for (const x of r.preset === 'Owner' ? presetPermissions('Owner', p.catalog.permissions) : r.permissions) out.add(x);
@@ -142,6 +142,18 @@ async function capServiceRole(p: Platform, tx: Tx, actor: Principal, role: strin
   const held = heldPermissions(p, actor);
   const extra = resolved.permissions.filter((x) => !held.has(x));
   if (extra.length) throw Object.assign(new CommandError(403, 'role_exceeds_publisher', `the workflow's role may not have more permissions than you: ${extra.slice(0, 5).join(', ')}${extra.length > 5 ? ', …' : ''}`), { details: { extra } });
+  // Field rules: the workflow's role may not see or change a field its publisher cannot.
+  const RANK: Record<FieldAccess, number> = { hidden: 0, read: 1, write: 2 };
+  if (!actor.roles.some((r) => r.preset === 'Owner') && actor.type !== 'System') {
+    const serviceRules = resolved.preset === 'Owner' ? [] : [...resolved.fieldRules, ...(await publishedFieldRules(tx, role))];
+    const looser: string[] = [];
+    for (const r of actor.roles.flatMap((x) => x.fieldRules)) {
+      const mine = serviceRules.filter((x) => x.resource === r.resource && x.field === r.field);
+      const access: FieldAccess = mine.length ? mine.reduce<FieldAccess>((a, b) => (RANK[b.access] > RANK[a] ? b.access : a), 'hidden') : 'write';
+      if (RANK[access] > RANK[r.access]) looser.push(`${r.resource}.${r.field} (${access}; you have ${r.access})`);
+    }
+    if (looser.length) throw Object.assign(new CommandError(403, 'role_exceeds_publisher', `the workflow's role may not have more field access than you: ${looser.slice(0, 5).join(', ')}`), { details: { extra: looser } });
+  }
   const perms = new Set(resolved.permissions);
   const missing: string[] = [];
   for (const n of graph.nodes) {
@@ -151,6 +163,8 @@ async function capServiceRole(p: Platform, tx: Tx, actor: Principal, role: strin
       if (perm && !perms.has(perm)) missing.push(`${n.id} needs ${perm}`);
     }
     if (n.type === 'record' && !perms.has('platform:records.write')) missing.push(`${n.id} needs platform:records.write`);
+    // Hub endpoints carry credentials an Admin configured: sending needs its own permission.
+    if (n.type === 'hub_send' && !perms.has('platform:hub.send')) missing.push(`${n.id} needs platform:hub.send`);
   }
   if (missing.length) throw Object.assign(new CommandError(422, 'role_too_narrow', `the role ${resolved.name} cannot run this workflow: ${missing.join('; ')}`), { details: { missing } });
   return resolved.permissions;
@@ -206,9 +220,18 @@ export async function discardWorkflowDraft(p: Platform, tx: Tx, tenantId: string
   await recordChange(p, tx, { tenantId, actor, action: 'platform:workflow.draft_discarded', resourceType: RESOURCE, resourceId: id, correlationId, data: { number: r.number } });
 }
 
+/** Starting work a workflow will do (enable, retry) needs the actor to hold everything its role may do. */
+export async function assertActorCovers(p: Platform, tx: Tx, actor: Principal, workflowId: string, number: number) {
+  const v = await tx.selectFrom('workflow_version').select('service_permissions').where('workflow_id', '=', workflowId).where('number', '=', number).executeTakeFirst();
+  const held = heldPermissions(p, actor);
+  const extra = ((v?.service_permissions as string[] | undefined) ?? []).filter((x) => !held.has(x));
+  if (extra.length) throw Object.assign(new CommandError(403, 'role_exceeds_actor', `this workflow acts with permissions you do not have: ${extra.slice(0, 5).join(', ')}`), { details: { extra } });
+}
+
 export async function setWorkflowStatus(p: Platform, tx: Tx, tenantId: string, actor: Principal, id: string, status: 'active' | 'disabled', correlationId: string) {
   const w = await getWorkflow(tx, id);
   if (status === 'active' && !w.published_number) throw new CommandError(409, 'not_published', 'publish the workflow first');
+  if (status === 'active') await assertActorCovers(p, tx, actor, id, w.published_number!);
   await tx.updateTable('workflow').set({ status, updated_at: new Date(), version: sql`version + 1` }).where('id', '=', id).execute();
   await recordChange(p, tx, { tenantId, actor, action: `platform:workflow.${status === 'active' ? 'enabled' : 'disabled'}`, resourceType: RESOURCE, resourceId: id, correlationId, events: [{ type: `workflow.${status === 'active' ? 'enabled' : 'disabled'}`, data: { workflow_id: id } }] });
 }

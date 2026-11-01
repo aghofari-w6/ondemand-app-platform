@@ -9,6 +9,7 @@ import { publishedDefinition } from '../../platform/datastudio.ts';
 import { traceQuery } from '../../platform/trace.ts';
 import { checkGraph, createWorkflow, discardWorkflowDraft, getWorkflow, publishWorkflow, rollbackWorkflow, saveDraft, setWorkflowStatus } from '../../platform/workflows/definitions.ts';
 import { dryRun } from '../../platform/workflows/dryrun.ts';
+import { hiddenKeysFor, redact } from '../../platform/workflows/redact.ts';
 import { cancelRun, retryRun } from '../../platform/workflows/engine.ts';
 import { correlationId, parse, requireAuth, requirePermission } from '../app.ts';
 
@@ -199,8 +200,9 @@ export function workflowRoutes(p: Platform) {
         const trigger = checked.graph.nodes.find((n) => n.type === 'trigger');
         let event: EventEnvelope;
         if (body.event_id) {
-          const row = await tx.selectFrom('event_log').select('payload').where('id', '=', body.event_id).executeTakeFirst();
-          if (!row) throw new CommandError(404, 'not_found', 'event not found');
+          // Only past events of the trigger's own type can be replayed in a test run.
+          const row = await tx.selectFrom('event_log').select('payload').where('id', '=', body.event_id).where('type', '=', String(trigger?.config.event ?? '')).executeTakeFirst();
+          if (!row) throw new CommandError(404, 'not_found', "no past event of the trigger's type with this id");
           event = row.payload as EventEnvelope;
         } else {
           const type = String(trigger?.config.event ?? 'sample.event');
@@ -223,7 +225,10 @@ export function workflowRoutes(p: Platform) {
         }
         return { graph: checked.graph, event };
       });
-      return dryRun(p, graph, event, { ...(body.approval ? { approval: body.approval } : {}), ...(body.wait ? { wait: body.wait } : {}) });
+      const result = await dryRun(p, graph, event, { ...(body.approval ? { approval: body.approval } : {}), ...(body.wait ? { wait: body.wait } : {}) });
+      // Field rules: the viewer never sees, through a test run, a field hidden from them.
+      const hidden = hiddenKeysFor(a.principal);
+      return { ...result, steps: result.steps.map((s) => ({ ...s, input: redact(s.input, hidden), output: redact(s.output, hidden) })) };
     });
 
     // ---------------------------------------------------------------- runs
@@ -250,7 +255,15 @@ export function workflowRoutes(p: Platform) {
         const v = await tx.selectFrom('workflow_version').select('graph').where('workflow_id', '=', run.workflow_id).where('number', '=', run.version_number).executeTakeFirstOrThrow();
         const nodes = await tx.selectFrom('workflow_node_run').select(['id', 'node_id', 'status', 'attempt', 'input', 'output', 'port', 'error', 'state', 'created_at', 'started_at', 'finished_at', 'not_before']).where('run_id', '=', id).orderBy('created_at').orderBy(sql`started_at NULLS LAST`).orderBy('node_id').execute();
         const approvals = await tx.selectFrom('approval_request').select(['id', 'source_ref', 'title', 'status']).where('source', '=', 'workflow').where('source_ref', 'in', [...nodes.map((n) => n.id), '00000000-0000-0000-0000-000000000000']).execute();
-        return { run, workflow: w, graph: v.graph, nodes, approvals };
+        // Field rules: run data is masked for the viewer (see redact.ts).
+        const hidden = hiddenKeysFor(a.principal);
+        return {
+          run: { ...run, trigger: redact(run.trigger, hidden), vars: redact(run.vars, hidden) },
+          workflow: w,
+          graph: v.graph,
+          nodes: nodes.map((n) => ({ ...n, input: redact(n.input, hidden), output: redact(n.output, hidden), state: redact(n.state, hidden) })),
+          approvals,
+        };
       });
     });
 
