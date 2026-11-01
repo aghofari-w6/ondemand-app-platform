@@ -335,7 +335,8 @@ function CustomFieldsCard({ run }: { run: (fn: () => Promise<unknown>, ok: strin
   const save = (e: FormEvent) => {
     e.preventDefault();
     void run(async () => {
-      await api('/api/fields', { body: { app, entity, key: f.key, label: f.label, type: f.type, options: f.options ? f.options.split(',').map((s) => s.trim()).filter(Boolean) : [] } });
+      // Quick add: Data studio publishes a one-change version.
+      await api('/api/fields', { body: { app, entity, field: { key: f.key, label: f.label, type: f.type, options: f.options ? f.options.split(',').map((s) => s.trim()).filter(Boolean) : [] } } });
       setF({ key: '', label: '', type: 'text', options: '' });
       await fields.refetch();
     }, 'Field added.');
@@ -443,9 +444,7 @@ export function AuditScreen() {
 
 export const PLANNED: Record<string, { title: string; pkg: string; milestone: string; what: string }> = {
   '/billing': { title: 'Billing and usage', pkg: 'Platform', milestone: 'Milestone F', what: 'Invoices, usage meters and payment methods. Plan changes are under Settings for now.' },
-  '/data-studio': { title: 'Data studio', pkg: 'Apps', milestone: 'Milestone B (phase 2)', what: 'Draft and publish data models, custom entities, formulas, layouts and field access.' },
   '/workflows': { title: 'Workflows', pkg: 'Apps', milestone: 'Milestone C (phase 3)', what: 'Event-triggered automations built from app workflow templates.' },
-  '/integration-hub': { title: 'Integration Hub', pkg: 'Apps', milestone: 'Milestone B (phase 2)', what: 'Webhooks, REST push, queues and two-way sync with your systems.' },
   '/dashboards': { title: 'Dashboards', pkg: 'Analytics', milestone: 'Milestone D (phase 4)', what: 'Live dashboards over app metrics.' },
   '/reports': { title: 'Reports', pkg: 'Analytics', milestone: 'Milestone D (phase 4)', what: 'Scheduled and ad-hoc reports.' },
   '/data-governance': { title: 'Data governance', pkg: 'Analytics', milestone: 'Milestone D (phase 4)', what: 'PII inventory, retention and access reviews.' },

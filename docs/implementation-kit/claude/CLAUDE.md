@@ -20,7 +20,8 @@ Synthetic data only. Never commit secrets or keys.
 | Demo tenant "Acme Coffee" | `pnpm seed` (`-- --reset` to re-create) |
 | Build SPA + run server on :3000 | `pnpm --filter @aod/web build && pnpm start` |
 | Dev (API :3000, Vite :5173) | `pnpm dev` |
-| E2E J1 + axe | `pnpm e2e` (needs a migrated `aod` DB and a built SPA) |
+| E2E (J1 + phase 2) + axe | `pnpm e2e` (needs a migrated `aod` DB and a built SPA) |
+| Redis for the Streams test | `redis-server --daemonize yes` (or set `TEST_REDIS_URL`) |
 
 Run `pnpm lint && pnpm typecheck && pnpm test && pnpm test:integration` before every
 commit. The server runs TypeScript directly on Node 24 (type stripping): use `.ts`
@@ -34,7 +35,9 @@ apps/server/src/
   ports/       port interfaces — call sites depend on these, never on adapters
   adapters/    one prototype adapter per port (pg event bus, pg-boss, vault, OIDC/SAML, …)
   platform/    catalog, commands (write pipeline), outbox, audit, consumers,
-               provisioning (sagas), tenants (lifecycle), workspace (list/detail), fields
+               provisioning (sagas), tenants (lifecycle), workspace (list/detail), fields,
+               datastudio (metadata versions), records (custom entities), links, hub,
+               maintenance (backfills, index builder), openapi
   http/        app.ts (hooks, errors, auth helpers) + routes/
 apps/web/src/  React SPA: components/ (ui, shell, workspace), screens/, lib/ (api, offline)
 packages/shared/src/  envelope, manifest (schema + validator), permissions (authorize),
@@ -81,6 +84,14 @@ e2e/               Playwright
    user-written conditions or formulas. Never use `eval`/`Function`.
 10. **Ports.** New infrastructure needs go behind a port in `apps/server/src/ports` with
     one prototype adapter. Stubs only for ports unused in the current milestone.
+11. **Data model changes go through Data studio** (`platform/datastudio.ts`): never write
+    `field_definition` or `field_access_rule` directly outside a publish. Custom record
+    writes go through `executeRecordWrite()` (`platform/records.ts`). PII values are
+    encrypted with `encryptPii()` and never put into event data.
+12. **Outbound calls go through the `Webhooks` port** (`adapters/delivery.ts`), which
+    enforces the SSRF policy (`adapters/ssrf.ts`). Never `fetch` a tenant-supplied URL
+    directly. Tenant code runs only in the `Sandbox` port (isolated-vm). Credentials are
+    stored encrypted and never returned by an API.
 
 ## Conventions
 

@@ -21,6 +21,16 @@ export default defineConfig({
     url: `http://localhost:${PORT}/api/health`,
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,
-    env: { PORT: String(PORT), PUBLIC_URL: `http://localhost:${PORT}`, LOG_LEVEL: 'warn', DEMO_MODE: 'true' },
+    env: {
+      PORT: String(PORT),
+      PUBLIC_URL: `http://localhost:${PORT}`,
+      LOG_LEVEL: 'warn',
+      DEMO_MODE: 'true',
+      // The e2e webhook receiver runs on localhost; production never allows this.
+      HUB_ALLOW_PRIVATE_HOSTS: '127.0.0.1,localhost',
+      HUB_BACKOFF_BASE_MS: '50',
+      HUB_MAX_ATTEMPTS: '2',
+      HUB_INTERVAL_MS: '200',
+    },
   },
 });

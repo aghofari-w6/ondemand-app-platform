@@ -15,8 +15,8 @@ External services are only called as API clients. Synthetic data only; never com
 
 | Milestone | Scope | State |
 | --- | --- | --- |
-| A | Week 0 + phase 1 (journey J1) | this branch |
-| B | Phase 2: Data studio, Integration Hub, public `/v1` | not started |
+| A | Week 0 + phase 1 (journey J1) | merged |
+| B | Phase 2: Data studio, custom entities, link index, Integration Hub, public `/v1` | this branch |
 
 Screens for later milestones are in the navigation and show an empty state naming the
 owning package and milestone.
@@ -54,7 +54,10 @@ With Docker: `docker compose up --build` migrates, seeds and starts the app on :
 Environment (see `apps/server/src/config.ts`): `DATABASE_URL` (app role `aod_app`),
 `MIGRATION_DATABASE_URL` (owner role, migrations and seed only), `PUBLIC_URL`, `DEMO_MODE`,
 `VAULT_KEY`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL` (default `claude-opus-5-5`),
-`OTEL_EXPORTER_OTLP_ENDPOINT`, `WORKERS`.
+`OTEL_EXPORTER_OTLP_ENDPOINT`, `WORKERS`, `INDEX_DATABASE_URL` (owner connection for the index
+builder; defaults to `MIGRATION_DATABASE_URL`), `HUB_ALLOW_PRIVATE_HOSTS` (dev/test only),
+`HUB_MAX_ATTEMPTS`, `HUB_BACKOFF_BASE_MS`, `HUB_BREAKER_THRESHOLD`, `HUB_BREAKER_COOLDOWN_MS`,
+`HUB_INTERVAL_MS`.
 
 ## Tests
 
@@ -88,8 +91,19 @@ The integration suite includes the contracts that must hold from day one:
   upgrades, pins, backfill), command pipeline (idempotency, 409s, field rules, custom
   fields, cursor paging), HTTP flows (signup, invites, last-Owner guard, carrier inbound,
   lifecycle jobs, SSE), and OIDC sign-in against an in-process mock IdP.
+- Phase 2: Data studio (publish/rollback, impact and blocking rules, PII encryption and
+  decryption backfills, field access per role, concurrent index builds, plan limits),
+  custom records (formulas, rollups, rules, idempotency, versions, link index), the
+  Integration Hub against a local receiver (signatures, retries, dead letters and replay
+  with the same event id, circuit breaker under concurrent failures, filters, schema pins,
+  SSRF refusals, encrypted credentials, sandboxed connectors, Redis Streams, two-way sync
+  with conflicts and loop prevention), and the public API (scopes, OAuth client
+  credentials, delegated tokens, OpenAPI). Kafka, SFTP and SQS are tested with fake clients.
 
-CI (`.github/workflows/ci.yml`) runs all of it in one job against a Postgres 17 service.
+CI (`.github/workflows/ci.yml`) runs all of it in one job against a Postgres 17 service
+(plus a test-only Redis service for the Redis Streams adapter). The e2e suite has two
+journeys: J1 and the phase 2 journey (Data studio → custom records with a rule, a
+formula and a board → signed webhook → dead letter → replay → API key), with axe checks.
 
 ## Layout
 
@@ -166,6 +180,31 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
 (30 days, restorable) or purge. Upgrades move a tenant along its release channel
 (stable/canary); pins block them.
 
+## Phase 2 in one page
+
+- **Data studio** (`apps/server/src/platform/datastudio.ts`): one draft per tenant over a
+  versioned `Definition` (`packages/shared/src/datastudio.ts`). Publishing validates it
+  (expressions, links, layouts, plan limits), computes an impact summary (changes, records
+  affected, backfills, index jobs, blocking problems such as a required field without a
+  default), swaps the runtime projections (`field_definition`, `field_access_rule`) in the
+  same transaction, and queues backfills (`set_default`, `encrypt`, `decrypt`) and index
+  requests. Rollback re-publishes an earlier version as a new version.
+- **PII** values are stored as `enc:v1…` (AES-256-GCM via the Vault port, bound to tenant,
+  record type and field), decrypted only on read, and never put in events.
+- **Custom entities** live in one RLS table (`custom_record`) and are written through the
+  same contract as app commands. Formulas and rollups are computed on read; rules run on
+  every write. Link fields feed the link index.
+- **Link index** (`record_link`): manifests declare `links` (e.g. a shipment ships an
+  order); a platform consumer records them, and detail pages show linked records the
+  viewer may read.
+- **Integration Hub** (`apps/server/src/platform/hub.ts`, `adapters/delivery.ts`,
+  `adapters/ssrf.ts`, `adapters/sandbox.ts`): see the module comments for fan-out,
+  delivery, breaker, replay and two-way sync.
+- **Public API** (`/v1`, `apps/server/src/http/routes/v1.ts`): bearer only; API keys,
+  OAuth client-credentials tokens and delegated tokens resolve to a scoped principal and go
+  through the same authorize/RLS/idempotency/outbox/audit paths. `/v1/openapi.json` is
+  generated per tenant from active apps and the published data model.
+
 ## Decisions worth knowing
 
 - **DDL happens at deploy time, not at provision time.** The migrate script (owner role)
@@ -180,3 +219,17 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
   automatically, so "retry from the failed step" is possible.
 - The demo flag `POST /api/provisioning/fail-once {step}` (demo mode only) makes one step
   fail, to show retry and rollback.
+- **The index builder is the one runtime DDL path.** `CREATE INDEX CONCURRENTLY` cannot run
+  inside a transaction or a function and needs table ownership, so a single worker uses
+  the owner connection (`INDEX_DATABASE_URL`) and only ever issues CREATE/DROP INDEX built
+  from catalog names and validated keys. Everything else still connects as `aod_app`.
+- **The `Webhooks` port covers all outbound transports** (webhook, REST push, Kafka, Redis
+  Streams, SFTP, SQS); Svix or managed brokers can replace the adapter later.
+- **SSRF:** HTTP connections are pinned to the checked addresses (no DNS rebinding) and
+  redirects are not followed; SFTP connects to the checked IP; Kafka, Redis and SQS are
+  checked right before connecting.
+- **Two-way sync covers custom entities**, whose shape is generic; app entities sync one
+  way through events and commands.
+- **API keys and OAuth clients carry scopes, not roles:** field rules apply to users and
+  delegated tokens; machine credentials see every field their scopes allow.
+- Formulas and rollups are computed on read, so they need no backfill.

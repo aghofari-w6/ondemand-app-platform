@@ -8,7 +8,7 @@ kickoff prompts for the next milestones.
 
 | Path | What it is |
 | --- | --- |
-| `CLAUDE.md` | Project memory: commands, layout, the ten contracts that must not break, UI and git conventions. |
+| `CLAUDE.md` | Project memory: commands, layout, the contracts that must not break, UI and git conventions. |
 | `.claude/settings.json` | Pre-approved check commands, denied reads of `.env` and force-pushes, and the migration guard hook. |
 | `.claude/hooks/guard-migrations.mjs` | Blocks edits to migration files already on `main` (add a new migration instead). |
 | `.claude/skills/new-tenant-table/` | Checklist for any table holding tenant data: RLS, purge, isolation-test coverage. |

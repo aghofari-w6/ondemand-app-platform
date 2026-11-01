@@ -4,7 +4,10 @@ import { AuditScreen, PLANNED, PlannedScreen, SettingsScreen, UsersScreen } from
 import { LogisticsScreen, OrderDetailScreen, OrderingScreen, PaymentDetailScreen, PaymentsScreen, ShipmentDetailScreen } from './screens/apps';
 import { LoginScreen, SignupScreen, VerifyScreen } from './screens/auth';
 import { CatalogScreen, HomeScreen, ProvisioningScreen } from './screens/platform';
+import { DataStudioScreen } from './screens/datastudio';
+import { EndpointScreen, HubScreen } from './screens/hub';
 import { PosScreen, SaleDetailScreen } from './screens/pos';
+import { RecordDetailScreen, RecordsIndexScreen, RecordsScreen } from './screens/records';
 
 const root = createRootRoute({ component: () => <Outlet /> });
 
@@ -34,6 +37,12 @@ const routeTree = root.addChildren([
     r('/apps/logistics/$id', ShipmentDetailScreen),
     r('/apps/payments', PaymentsScreen),
     r('/apps/payments/$id', PaymentDetailScreen),
+    r('/data-studio', DataStudioScreen),
+    r('/data', RecordsIndexScreen),
+    r('/data/$entity', RecordsScreen),
+    r('/data/$entity/$id', RecordDetailScreen),
+    r('/integration-hub', HubScreen),
+    r('/integration-hub/endpoints/$id', EndpointScreen),
     ...Object.keys(PLANNED).map((path) => r(path, () => <PlannedScreen path={path} />)),
   ]),
 ]);
