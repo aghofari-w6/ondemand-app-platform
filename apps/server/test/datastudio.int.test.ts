@@ -175,6 +175,44 @@ describe('Data studio', () => {
     const sups = await p.database.withTenant(t.tenantId, (tx) => listRecords(p, tx, staff, 'supplier', { filters: {} }));
     expect(sups.items[0]!.values).not.toHaveProperty('discount');
     await expect(executeRecordWrite(p, { tenantId: t.tenantId, principal: staff, entity: 'supplier', op: 'create', values: { name: 'S', discount: 5 }, correlationId: cid() })).rejects.toMatchObject({ code: 'field_forbidden' });
+
+    // Computed values and search must not reveal a hidden field.
+    await publish((d) => {
+      d.entities.find((e) => e.key === 'supplier')!.fields.push(field('disc_copy', { formula: 'discount * 1' }));
+      d.field_access.push({ role: 'Staff', target: 'custom:supplier', field: 'name', access: 'hidden' });
+    });
+    const again = await p.database.withTenant(t.tenantId, async (tx) => principalFor(tx, p.catalog, t.tenantId, { id: staff.id, role: 'Staff' }));
+    const view = await p.database.withTenant(t.tenantId, (tx) => listRecords(p, tx, again, 'supplier', { filters: {} }));
+    expect(view.items[0]!.values).not.toHaveProperty('disc_copy');
+    expect(view.items[0]!.values).not.toHaveProperty('label'); // label = upper(name), name hidden
+    expect(view.hiddenFields).toEqual(expect.arrayContaining(['discount', 'disc_copy', 'name', 'label']));
+    const searched = await p.database.withTenant(t.tenantId, (tx) => listRecords(p, tx, again, 'supplier', { q: 'nusantara', filters: {} }));
+    expect(searched.items).toHaveLength(0);
+    const ownerSearch = await p.database.withTenant(t.tenantId, (tx) => listRecords(p, tx, t.owner, 'supplier', { q: 'nusantara', filters: {} }));
+    expect(ownerSearch.items).toHaveLength(1);
+    const del = (await p.database.withTenant(t.tenantId, (tx) => listRecords(p, tx, t.owner, 'delivery', { filters: {} }))).items.find((i) => i.values.supplier);
+    const lk = await p.database.withTenant(t.tenantId, (tx) => linksFor(p, tx, again, 'custom::Delivery', del!.id));
+    expect(lk.links[0]!.title).not.toBe('Kopi Nusantara');
+  });
+
+  it('never writes a removed PII field back in clear text or into events', async () => {
+    const s = await write('supplier', 'create', { values: { name: 'Secret Beans', email: 'secret@beans.example' } });
+    await publish((d) => {
+      const e = d.entities.find((x) => x.key === 'supplier')!;
+      e.fields = e.fields.filter((f) => f.key !== 'email');
+    });
+    await write('supplier', 'update', { id: s.body.id, version: 1, values: { tier: 'silver' } });
+    const db = admin();
+    try {
+      const raw = (await db.query(`SELECT data->>'email' AS e FROM custom_record WHERE id = $1`, [s.body.id])).rows[0].e;
+      expect(raw).toMatch(/^enc:/);
+      const evs = await db.query(`SELECT payload FROM outbox_event WHERE aggregateid = $1`, [s.body.id]);
+      expect(JSON.stringify(evs.rows)).not.toContain('secret@beans.example');
+    } finally {
+      await db.end();
+    }
+    const got = await p.database.withTenant(t.tenantId, (tx) => getRecord(p, tx, t.owner, 'supplier', s.body.id));
+    expect(got.item.values).not.toHaveProperty('email');
   });
 
   it('builds per-tenant indexes concurrently and drops them when unindexed', async () => {

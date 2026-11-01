@@ -1,11 +1,13 @@
 import { createHmac } from 'node:crypto';
+import net, { isIP } from 'node:net';
+import tls from 'node:tls';
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { Redis } from 'ioredis';
 import { Kafka, type SASLOptions } from 'kafkajs';
 import SftpClient from 'ssh2-sftp-client';
 import { Agent, fetch } from 'undici';
 import type { DeliveryResult, OutboundMessage, Webhooks } from '../ports/index.ts';
-import { BlockedAddressError, checkHost, safeLookup, type SsrfPolicy } from './ssrf.ts';
+import { BlockedAddressError, checkHost, isPrivateAddress, safeLookup, type SsrfPolicy } from './ssrf.ts';
 
 /**
  * Outbound delivery adapter (Webhooks port). External systems are reached only as API
@@ -37,9 +39,27 @@ export interface ClientFactories {
   sqs: (region: string, creds?: { accessKeyId: string; secretAccessKey: string }) => { send(cmd: any): Promise<unknown> };
 }
 
-export function defaultFactories(_policy: SsrfPolicy): ClientFactories {
+/**
+ * kafkajs connects to every broker the cluster advertises in its metadata, not only the
+ * bootstrap list; this socket factory applies the SSRF policy to each of those connections.
+ */
+export function policedKafkaSocketFactory(policy: SsrfPolicy) {
+  return ({ host, port, ssl, onConnect }: { host: string; port: number; ssl: any; onConnect: () => void }) => {
+    const h = host.replace(/^\[|\]$/g, '').toLowerCase();
+    if (isIP(h) && isPrivateAddress(h) && !policy.allow.has(h)) {
+      const sock = new net.Socket();
+      process.nextTick(() => sock.destroy(new BlockedAddressError(host)));
+      return sock;
+    }
+    const lookup = safeLookup(policy) as any;
+    return ssl ? tls.connect({ host, port, servername: host, lookup, ...(typeof ssl === 'object' ? ssl : {}) }, onConnect) : net.connect({ host, port, lookup }, onConnect);
+  };
+}
+
+export function defaultFactories(policy: SsrfPolicy): ClientFactories {
   return {
-    kafka: (cfg) => new Kafka({ clientId: 'apps-on-demand', brokers: cfg.brokers, ssl: cfg.ssl, ...(cfg.sasl ? { sasl: cfg.sasl } : {}), connectionTimeout: TIMEOUT_MS, retry: { retries: 0 } }),
+    kafka: (cfg) =>
+      new Kafka({ clientId: 'apps-on-demand', brokers: cfg.brokers, ssl: cfg.ssl, ...(cfg.sasl ? { sasl: cfg.sasl } : {}), connectionTimeout: TIMEOUT_MS, retry: { retries: 0 }, socketFactory: policedKafkaSocketFactory(policy) as any }),
     redis: (url, password) =>
       new Redis(url, { lazyConnect: false, connectTimeout: TIMEOUT_MS, maxRetriesPerRequest: 1, enableOfflineQueue: true, ...(password ? { password } : {}) }) as any,
     sftp: () => new SftpClient('aod-hub'),
@@ -89,13 +109,17 @@ export function createDelivery(policy: SsrfPolicy, opts: { production: boolean; 
         case 'kafka':
           for (const b of t.config.brokers as string[]) await checkHost(b.split(':')[0]!, policy);
           return;
-        case 'redis_stream':
-          return void (await checkHost(new URL(t.config.url).hostname, policy));
+        case 'redis_stream': {
+          const u = new URL(t.config.url);
+          if (u.username || u.password) throw new Error('put the Redis password in the credentials field, not in the URL');
+          return void (await checkHost(u.hostname, policy));
+        }
         case 'sftp':
           await checkHost(t.config.host, policy);
           if (t.credentials && !t.credentials.password && !t.credentials.private_key) throw new Error('SFTP needs a password or a private key');
           return;
         case 'sqs':
+          if (!t.credentials?.access_key_id || !t.credentials?.secret_access_key) throw new Error('SQS endpoints need their own credentials');
           return checkUrl(t.config.queue_url);
       }
     },
@@ -155,6 +179,8 @@ export function createDelivery(policy: SsrfPolicy, opts: { production: boolean; 
           }
           case 'sqs': {
             await checkUrl(t.config.queue_url);
+            // Never fall back to the platform's own AWS identity (env vars, instance metadata).
+            if (!t.credentials?.access_key_id || !t.credentials?.secret_access_key) throw new Error('SQS endpoints need their own credentials');
             const client = f.sqs(t.config.region, t.credentials ? { accessKeyId: t.credentials.access_key_id, secretAccessKey: t.credentials.secret_access_key } : undefined);
             const fifo = String(t.config.queue_url).endsWith('.fifo');
             await client.send(

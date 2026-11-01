@@ -4,6 +4,8 @@ import type { Tx } from '../db/database.ts';
 import type { Consumer } from '../ports/index.ts';
 import type { Platform } from './context.ts';
 import { publishedDefinition } from './datastudio.ts';
+import { decryptDefined } from './fields.ts';
+import { hiddenForPrincipal } from './records.ts';
 import { readPermission } from './workspace.ts';
 
 /**
@@ -54,16 +56,26 @@ async function resolve(p: Platform, tx: Tx, principal: Principal, type: string, 
     const { definition } = await publishedDefinition(tx);
     const e = definition.entities.find((x) => customResource(x.key) === type);
     if (!e) return null;
-    if (authorize(principal, action('platform:records.read'), { type, id, tenantId: principal.tenantId }).decision === 'deny') return null;
-    const r = await tx.selectFrom('custom_record').select(sql<string>`data ->> ${e.title_field}`.as('t')).where('id', '=', id).executeTakeFirst();
-    return { app: 'custom', entity: e.key, label: e.label, title: r ? (r.t ?? id.slice(0, 8)) : null, path: `/data/${e.key}/${id}` };
+    const d = authorize(principal, action('platform:records.read'), { type, id, tenantId: principal.tenantId });
+    if (d.decision === 'deny') return null;
+    // The title obeys field rules and formulas like any other value.
+    const hidden = hiddenForPrincipal(principal, definition, e, d);
+    const r = await tx.selectFrom('custom_record').select('data').where('id', '=', id).executeTakeFirst();
+    let title: string | null = null;
+    if (r && !hidden.has(e.title_field) && !e.fields.find((f) => f.key === e.title_field)?.formula) {
+      const v = decryptDefined(p.ports.vault, principal.tenantId, `custom:${e.key}`, e.fields, r.data as Record<string, unknown>)[e.title_field];
+      title = v === null || v === undefined ? null : String(v);
+    }
+    return { app: 'custom', entity: e.key, label: e.label, title: r ? (title ?? id.slice(0, 8)) : null, path: `/data/${e.key}/${id}` };
   }
   for (const m of p.catalog.manifests()) {
     const e = m.entities.find((x) => x.resource === type);
     if (!e) continue;
-    if (authorize(principal, action(readPermission(m.id, e)), { type, id, tenantId: principal.tenantId }).decision === 'deny') return null;
+    const d = authorize(principal, action(readPermission(m.id, e)), { type, id, tenantId: principal.tenantId });
+    if (d.decision === 'deny') return null;
     if (!/^[0-9a-f-]{36}$/i.test(id)) return null;
-    const r = e.title_field ? await tx.selectFrom(e.table).select(sql<string>`${sql.ref(e.title_field)}::text`.as('t')).where('id', '=', id).executeTakeFirst() : null;
+    const titleField = e.title_field && d.fields[e.title_field] !== 'hidden' && !e.fields.find((f) => f.key === e.title_field)?.pii ? e.title_field : null;
+    const r = titleField ? await tx.selectFrom(e.table).select(sql<string>`${sql.ref(titleField)}::text`.as('t')).where('id', '=', id).executeTakeFirst() : null;
     const routes: Record<string, string> = { 'ordering:order': `/apps/ordering/${id}`, 'pos:sale': `/apps/pos/sales/${id}`, 'logistics:shipment': `/apps/logistics/${id}`, 'payments:payment': `/apps/payments/${id}` };
     return { app: m.id, entity: e.name, label: e.label, title: r?.t ?? null, path: routes[`${m.id}:${e.name}`] ?? null };
   }

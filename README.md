@@ -226,8 +226,10 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
 - **The `Webhooks` port covers all outbound transports** (webhook, REST push, Kafka, Redis
   Streams, SFTP, SQS); Svix or managed brokers can replace the adapter later.
 - **SSRF:** HTTP connections are pinned to the checked addresses (no DNS rebinding) and
-  redirects are not followed; SFTP connects to the checked IP; Kafka, Redis and SQS are
-  checked right before connecting.
+  redirects are not followed; SFTP connects to the checked IP; every Kafka broker socket
+  (including brokers the cluster advertises) goes through the policy; Redis and SQS hosts
+  are checked right before connecting. SQS endpoints must bring their own credentials, so
+  the platform's AWS identity is never used for a tenant's queue.
 - **Two-way sync covers custom entities**, whose shape is generic; app entities sync one
   way through events and commands.
 - **API keys and OAuth clients carry scopes, not roles:** field rules apply to users and

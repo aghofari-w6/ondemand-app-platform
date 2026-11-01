@@ -1,6 +1,6 @@
 import { backoffMs } from '@aod/shared';
 import { describe, expect, it } from 'vitest';
-import { createDelivery, signWebhook, verifyWebhook, type ClientFactories } from './delivery.ts';
+import { createDelivery, policedKafkaSocketFactory, signWebhook, verifyWebhook, type ClientFactories } from './delivery.ts';
 import { checkHost, isPrivateAddress, policyFrom, safeLookup } from './ssrf.ts';
 
 const strict = policyFrom('', false);
@@ -71,6 +71,16 @@ describe('transports (fake clients)', () => {
     const r = await d.deliver({ kind: 'sqs', config: { queue_url: 'https://93.184.216.34/123/orders.fifo', region: 'us-east-1' }, credentials: { access_key_id: 'a', secret_access_key: 's' } }, msg);
     expect(r.ok).toBe(true);
     expect(calls.sqs![0]).toMatchObject({ MessageBody: '{"a":1}', MessageDeduplicationId: 'evt_1', MessageGroupId: 'order.created' });
+  });
+
+  it('polices every Kafka broker connection, including advertised brokers', async () => {
+    const sock = policedKafkaSocketFactory(strict)({ host: '169.254.169.254', port: 80, ssl: false, onConnect: () => {} });
+    await expect(new Promise((_res, rej) => sock.on('error', rej))).rejects.toThrow(/private or reserved/);
+  });
+
+  it('never uses ambient AWS credentials for SQS', async () => {
+    const r = await d.deliver({ kind: 'sqs', config: { queue_url: 'https://93.184.216.34/123/q', region: 'us-east-1' }, credentials: null }, msg);
+    expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/own credentials/) });
   });
 
   it('refuses http URLs and private targets at check time', async () => {

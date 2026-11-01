@@ -87,7 +87,12 @@ describe('public /v1 API', () => {
     const t = (await app.inject({ method: 'POST', url: '/api/tokens', headers: json(cookie), payload: { name: 'zapier', scopes: ['apps:read'], expires_in_minutes: 30 } })).json();
     expect(t.token).toMatch(/^aod_dt\./);
     expect((await app.inject({ url: '/v1/apps/ordering/order', headers: bearer(t.token) })).statusCode).toBe(200);
-    const write = await app.inject({ method: 'POST', url: '/v1/apps/ordering/commands/order.create', headers: bearer(t.token), payload: { channel: 'web', lines: [{ sku: 'A', name: 'A', qty: 1, unit_price: 1 }] } });
+    const revoked = await app.inject({ method: 'POST', url: `/api/tokens/${t.id}/revoke`, headers: json(cookie), payload: {} });
+    expect(revoked.statusCode).toBe(200);
+    expect((await app.inject({ url: '/v1/apps/ordering/order', headers: bearer(t.token) })).statusCode).toBe(401);
+    expect((await app.inject({ url: '/api/audit?action=token.revoked', headers: { cookie } })).json().items).toHaveLength(1);
+    const t2 = (await app.inject({ method: 'POST', url: '/api/tokens', headers: json(cookie), payload: { name: 'zapier2', scopes: ['apps:read'], expires_in_minutes: 30 } })).json();
+    const write = await app.inject({ method: 'POST', url: '/v1/apps/ordering/commands/order.create', headers: bearer(t2.token), payload: { channel: 'web', lines: [{ sku: 'A', name: 'A', qty: 1, unit_price: 1 }] } });
     expect(write.statusCode).toBe(403);
     // A Viewer's delegated token cannot write even with a write scope.
     const inv = await app.inject({ method: 'POST', url: '/api/users/invite', headers: json(cookie), payload: { email: 'viewer@x.example', name: 'V', role: 'Viewer' } });

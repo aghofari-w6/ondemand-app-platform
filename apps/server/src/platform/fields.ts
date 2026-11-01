@@ -107,6 +107,24 @@ export function encryptPii(vault: Vault, tenantId: string, target: string, defs:
   return out;
 }
 
+/**
+ * Decrypts the values of currently defined fields only. Values of fields that were
+ * removed from the data model stay exactly as stored (still encrypted if they were PII),
+ * so an edit never writes them back in clear text.
+ */
+export function decryptDefined(vault: Vault, tenantId: string, target: string, defs: { key: string }[], values: Record<string, unknown> | null | undefined): Record<string, unknown> {
+  const keys = new Set(defs.map((d) => d.key));
+  const out: Record<string, unknown> = { ...(values ?? {}) };
+  for (const [k, v] of Object.entries(out)) if (keys.has(k) && isEncrypted(v)) out[k] = decryptValue(vault, tenantId, target, k, v);
+  return out;
+}
+
+/** Only the values of currently defined fields (removed fields are kept in storage but hidden). */
+export const definedOnly = (defs: { key: string }[], values: Record<string, unknown>) => {
+  const keys = new Set(defs.map((d) => d.key));
+  return Object.fromEntries(Object.entries(values).filter(([k]) => keys.has(k)));
+};
+
 /** Decrypts every encrypted value (a field that stopped being PII may still hold ciphertext until its backfill runs). */
 export function decryptAll(vault: Vault, tenantId: string, target: string, values: Record<string, unknown> | null | undefined): Record<string, unknown> {
   const out: Record<string, unknown> = { ...(values ?? {}) };

@@ -36,7 +36,7 @@ export const EndpointInput = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('redis_stream'),
     ...common,
-    config: z.object({ url: z.string().regex(/^rediss?:\/\/[^/\s]+(\/\d+)?$/), stream: z.string().min(1).max(200), maxlen: z.int().positive().max(1_000_000).optional() }),
+    config: z.object({ url: z.string().regex(/^rediss?:\/\/[^/\s@]+(\/\d+)?$/, 'redis://host:port[/db] (credentials go in the credentials field)'), stream: z.string().min(1).max(200), maxlen: z.int().positive().max(1_000_000).optional() }),
     credentials: z.object({ password: z.string().min(1) }).optional(),
   }),
   z.object({
@@ -49,7 +49,8 @@ export const EndpointInput = z.discriminatedUnion('kind', [
     kind: z.literal('sqs'),
     ...common,
     config: z.object({ queue_url: z.url(), region: z.string().regex(/^[a-z]{2}-[a-z]+-\d$/) }),
-    credentials: z.object({ access_key_id: z.string().min(1), secret_access_key: z.string().min(1) }).optional(),
+    // required: the platform's own AWS identity must never be used for a tenant's queue
+    credentials: z.object({ access_key_id: z.string().min(1), secret_access_key: z.string().min(1) }),
   }),
   z.object({
     kind: z.literal('custom'),

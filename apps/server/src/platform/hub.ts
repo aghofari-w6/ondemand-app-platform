@@ -158,6 +158,9 @@ export function hubFanoutConsumer(_p: Platform): Consumer {
       const syncs = await tx.selectFrom('hub_sync').select(['id', 'endpoint_id']).execute();
       for (const e of endpoints) {
         if (!(e.event_types as string[]).some((pt) => matchesType(pt, event.type))) continue;
+        // An endpoint never receives the Hub's own events about itself (a dead endpoint
+        // subscribed to `*` would otherwise feed itself dead-letter events forever).
+        if (event.type.startsWith('hub.') && event.data.endpoint_id === e.id) continue;
         // Loop prevention: never send a change back to the system it came from.
         if (syncs.some((s) => s.endpoint_id === e.id && event.correlation_id.startsWith(`sync:${s.id}:`))) continue;
         let status: 'pending' | 'skipped' = 'pending';

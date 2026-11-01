@@ -2,7 +2,8 @@ import { action, authorize, CommandError, maskFields, type Decision, type Entity
 import { sql, type SelectQueryBuilder } from 'kysely';
 import type { Tx } from '../db/database.ts';
 import type { Platform } from './context.ts';
-import { decryptAll } from './fields.ts';
+import { decryptDefined, definedOnly, fieldDefinitions } from './fields.ts';
+import { searchPredicate } from './records.ts';
 
 /**
  * Generic list/detail over any manifest entity: facets, full-text search through the
@@ -61,6 +62,9 @@ export async function listEntity(p: Platform, tx: Tx, principal: Principal, app:
   if (q.view && !view) throw new CommandError(404, 'unknown_view', `unknown view ${q.view}`);
 
   const facetFields = entity.fields.filter((f) => f.facet);
+  // With hidden fields, full-text search (which covers every field) would leak them: match visible fields only.
+  const hiddenSet = new Set(Object.entries(decision.fields).filter(([, a]) => a === 'hidden').map(([f]) => f));
+  const visibleSearchable = entity.fields.filter((f) => f.searchable && !f.pii && !hiddenSet.has(f.key)).map((f) => f.key);
   const filters: Record<string, string[]> = { ...(view?.filter ?? {}) };
   for (const [k, vals] of Object.entries(q.filters)) {
     if (!facetFields.some((f) => f.key === k)) throw new CommandError(400, 'invalid_filter', `${k} is not a facet`);
@@ -84,10 +88,11 @@ export async function listEntity(p: Platform, tx: Tx, principal: Principal, app:
       if (field.type === 'boolean') out = out.where(sql.ref(k), 'in', vals.map((v) => v === 'true')) as Q;
       else out = out.where(sql.ref(k), 'in', vals) as Q;
     }
-    if (q.q?.trim()) out = out.where(p.ports.search.match('search', q.q)) as Q;
+    if (q.q?.trim()) out = out.where(searchPredicate(p, q.q, hiddenSet, visibleSearchable, (k) => sql`${sql.ref(k)}::text`)) as Q;
     return out;
   };
 
+  const showCustom = await customPresenter(p, tx, principal.tenantId, app, entity);
   let qb = applyFilters(tx.selectFrom(entity.table).selectAll());
   if (q.cursor) {
     const c = decodeCursor(q.cursor);
@@ -122,12 +127,18 @@ export async function listEntity(p: Platform, tx: Tx, principal: Principal, app:
   }
 
   return {
-    items: page.map((r) => maskFields(clean(r, (c) => decryptAll(p.ports.vault, principal.tenantId, `${app}:${entity.name}`, c)), decision)),
+    items: page.map((r) => maskFields(clean(r, showCustom), decision)),
     nextCursor,
     facets,
     applied: { filters, sort: sortSpec, q: q.q ?? '' },
     hiddenFields: Object.entries(decision.fields).filter(([, a]) => a === 'hidden').map(([f]) => f),
   };
+}
+
+/** Custom values as users see them: defined fields only, PII decrypted. */
+async function customPresenter(p: Platform, tx: Tx, tenantId: string, app: string, entity: Entity) {
+  const defs = entity.custom_fields ? await fieldDefinitions(tx, app, entity.name) : [];
+  return (c: Record<string, unknown>) => definedOnly(defs, decryptDefined(p.ports.vault, tenantId, `${app}:${entity.name}`, defs, c));
 }
 
 function clean(row: Record<string, unknown>, decrypt?: (custom: Record<string, unknown>) => Record<string, unknown>) {
@@ -149,7 +160,7 @@ export async function getEntity(p: Platform, tx: Tx, principal: Principal, app: 
     SELECT id, type, payload, created_at, true AS pending FROM outbox_event WHERE aggregateid = ${id} AND relayed_at IS NULL
     ORDER BY created_at, id`.execute(tx);
   return {
-    item: maskFields(clean(row, (c) => decryptAll(p.ports.vault, principal.tenantId, `${app}:${entity.name}`, c)), decision),
+    item: maskFields(clean(row, await customPresenter(p, tx, principal.tenantId, app, entity)), decision),
     events: events.rows.map((e) => ({
       id: e.id,
       type: e.type,

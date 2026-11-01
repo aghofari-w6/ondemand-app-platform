@@ -99,17 +99,20 @@ describe('Integration Hub', () => {
 
   it('dead-letters after the last attempt and replays with the original event id', async () => {
     plan.set('/down', [500]);
-    const ep = await endpoint({ kind: 'webhook', name: 'down', event_types: ['order.created'], config: { url: `${base}/down` } });
+    const ep = await endpoint({ kind: 'webhook', name: 'down', event_types: ['order.created', 'hub.*'], config: { url: `${base}/down` } });
     await order();
     await until(async () => (await deliveries(ep.id))[0]?.status === 'dead');
     const [dead] = await deliveries(ep.id);
     expect(dead!.attempts).toBe(3);
-    const firstId = received('/down')[0]!.headers['webhook-id'];
+    // The dead-letter event about this endpoint is never queued to the endpoint itself.
+    expect((await deliveries(ep.id)).map((d) => d.event_type)).toEqual(['order.created']);
+    const orders = () => received('/down').filter((r) => JSON.parse(r.body).type === 'order.created');
+    const firstId = orders()[0]!.headers['webhook-id'];
     plan.set('/down', [200]);
     const n = await p.database.withTenant(t.tenantId, (tx) => replayDeliveries(p, tx, t.tenantId, t.owner, { ids: [dead!.id] }, cid()));
     expect(n).toBe(1);
     await until(async () => (await deliveries(ep.id))[0]?.status === 'succeeded');
-    expect(received('/down').at(-1)!.headers['webhook-id']).toBe(firstId);
+    expect(orders().at(-1)!.headers['webhook-id']).toBe(firstId);
     expect((await deliveries(ep.id))[0]!.replays).toBe(1);
   });
 
@@ -168,6 +171,8 @@ describe('Integration Hub', () => {
     }
     await expect(endpoint({ kind: 'redis_stream', name: 'ssrf-redis', event_types: ['order.created'], config: { url: 'redis://10.1.2.3:6379', stream: 's' } })).rejects.toMatchObject({ code: 'endpoint_rejected' });
     await expect(endpoint({ kind: 'webhook', name: 'creds-in-url', event_types: ['order.created'], config: { url: 'https://user:pw@93.184.216.34/x' } })).rejects.toMatchObject({ code: 'endpoint_rejected' });
+    await expect(endpoint({ kind: 'redis_stream', name: 'redis-pw', event_types: ['order.created'], config: { url: 'redis://:hunter2@93.184.216.34:6379', stream: 's' } })).rejects.toThrow(/credentials field/);
+    await expect(endpoint({ kind: 'sqs', name: 'sqs-ambient', event_types: ['order.created'], config: { queue_url: 'https://93.184.216.34/1/q', region: 'us-east-1' } })).rejects.toThrow();
   });
 
   it('pushes REST with write-only encrypted credentials', async () => {

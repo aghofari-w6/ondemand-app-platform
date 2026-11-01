@@ -65,7 +65,11 @@ export function apiKeyRoutes(p: Platform) {
     app.post('/api/tokens/:id/revoke', async (req) => {
       const a = requireAuth(req);
       const id = parse(UUID, (req.params as { id: string }).id);
-      await p.database.withTenant(a.tenantId, (tx) => tx.updateTable('access_token').set({ revoked_at: sql`now()` }).where('id', '=', id).where('user_id', '=', a.user.id).execute());
+      await p.database.withTenant(a.tenantId, async (tx) => {
+        const r = await tx.updateTable('access_token').set({ revoked_at: sql`now()` }).where('id', '=', id).where('user_id', '=', a.user.id).where('revoked_at', 'is', null).executeTakeFirst();
+        if (!Number(r.numUpdatedRows)) throw new CommandError(404, 'not_found', 'token not found');
+        await recordChange(p, tx, { tenantId: a.tenantId, actor: a.principal, action: 'platform:token.revoked', resourceType: 'platform::AccessToken', resourceId: id, correlationId: correlationId(req) });
+      });
       return { ok: true };
     });
   };

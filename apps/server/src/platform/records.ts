@@ -5,7 +5,7 @@ import { newId, type Tx } from '../db/database.ts';
 import { assertWritableTenant } from './commands.ts';
 import type { Platform } from './context.ts';
 import { publishedDefinition } from './datastudio.ts';
-import { decryptAll, encryptPii, validateCustomValues, type FieldDefinition } from './fields.ts';
+import { decryptDefined, encryptPii, validateCustomValues, type FieldDefinition } from './fields.ts';
 import { assertIdempotencyKey, claimIdempotencyKey, storeIdempotentResponse } from './idempotency.ts';
 import { writeAudit } from './audit.ts';
 import { writeOutbox } from './outbox.ts';
@@ -84,13 +84,43 @@ export function evaluateRules(entity: CustomEntity, values: Record<string, unkno
   return failed;
 }
 
-function present(p: Platform, tenantId: string, entity: CustomEntity, row: any, rollups: Record<string, unknown>, decision: Decision) {
-  const data = decryptAll(p.ports.vault, tenantId, recordTarget(entity.key), row.data);
+/**
+ * Fields a principal must not see on this entity: hidden by field rules, plus every
+ * computed value (rollup or formula) that depends on something hidden — otherwise a
+ * formula like `pay = salary` would reveal a hidden field.
+ */
+export function hiddenForPrincipal(principal: Principal, def: Definition, entity: CustomEntity, decision: Decision): Set<string> {
+  const hidden = new Set(Object.entries(decision.fields).filter(([, a]) => a === 'hidden').map(([f]) => f));
+  for (const r of entity.rollups) {
+    const child = authorize(principal, action('platform:records.read'), { type: customResource(r.from), id: '*', tenantId: principal.tenantId });
+    const childEntity = def.entities.find((e) => e.key === r.from);
+    if (child.decision === 'deny' || !childEntity || (r.field && child.fields[r.field] === 'hidden') || child.fields[r.via] === 'hidden') hidden.add(r.key);
+  }
+  for (const f of entity.fields.filter((x) => x.formula)) {
+    try {
+      if (expr.references(expr.parse(f.formula!)).some((ref) => hidden.has(ref.split('.')[0]!))) hidden.add(f.key);
+    } catch {
+      hidden.add(f.key);
+    }
+  }
+  return hidden;
+}
+
+function present(p: Platform, tenantId: string, entity: CustomEntity, row: any, rollups: Record<string, unknown>, hidden: Set<string>) {
+  const data = decryptDefined(p.ports.vault, tenantId, recordTarget(entity.key), entity.fields, row.data);
   const { values, errors } = computeFormulas(entity, { ...data, ...rollups, id: row.id, created_at: new Date(row.created_at).toISOString() });
   const known = new Set([...entity.fields.map((f) => f.key), ...entity.rollups.map((r) => r.key)]);
   const shown: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(values)) if (known.has(k) && decision.fields[k] !== 'hidden') shown[k] = v;
-  return { id: row.id, version: row.version, created_at: row.created_at, updated_at: row.updated_at, values: shown, title: shown[entity.title_field] ?? null, formula_errors: errors };
+  for (const [k, v] of Object.entries(values)) if (known.has(k) && !hidden.has(k)) shown[k] = v;
+  return { id: row.id, version: row.version, created_at: row.created_at, updated_at: row.updated_at, values: shown, title: shown[entity.title_field] ?? null, formula_errors: Object.fromEntries(Object.entries(errors).filter(([k]) => !hidden.has(k))) };
+}
+
+/** Full-text search, or (when the role has hidden fields) a plain match over visible text fields only. */
+export function searchPredicate(p: Platform, q: string, hidden: Set<string>, visibleText: string[], column: (k: string) => ReturnType<typeof sql>) {
+  if (!hidden.size) return p.ports.search.match('search', q);
+  if (!visibleText.length) return sql<boolean>`false`;
+  const like = `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+  return sql<boolean>`(${sql.join(visibleText.map((k) => sql`${column(k)} ILIKE ${like}`), sql` OR `)})`;
 }
 
 // ------------------------------------------------------------------ read
@@ -107,6 +137,8 @@ export async function listRecords(p: Platform, tx: Tx, principal: Principal, key
   const { definition, entity } = await loadEntity(tx, key);
   const decision = authorizeRecords(principal, key, 'read');
   const fields = new Map(entity.fields.map((f) => [f.key, f]));
+  const hidden = hiddenForPrincipal(principal, definition, entity, decision);
+  const textFields = entity.fields.filter((f) => (f.type === 'text' || f.type === 'select') && !f.pii && !f.formula && !hidden.has(f.key)).map((f) => f.key);
   const facetable = entity.fields.filter((f) => (f.type === 'select' || f.type === 'boolean') && !f.pii && decision.fields[f.key] !== 'hidden');
   for (const k of Object.keys(q.filters)) if (!facetable.some((f) => f.key === k)) throw new CommandError(400, 'invalid_filter', `${k} is not filterable`);
 
@@ -121,7 +153,7 @@ export async function listRecords(p: Platform, tx: Tx, principal: Principal, key
   const where = (except?: string) => {
     const parts = [sql`entity = ${key}`];
     for (const [k, vals] of Object.entries(q.filters)) if (k !== except && vals.length) parts.push(sql`(data ->> ${k}) = ANY(${vals}::text[])`);
-    if (q.q?.trim()) parts.push(p.ports.search.match('search', q.q));
+    if (q.q?.trim()) parts.push(searchPredicate(p, q.q, hidden, textFields, (k) => sql`(data ->> ${k})`));
     return sql.join(parts, sql` AND `);
   };
   let cursorCond = sql`true`;
@@ -150,10 +182,10 @@ export async function listRecords(p: Platform, tx: Tx, principal: Principal, key
   }
   return {
     entity,
-    items: page.map((r) => present(p, principal.tenantId, entity, r, rollups.get(r.id) ?? {}, decision)),
+    items: page.map((r) => present(p, principal.tenantId, entity, r, rollups.get(r.id) ?? {}, hidden)),
     nextCursor,
     facets,
-    hiddenFields: Object.entries(decision.fields).filter(([, a]) => a === 'hidden').map(([f]) => f),
+    hiddenFields: [...hidden],
     layouts: definition.layouts.filter((l) => l.target === recordTarget(key)),
   };
 }
@@ -171,7 +203,7 @@ export async function getRecord(p: Platform, tx: Tx, principal: Principal, key: 
     ORDER BY 1`.execute(tx);
   return {
     entity,
-    item: present(p, principal.tenantId, entity, row, rollups.get(id) ?? {}, decision),
+    item: present(p, principal.tenantId, entity, row, rollups.get(id) ?? {}, hiddenForPrincipal(principal, definition, entity, decision)),
     events: events.rows
       .map((e) => ({ id: e.id, type: e.type, occurred_at: e.payload.occurred_at, origin: e.payload.origin, pending: e.pending }))
       .sort((a, b) => String(a.occurred_at).localeCompare(String(b.occurred_at))),
@@ -227,8 +259,9 @@ async function syncLinks(p: Platform, tx: Tx, tenantId: string, entity: CustomEn
 }
 
 /** Event data never carries PII values. */
+/** Event data: only currently defined, non-PII, non-computed fields. */
 const publicData = (entity: CustomEntity, values: Record<string, unknown>) =>
-  Object.fromEntries(Object.entries(values).filter(([k]) => !entity.fields.find((f) => f.key === k)?.pii));
+  Object.fromEntries(Object.entries(values).filter(([k]) => entity.fields.some((f) => f.key === k && !f.pii && !f.formula)));
 
 export async function executeRecordWrite(p: Platform, req: RecordWrite, existingTx?: Tx): Promise<{ status: number; body: any; replayed: boolean }> {
   assertIdempotencyKey(req.idempotencyKey);
@@ -270,7 +303,7 @@ export async function executeRecordWrite(p: Platform, req: RecordWrite, existing
         await tx.deleteFrom('custom_record').where('id', '=', id).execute();
         eventType = 'record.deleted';
       } else {
-        const existing = decryptAll(p.ports.vault, req.tenantId, target, cur.data);
+        const existing = decryptDefined(p.ports.vault, req.tenantId, target, defs, cur.data);
         const values = validateCustomValues(defs, req.values ?? {}, existing);
         await assertLinkTargets(p, tx, entity, values);
         const failed = evaluateRules(entity, computeFormulas(entity, { ...values, ...((await rollupsFor(tx, definition, entity, [id])).get(id) ?? {}), id }).values);
@@ -288,7 +321,7 @@ export async function executeRecordWrite(p: Platform, req: RecordWrite, existing
         eventType = 'record.updated';
       }
     }
-    const plain = stored ? decryptAll(p.ports.vault, req.tenantId, target, stored) : null;
+    const plain = stored ? decryptDefined(p.ports.vault, req.tenantId, target, defs, stored) : null;
     const [env] = await writeOutbox(
       tx,
       [{ type: eventType, aggregateType: target, aggregateId: id, data: { entity: req.entity, record_id: id, version: req.op === 'delete' ? null : version, values: plain ? publicData(entity, plain) : null, changed: Object.keys(req.values ?? {}) } }],
