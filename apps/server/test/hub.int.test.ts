@@ -1,9 +1,10 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { Definition, EndpointInput, type FieldDef } from '@aod/shared';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { Redis } from 'ioredis';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { verifyWebhook } from '../src/adapters/delivery.ts';
+import { createVault } from '../src/adapters/index.ts';
 import { newId } from '../src/db/database.ts';
 import { openDraft, publishDraft, saveDraft } from '../src/platform/datastudio.ts';
 import { applyInbound, endpointView, replayDeliveries, saveEndpoint } from '../src/platform/hub.ts';
@@ -81,9 +82,10 @@ describe('Integration Hub', () => {
     const env = JSON.parse(hit!.body);
     expect(env).toMatchObject({ type: 'order.created', data: { order_id: o.body.id } });
     expect(hit!.headers['webhook-id']).toBe(env.id);
-    const view = await p.database.withTenant(t.tenantId, async (tx) => endpointView(await tx.selectFrom('hub_endpoint').selectAll().where('id', '=', ep.id).executeTakeFirstOrThrow()));
+    const view = await p.database.withTenant(t.tenantId, async (tx) => endpointView(p.ports.vault, await tx.selectFrom('hub_endpoint').selectAll().where('id', '=', ep.id).executeTakeFirstOrThrow()));
     expect(JSON.stringify(view)).not.toContain('whsec_');
     expect(view.has_signing_secret).toBe(true);
+    expect(view.signing_secret_unreadable).toBe(false);
   });
 
   it('retries with backoff and jitter, logs every attempt, then succeeds', async () => {
@@ -95,6 +97,33 @@ describe('Integration Hub', () => {
     const log = await attempts(d!.id);
     expect(log.map((a) => [a.ok, a.status_code])).toEqual([[false, 500], [false, 503], [true, 200]]);
     expect(new Set(received('/flaky').map((r) => r.headers['webhook-id'])).size).toBe(1); // same event id on every retry
+  });
+
+  it('fails, logs and dead-letters deliveries whose endpoint secret cannot be decrypted (vault key changed)', async () => {
+    const ep = await endpoint({ kind: 'webhook', name: 'rekeyed', event_types: ['order.created'], config: { url: `${base}/rekeyed` } });
+    // Same AAD, different key: what a VAULT_KEY change (or an ephemeral key) leaves behind.
+    const foreign = createVault(randomBytes(32).toString('base64'), () => {}).encrypt('whsec_other', `hub:whsec:${t.tenantId}:${ep.id}`);
+    const db = admin();
+    try {
+      await db.query(`UPDATE hub_endpoint SET signing_secret_enc = $1 WHERE id = $2`, [foreign, ep.id]);
+    } finally {
+      await db.end();
+    }
+    await order();
+    await until(async () => (await deliveries(ep.id))[0]?.status === 'dead');
+    const [d] = await deliveries(ep.id);
+    expect(d!.attempts).toBe(3);
+    expect(d!.last_error).toMatch(/signing secret cannot be decrypted \(was the vault key changed\?\)/);
+    const log = await attempts(d!.id);
+    expect(log.map((a) => a.ok)).toEqual([false, false, false]);
+    for (const a of log) {
+      expect(a.error).toMatch(/cannot be decrypted/);
+      expect(a.error).not.toContain(foreign.split('.')[3]!);
+    }
+    expect(received('/rekeyed')).toHaveLength(0); // nothing unsigned goes out
+    const view = await p.database.withTenant(t.tenantId, async (tx) => endpointView(p.ports.vault, await tx.selectFrom('hub_endpoint').selectAll().where('id', '=', ep.id).executeTakeFirstOrThrow()));
+    expect(view).toMatchObject({ signing_secret_unreadable: true, credentials_unreadable: false, circuit_state: 'open', consecutive_failures: 3 });
+    await pump(); // fan out our hub.delivery_dead event now, before later `hub.*` endpoints exist
   });
 
   it('dead-letters after the last attempt and replays with the original event id', async () => {

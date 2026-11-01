@@ -26,7 +26,7 @@ export function hubRoutes(p: Platform) {
       return p.database.withTenant(a.tenantId, async (tx) => {
         const rows = await tx.selectFrom('hub_endpoint').selectAll().orderBy('created_at').execute();
         const stats = await tx.selectFrom('hub_delivery').select(['endpoint_id', 'status', sql<number>`count(*)::int`.as('n')]).groupBy(['endpoint_id', 'status']).execute();
-        return { endpoints: rows.map((r) => ({ ...endpointView(r), stats: Object.fromEntries(stats.filter((s) => s.endpoint_id === r.id).map((s) => [s.status, s.n])) })) };
+        return { endpoints: rows.map((r) => ({ ...endpointView(p.ports.vault, r), stats: Object.fromEntries(stats.filter((s) => s.endpoint_id === r.id).map((s) => [s.status, s.n])) })) };
       });
     });
 

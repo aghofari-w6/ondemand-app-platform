@@ -3,7 +3,7 @@ import { backoffMs, CommandError, ConnectorSpec, expr, type EndpointInput, type 
 import { sql } from 'kysely';
 import { z } from 'zod';
 import { newId, type Tx } from '../db/database.ts';
-import type { Consumer, DeliveryTarget, OutboundMessage } from '../ports/index.ts';
+import type { Consumer, DeliveryTarget, OutboundMessage, Vault } from '../ports/index.ts';
 import type { Platform } from './context.ts';
 import { executeRecordWrite, loadEntity } from './records.ts';
 import { recordChange } from './record.ts';
@@ -24,6 +24,35 @@ import { recordChange } from './record.ts';
 
 const aadCreds = (tenantId: string, endpointId: string) => `hub:creds:${tenantId}:${endpointId}`;
 const aadSecret = (tenantId: string, endpointId: string) => `hub:whsec:${tenantId}:${endpointId}`;
+
+type EndpointSecrets = { ok: true; credentials: Record<string, any> | null; signingSecret: string | null } | { ok: false; unreadable: 'credentials' | 'signing_secret' };
+
+/**
+ * Decrypts an endpoint's stored credentials and signing secret. A value that cannot be
+ * decrypted (the vault key changed, or the ciphertext was altered) is reported by field
+ * instead of thrown, so callers can fail the delivery visibly. Never exposes the cause:
+ * it could carry ciphertext.
+ */
+function openSecrets(vault: Vault, tenantId: string, e: { id: string; credentials_enc?: string | null; signing_secret_enc?: string | null }): EndpointSecrets {
+  let credentials: Record<string, any> | null = null;
+  let signingSecret: string | null = null;
+  try {
+    if (e.credentials_enc) credentials = JSON.parse(vault.decrypt(e.credentials_enc, aadCreds(tenantId, e.id)));
+  } catch {
+    return { ok: false, unreadable: 'credentials' };
+  }
+  try {
+    if (e.signing_secret_enc) signingSecret = vault.decrypt(e.signing_secret_enc, aadSecret(tenantId, e.id));
+  } catch {
+    return { ok: false, unreadable: 'signing_secret' };
+  }
+  return { ok: true, credentials, signingSecret };
+}
+
+const UNREADABLE_ERROR = {
+  credentials: 'endpoint credentials cannot be decrypted (was the vault key changed?); re-enter the credentials',
+  signing_secret: 'endpoint signing secret cannot be decrypted (was the vault key changed?); rotate the signing secret',
+} as const;
 
 // ------------------------------------------------------------------ endpoints
 
@@ -125,8 +154,13 @@ export async function rotateSecret(p: Platform, tx: Tx, tenantId: string, actor:
   return secret;
 }
 
-/** Public view: never includes credentials or secrets. */
-export function endpointView(r: any) {
+/**
+ * Public view: never includes credentials or secrets. `*_unreadable` flags a stored value
+ * the vault can no longer decrypt, so the admin can re-enter it.
+ */
+export function endpointView(vault: Vault, r: any) {
+  const credentialsUnreadable = Boolean(r.credentials_enc) && !openSecrets(vault, r.tenant_id, { id: r.id, credentials_enc: r.credentials_enc }).ok;
+  const secretUnreadable = Boolean(r.signing_secret_enc) && !openSecrets(vault, r.tenant_id, { id: r.id, signing_secret_enc: r.signing_secret_enc }).ok;
   return {
     id: r.id,
     name: r.name,
@@ -141,6 +175,8 @@ export function endpointView(r: any) {
     consecutive_failures: r.consecutive_failures,
     has_credentials: Boolean(r.credentials_enc),
     has_signing_secret: Boolean(r.signing_secret_enc),
+    credentials_unreadable: credentialsUnreadable,
+    signing_secret_unreadable: secretUnreadable,
     version: r.version,
     created_at: r.created_at,
   };
@@ -320,15 +356,20 @@ export class HubDeliverer {
     if (!loaded) return;
     const { d, e, envelope } = loaded;
 
-    const credentials = e.credentials_enc ? JSON.parse(p.ports.vault.decrypt(e.credentials_enc, aadCreds(tenantId, e.id))) : null;
-    const signingSecret = e.signing_secret_enc ? p.ports.vault.decrypt(e.signing_secret_enc, aadSecret(tenantId, e.id)) : null;
+    const secrets = openSecrets(p.ports.vault, tenantId, { id: e.id, credentials_enc: e.credentials_enc, signing_secret_enc: e.signing_secret_enc });
+    const { credentials, signingSecret } = secrets.ok ? secrets : { credentials: null, signingSecret: null };
     const sync = loaded.sync.find((s) => envelope.type.startsWith('record.') && envelope.data.entity === s.entity) ?? null;
     const body = sync ? syncBody(sync, envelope, loaded.map.find((m) => m.sync_id === sync.id)?.external_id ?? null) : JSON.stringify(envelope);
     const msg: OutboundMessage = { id: envelope.id, type: envelope.type, timestamp: new Date(), body };
 
     let result: { ok: boolean; status?: number | undefined; error?: string | undefined; response?: string | undefined; durationMs: number };
     const started = Date.now();
-    if (e.kind === 'custom') {
+    if (!secrets.ok) {
+      // Not sendable, but still an attempt: it is logged, counts toward the breaker and
+      // dead-letters like any other failure instead of being re-claimed forever.
+      p.log.warn({ delivery: d.id, endpoint: e.id, field: secrets.unreadable }, 'hub endpoint secret cannot be decrypted');
+      result = { ok: false, error: UNREADABLE_ERROR[secrets.unreadable], durationMs: 0 };
+    } else if (e.kind === 'custom') {
       const spec = ConnectorSpec.parse(loaded.connector?.spec);
       const r = await runConnector(p, spec, envelope, credentials, { dryRun: false });
       result = { ok: r.ok, status: r.status, error: r.error, response: r.response, durationMs: Date.now() - started };

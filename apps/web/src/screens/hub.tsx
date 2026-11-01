@@ -88,6 +88,9 @@ function EndpointsPanel() {
                   <td className="py-2">{e.event_types.join(', ')}</td>
                   <td className="py-2">
                     <Badge value={e.status} />
+                    {(e.credentials_unreadable || e.signing_secret_unreadable) && (
+                      <span className="ml-2 text-xs font-medium text-warn">{e.credentials_unreadable ? 'Re-enter credentials' : 'Rotate signing secret'}</span>
+                    )}
                   </td>
                   <td className="py-2">
                     <Badge value={e.circuit_state === 'closed' ? 'active' : e.circuit_state} />
@@ -276,6 +279,15 @@ export function EndpointScreen() {
       {msg && (
         <div className="mb-4">
           <Alert tone={msg.tone}>{msg.text}</Alert>
+        </div>
+      )}
+      {(ep.credentials_unreadable || ep.signing_secret_unreadable) && (
+        <div className="mb-4">
+          <Alert tone="warn" title="Stored secrets cannot be decrypted">
+            {ep.credentials_unreadable && <p>The credentials of this endpoint can no longer be read (was the vault key changed?). Save the endpoint again with its credentials.</p>}
+            {ep.signing_secret_unreadable && <p>The signing secret of this endpoint can no longer be read (was the vault key changed?). Rotate the signing secret and give the new one to the receiver.</p>}
+            <p className="mt-1">Until then every delivery fails and ends in Dead letters; replay them once fixed.</p>
+          </Alert>
         </div>
       )}
       <div className="mb-3 max-w-xs">
