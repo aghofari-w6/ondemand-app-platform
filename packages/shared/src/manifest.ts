@@ -1,6 +1,7 @@
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { parse as parseExpr } from './expr/index.ts';
+import { AnalyticsMetric, validateAnalyticsMetric } from './analytics.ts';
 import { PermissionLevel } from './permissions.ts';
 
 /**
@@ -101,13 +102,6 @@ export const WorkflowTemplate = z.object({
   action: z.string(),
 });
 
-export const AnalyticsMetric = z.object({
-  name: ident,
-  label: z.string(),
-  entity: ident,
-  aggregate: z.enum(['count', 'sum', 'avg']),
-  field: z.string().optional(),
-});
 
 export const RiskTier = z.enum(['read', 'low', 'high']);
 export const AssistantTool = z.object({
@@ -273,7 +267,11 @@ export function validateManifest(raw: unknown, migrationSources?: Record<string,
   for (const a of m.analytics.metrics) {
     const ent = entities.get(a.entity);
     if (!ent) problems.push(`metric ${a.name}: unknown entity ${a.entity}`);
-    else if (a.aggregate !== 'count' && !ent.fields.some((f) => f.key === a.field)) problems.push(`metric ${a.name}: unknown field ${a.field}`);
+    else {
+      const evs = new Set(m.events.publishes.filter((e) => e.entity === a.entity).map((e) => e.type));
+      problems.push(...validateAnalyticsMetric(a, evs, new Set(ent.fields.map((f) => f.key))));
+      if (!a.events.length) problems.push(`metric ${a.name}: needs at least one event`);
+    }
   }
   for (const t of m.assistant.tools) {
     if (!t.command && !t.view) problems.push(`assistant tool ${t.name}: needs a command or a view`);

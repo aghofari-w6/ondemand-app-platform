@@ -116,14 +116,59 @@ export interface SamlSettings {
 export interface Vault {
   encrypt(plaintext: string, aad: string): string;
   decrypt(ciphertext: string, aad: string): string;
+  /** HMAC-SHA256 (base64url) under a key derived for `purpose`; for signed URLs. */
+  mac(data: string, purpose: string): string;
 }
 
 /** S3 later. Not used before Milestone B. */
+export interface FileMeta {
+  name: string;
+  contentType: string;
+  /** what created it, e.g. `report:<id>` */
+  purpose: string;
+  createdBy: string;
+  expiresAt?: Date | null;
+}
+
+/**
+ * Object storage (S3 later). Bodies are streamed both ways and never held whole in memory
+ * (memory-safe-code §1). Files belong to a tenant; reads are tenant-scoped.
+ */
 export interface Files {
-  /** Streams the body to storage; callers check the size limit before (memory-safe-code §1). */
-  put(tenantId: string, key: string, body: Readable, contentType: string, opts: { maxBytes: number; contentLength?: number }): Promise<{ url: string; size: number }>;
-  /** A stream of the object (never a whole Buffer), or null if missing. */
-  get(tenantId: string, key: string): Promise<{ stream: Readable; contentType: string; contentLength: number | null } | null>;
+  /** Streams `body` into storage; rejects (and stores nothing) past `maxBytes`. */
+  put(tenantId: string, meta: FileMeta, body: AsyncIterable<Uint8Array | string>, opts: { maxBytes: number }): Promise<{ id: string; size: number; sha256: string }>;
+  /** A stream of the file, or null if it does not exist (or is not ready). */
+  open(tenantId: string, id: string): Promise<{ stream: Readable; name: string; contentType: string; size: number } | null>;
+  remove(tenantId: string, id: string): Promise<void>;
+  /** A signed, expiring download token for one file. */
+  signToken(tenantId: string, id: string, ttlSeconds: number): string;
+  /** Checks a token: the file it grants, or null if forged or expired. */
+  verifyToken(token: string): { tenantId: string; fileId: string } | null;
+}
+
+/** A point added to a metric's hourly bucket. */
+export interface MetricPoint {
+  tenantId: string;
+  metric: string;
+  at: Date;
+  store: string;
+  channel: string;
+  value: number;
+  count: number;
+}
+
+/**
+ * Analytics store (ClickHouse later; PostgreSQL buckets now). Every call runs inside the
+ * caller's tenant transaction.
+ */
+export interface Analytics {
+  add(tx: Transaction<any>, points: MetricPoint[]): Promise<void>;
+  reset(tx: Transaction<any>, metric: string): Promise<void>;
+  query(
+    tx: Transaction<any>,
+    q: { metric: string; from: Date; to: Date; granularity: 'hour' | 'day' | 'week' | 'month' | null; groupBy: 'store' | 'channel' | null; filters: { store?: string[]; channel?: string[] }; limit?: number },
+  ): Promise<{ bucket: string | null; key: string | null; value: number; count: number }[]>;
+  total(tx: Transaction<any>, metric: string): Promise<{ value: number; count: number }>;
 }
 
 /** OpenTelemetry. */

@@ -34,6 +34,10 @@ export class BoundedCache<V> {
     this.entries.set(key, { at: now, value });
   }
 
+  delete(key: string) {
+    this.entries.delete(key);
+  }
+
   get size() {
     return this.entries.size;
   }

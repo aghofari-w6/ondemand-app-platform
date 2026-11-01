@@ -7,6 +7,7 @@ import { executeCommand } from '../src/platform/commands.ts';
 import type { Logger, Platform } from '../src/platform/context.ts';
 import { createPlatform } from '../src/platform/create.ts';
 import { runBackfill } from '../src/platform/maintenance.ts';
+import { rebuildMetric } from '../src/platform/analytics/metrics.ts';
 import { enqueueStep, handleStepJob, SAGAS, startRun, type RunKind } from '../src/platform/provisioning.ts';
 import { QUEUES } from '../src/platform/queues.ts';
 import { changeTenantStatus, handleLifecycleJob, signup } from '../src/platform/tenants.ts';
@@ -25,6 +26,7 @@ export function testPlatform(): Platform & { jobs: MemJobs } {
   jobs.work(QUEUES.provisionStep, (d: any, j: any) => handleStepJob(p, d, j.retryCount)).catch(registerFailed);
   jobs.work(QUEUES.tenantLifecycle, (d: any) => handleLifecycleJob(p, d)).catch(registerFailed);
   jobs.work(QUEUES.backfill, (d: any) => runBackfill(p, d)).catch(registerFailed);
+  jobs.work(QUEUES.metricRebuild, (d: any) => rebuildMetric(p, d)).catch(registerFailed);
   return Object.assign(p, { jobs });
 }
 

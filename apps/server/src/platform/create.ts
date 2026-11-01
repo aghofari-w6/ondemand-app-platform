@@ -1,4 +1,8 @@
-import { createAuth, createBilling, createChannel, createLlm, createMetrics, createTelemetry, createVault, pgSearch, stubFiles, stubRetriever } from '../adapters/index.ts';
+import { createAuth, createBilling, createChannel, createLlm, createMetrics, createTelemetry, createVault, pgSearch, stubRetriever } from '../adapters/index.ts';
+import { pgAnalytics } from '../adapters/pg-analytics.ts';
+import { createPgFiles } from '../adapters/pg-files.ts';
+import { registerAnalyticsJobs } from './analytics/jobs.ts';
+import { metricsConsumer } from './analytics/metrics.ts';
 import { createDelivery } from '../adapters/delivery.ts';
 import { createSandbox } from '../adapters/sandbox.ts';
 import { policyFrom } from '../adapters/ssrf.ts';
@@ -31,6 +35,7 @@ export function createPlatform(opts: { env?: Partial<Record<keyof Env, string>>;
   const catalog = new Catalog(TEMPLATES, config);
   const database = createDatabase(env.DATABASE_URL, { max: 15 });
   const metrics = createMetrics();
+  const vault = createVault(env.VAULT_KEY, (m) => log.warn({}, m));
   const p: Platform = {
     workers: undefined as unknown as Platform['workers'],
     env,
@@ -46,13 +51,14 @@ export function createPlatform(opts: { env?: Partial<Record<keyof Env, string>>;
       webhooks: createDelivery(policyFrom(env.HUB_ALLOW_PRIVATE_HOSTS, env.NODE_ENV === 'production'), { production: env.NODE_ENV === 'production', log: (msg, err) => log.warn({ err: String(err) }, msg) }),
       channel: createChannel(env.DEMO_MODE, (m) => log.info({}, m)),
       auth: createAuth({ allowInsecureIssuers: env.NODE_ENV !== 'production' }),
-      vault: createVault(env.VAULT_KEY, (m) => log.warn({}, m)),
-      files: stubFiles,
+      vault,
+      files: createPgFiles(database, vault),
       telemetry: createTelemetry(),
       llm: createLlm(env.ANTHROPIC_API_KEY, env.CLAUDE_MODEL),
       retriever: stubRetriever,
       sandbox: createSandbox(),
       billing: createBilling(config),
+      analytics: pgAnalytics,
     },
   };
   for (const c of templateConsumers(p)) p.ports.eventBus.subscribe(c);
@@ -60,6 +66,7 @@ export function createPlatform(opts: { env?: Partial<Record<keyof Env, string>>;
   p.ports.eventBus.subscribe(hubFanoutConsumer(p));
   p.ports.eventBus.subscribe(workflowsConsumer(p));
   p.ports.eventBus.subscribe(notificationsConsumer(p));
+  p.ports.eventBus.subscribe(metricsConsumer(p));
   p.workers = { hub: new HubDeliverer(p), workflows: new WorkflowRunner(p), indexes: null };
   return p;
 }
@@ -72,6 +79,7 @@ export async function startWorkers(p: Platform) {
   await p.ports.jobs.work(QUEUES.lifecycleSweep, () => lifecycleSweep(p));
   await p.ports.jobs.schedule(QUEUES.lifecycleSweep, '*/5 * * * *');
   await p.ports.jobs.work<{ tenantId: string; runId: string }>(QUEUES.backfill, (data) => runBackfill(p, data));
+  await registerAnalyticsJobs(p);
   await p.ports.eventBus.start();
   p.workers.hub.start();
   p.workers.workflows.start();

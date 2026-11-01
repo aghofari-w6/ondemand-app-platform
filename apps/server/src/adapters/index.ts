@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHmac, hkdfSync, randomBytes } from 'node:crypto';
 import Anthropic from '@anthropic-ai/sdk';
 import { SAML } from '@node-saml/node-saml';
 import { context, metrics as otelMetrics, propagation, trace, SpanStatusCode } from '@opentelemetry/api';
@@ -6,7 +6,7 @@ import { sql } from 'kysely';
 import * as oidc from 'openid-client';
 import type { PlatformConfig } from '../config.ts';
 import { BoundedCache } from './bounded-cache.ts';
-import type { Auth, Billing, Channel, Files, Llm, Metrics, OidcSettings, Retriever, SamlSettings, Search, Telemetry, Vault } from '../ports/index.ts';
+import type { Auth, Billing, Channel, Llm, Metrics, OidcSettings, Retriever, SamlSettings, Search, Telemetry, Vault } from '../ports/index.ts';
 
 // ------------------------------------------------------------------ Search
 
@@ -96,6 +96,10 @@ export function createVault(keyB64: string | undefined, log: (m: string) => void
       c.setAAD(Buffer.from(aad));
       const data = Buffer.concat([c.update(plaintext, 'utf8'), c.final()]);
       return ['v1', iv.toString('base64url'), c.getAuthTag().toString('base64url'), data.toString('base64url')].join('.');
+    },
+    mac(data, purpose) {
+      const k = Buffer.from(hkdfSync('sha256', key, Buffer.alloc(0), `aod-mac:${purpose}`, 32));
+      return createHmac('sha256', k).update(data).digest('base64url');
     },
     decrypt(ciphertext, aad) {
       const [v, iv, tag, data] = ciphertext.split('.');
@@ -230,5 +234,4 @@ const notYet = (port: string, milestone: string) => () => {
   throw new Error(`${port} port has no adapter before ${milestone}`);
 };
 
-export const stubFiles: Files = { put: notYet('Files', 'a later milestone'), get: notYet('Files', 'a later milestone') };
 export const stubRetriever: Retriever = { retrieve: notYet('Retriever', 'the assistant milestone') };

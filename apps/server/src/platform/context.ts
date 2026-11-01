@@ -1,6 +1,6 @@
 import type { Env, PlatformConfig } from '../config.ts';
 import type { Database } from '../db/database.ts';
-import type { Auth, Billing, Channel, EventBus, Files, Jobs, Llm, Metrics, Retriever, Sandbox, Search, Telemetry, Vault, Webhooks } from '../ports/index.ts';
+import type { Analytics, Auth, Billing, Channel, EventBus, Files, Jobs, Llm, Metrics, Retriever, Sandbox, Search, Telemetry, Vault, Webhooks } from '../ports/index.ts';
 import type { Catalog } from './catalog.ts';
 import type { HubDeliverer } from './hub.ts';
 import type { IndexBuilder } from './maintenance.ts';
@@ -36,5 +36,6 @@ export interface Platform {
     retriever: Retriever;
     sandbox: Sandbox;
     billing: Billing;
+    analytics: Analytics;
   };
 }

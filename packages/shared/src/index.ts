@@ -6,4 +6,5 @@ export * from './api.ts';
 export * from './datastudio.ts';
 export * from './hub.ts';
 export * from './workflow.ts';
+export * from './analytics.ts';
 export * as expr from './expr/index.ts';

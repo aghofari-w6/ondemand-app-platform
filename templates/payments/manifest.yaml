@@ -75,7 +75,14 @@ views:
 
 analytics:
   metrics:
-    - { name: captured_amount, label: Captured amount, entity: payment, aggregate: sum, field: amount }
+    - name: captured_amount
+      label: Captured amount
+      entity: payment
+      aggregate: sum
+      field: amount
+      unit: money
+      events: [{ type: payment.captured, value: amount }, { type: payment.refunded, value: "-amount" }]
+      where: { status: [captured] }
 
 assistant:
   tools:

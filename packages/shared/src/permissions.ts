@@ -43,6 +43,10 @@ export const PLATFORM_PERMISSIONS: PermissionDef[] = [
   { id: 'platform:workflows.manage', label: 'Build, publish and run workflows', level: 'manage' },
   { id: 'platform:trace.read', label: 'Use the trace viewer', level: 'manage' },
   { id: 'platform:hub.send', label: 'Send messages to Hub endpoints from workflows', level: 'admin' },
+  { id: 'platform:analytics.read', label: 'See dashboards and reports', level: 'manage' },
+  { id: 'platform:analytics.manage', label: 'Build dashboards and reports, run exports', level: 'manage' },
+  { id: 'platform:governance.read', label: 'See the PII inventory, access review and retention', level: 'admin' },
+  { id: 'platform:governance.manage', label: 'Run retention and data subject requests, export the audit log', level: 'admin' },
 ];
 
 export const ROLE_PRESETS = ['Owner', 'Admin', 'Manager', 'Staff', 'Viewer'] as const;

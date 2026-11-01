@@ -79,7 +79,11 @@ workflows:
 
 analytics:
   metrics:
-    - { name: shipments, label: Shipments, entity: shipment, aggregate: count }
+    - name: shipments
+      label: Shipments
+      entity: shipment
+      aggregate: count
+      events: [{ type: shipment.created }]
 
 assistant:
   tools:

@@ -12,6 +12,10 @@ import { executeRecordWrite } from '../src/platform/records.ts';
 import { principalFor } from '../src/auth/principal.ts';
 import { decideApproval } from '../src/platform/approvals.ts';
 import { createWorkflow, publishWorkflow } from '../src/platform/workflows/definitions.ts';
+import { saveDashboard } from '../src/platform/analytics/dashboards.ts';
+import { ensureMetrics, reconcileTenant } from '../src/platform/analytics/metrics.ts';
+import { runReport, saveReport } from '../src/platform/analytics/reports.ts';
+import { runDsr, saveRetentionPolicy } from '../src/platform/governance.ts';
 import { admin, closePlatform, cmd, newTenant, runSaga, setPlan, testPlatform, type TestTenant } from './helpers.ts';
 
 /**
@@ -96,7 +100,25 @@ async function populatePhase2(t: TestTenant) {
     return client;
   }).then((client) => clientCredentialsGrant(p, client.client_id, client.client_secret));
   await populatePhase3(t);
+  await populatePhase4(t);
 }
+
+/** Milestone D tables: metrics (rebuild + reconciliation), dashboard, report + run + file, retention, DSR. */
+async function populatePhase4(t: TestTenant) {
+  const c = () => randomUUID();
+  await ensureMetrics(p, t.tenantId);
+  for (let i = 0; i < 4; i++) {
+    await p.ports.eventBus.drain();
+    await p.jobs.runAll();
+  }
+  await reconcileTenant(p, t.tenantId);
+  await p.database.withTenant(t.tenantId, (tx) => saveDashboard(p, tx, t.tenantId, t.owner, { name: 'Iso', widgets: [{ id: 'k', kind: 'kpi', title: 'Orders', metric: 'ordering:orders' }] }, c()));
+  const { id } = await p.database.withTenant(t.tenantId, (tx) => saveReport(p, tx, t.tenantId, t.owner, { name: 'Iso', query: { metrics: ['ordering:orders'], range: 'last_7_days' } }, c()));
+  await runReport(p, t.tenantId, t.owner, id, { format: 'csv', trigger: 'manual', correlationId: c() });
+  await p.database.withTenant(t.tenantId, (tx) => saveRetentionPolicy(p, tx, t.tenantId, t.owner, { target: 'ordering:order', action: 'anonymise', after_days: 3650 }, c()));
+  await runDsr(p, t.tenantId, t.owner, { kind: 'export', subject: 'nobody@iso.example' }, c());
+}
+
 
 /** Milestone C tables: a published workflow with a parallel group and an approval, run for real. */
 async function populatePhase3(t: TestTenant) {
