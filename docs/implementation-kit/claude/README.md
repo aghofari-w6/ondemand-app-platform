@@ -17,8 +17,9 @@ kickoff prompts for the next milestones.
 | `.claude/skills/milestone/` | Branch → scope checklist → build → verify → review → PR → report. |
 | `.claude/skills/verify/` | Runs exactly what CI runs (`/verify`). |
 | `.claude/agents/contract-reviewer.md` | Read-only subagent that reviews a diff against the contracts. |
-| `prompts/milestone-b.md` | Ready-to-paste kickoff for Milestone B (phase 2). |
-| `prompts/next-milestone-template.md` | Fill-in template for Milestones C–F. |
+| `prompts/milestone-b.md` | Kickoff for Milestone B (phase 2) — done. |
+| `prompts/milestone-c.md` … `milestone-f.md` | Kickoffs for phases 3–6, pointing at `../plan-phases-3-6.md`. |
+| `prompts/next-milestone-template.md` | Fill-in template for anything beyond the plan. |
 
 ## Install
 
@@ -35,8 +36,8 @@ migration guard on every edit. The hook needs Node.js on the machine running Cla
 
 ## Use
 
-- **Start a milestone:** open Claude Code at the repo root and paste `prompts/milestone-b.md`
-  (or a filled-in copy of the template).
+- **Start a milestone:** open Claude Code at the repo root and paste the next
+  `prompts/milestone-<x>.md` (the plan for phases 3–6 is `../plan-phases-3-6.md`).
 - **Before pushing:** ask for `/verify`, then "have the contract-reviewer agent review the diff".
 - **Adding things:** mention the task ("add a tenant table for …", "add a command to POS …")
   and Claude picks the matching skill.

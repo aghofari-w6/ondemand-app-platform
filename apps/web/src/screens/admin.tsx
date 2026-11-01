@@ -443,17 +443,17 @@ export function AuditScreen() {
 // ---------------------------------------------------------------- Not-yet-built screens
 
 export const PLANNED: Record<string, { title: string; pkg: string; milestone: string; what: string }> = {
-  '/billing': { title: 'Billing and usage', pkg: 'Platform', milestone: 'Milestone F', what: 'Invoices, usage meters and payment methods. Plan changes are under Settings for now.' },
-  '/workflows': { title: 'Workflows', pkg: 'Apps', milestone: 'Milestone C (phase 3)', what: 'Event-triggered automations built from app workflow templates.' },
+  '/billing': { title: 'Billing and usage', pkg: 'Platform', milestone: 'Milestone F (phase 6)', what: 'Invoices paid through iPaymu, usage meters and plan limits. Plan changes are under Settings for now.' },
+  '/workflows': { title: 'Workflows', pkg: 'Apps', milestone: 'Milestone C (phase 3)', what: 'Event-triggered automations designed on a visual canvas, starting from app workflow templates.' },
   '/dashboards': { title: 'Dashboards', pkg: 'Analytics', milestone: 'Milestone D (phase 4)', what: 'Live dashboards over app metrics.' },
   '/reports': { title: 'Reports', pkg: 'Analytics', milestone: 'Milestone D (phase 4)', what: 'Scheduled and ad-hoc reports.' },
   '/data-governance': { title: 'Data governance', pkg: 'Analytics', milestone: 'Milestone D (phase 4)', what: 'PII inventory, retention and access reviews.' },
   '/assistant': { title: 'Assistant', pkg: 'Bot', milestone: 'Milestone E (phase 5)', what: 'A Claude-based assistant that uses app tools within their risk tiers.' },
   '/inbox': { title: 'Inbox', pkg: 'Omnichannel', milestone: 'Milestone E (phase 5)', what: 'Customer conversations from every channel.' },
-  '/channels': { title: 'Channels', pkg: 'Omnichannel', milestone: 'Milestone E (phase 5)', what: 'Connect Telegram, email and SMS.' },
+  '/channels': { title: 'Channels', pkg: 'Omnichannel', milestone: 'Milestone E (phase 5)', what: 'Connect Telegram, a Gmail mailbox and a live chat widget for your website.' },
   '/bot-studio': { title: 'Bot Studio', pkg: 'Bot', milestone: 'Milestone E (phase 5)', what: 'Design and test conversational bots.' },
   '/approvals': { title: 'Approvals', pkg: 'Apps', milestone: 'Milestone C (phase 3)', what: 'Approve high-risk actions from workflows and the assistant.' },
-  '/trace-viewer': { title: 'Trace viewer', pkg: 'Platform', milestone: 'Milestone F (phase 6)', what: 'Follow an event from command to every consumer by correlation id.' },
+  '/trace-viewer': { title: 'Trace viewer', pkg: 'Platform', milestone: 'Milestone C (phase 3)', what: 'Follow an event from command to every consumer by correlation id.' },
 };
 
 export function PlannedScreen({ path }: { path: string }) {
