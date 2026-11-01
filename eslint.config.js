@@ -46,4 +46,25 @@ export default tseslint.config(
     },
   },
   ...crossTemplateRules,
+  // Promise safety (skill: promise-safety). Type-aware: every promise is awaited, returned
+  // or has a rejection handler. On the server an unhandled rejection kills the process
+  // (API and every worker), so `void` alone does not count as handling there.
+  {
+    files: ['apps/server/**/*.ts', 'packages/**/*.ts', 'templates/**/*.ts', 'e2e/**/*.ts'],
+    languageOptions: { parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname } },
+    rules: {
+      '@typescript-eslint/no-floating-promises': ['error', { ignoreVoid: false }],
+      '@typescript-eslint/no-misused-promises': 'error',
+    },
+  },
+  {
+    files: ['apps/web/**/*.{ts,tsx}'],
+    languageOptions: { parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname } },
+    rules: {
+      // In the browser `void` marks a deliberate fire-and-forget (navigation, cache invalidation).
+      '@typescript-eslint/no-floating-promises': ['error', { ignoreVoid: true }],
+      // React Aria's onPress/onSubmit accept async handlers.
+      '@typescript-eslint/no-misused-promises': ['error', { checksVoidReturn: { attributes: false } }],
+    },
+  },
 );

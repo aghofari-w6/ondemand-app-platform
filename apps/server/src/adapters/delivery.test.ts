@@ -74,6 +74,18 @@ describe('transports (fake clients)', () => {
     expect(calls.sqs![0]).toMatchObject({ MessageBody: '{"a":1}', MessageDeduplicationId: 'evt_1', MessageGroupId: 'order.created' });
   });
 
+  it('logs a failing connection close instead of swallowing it, and the delivery still succeeds', async () => {
+    const logged: string[] = [];
+    const failingClose = createDelivery(strict, {
+      production: false,
+      factories: { ...factories, sftp: () => ({ connect: async () => undefined, put: async () => undefined, end: async () => Promise.reject(new Error('socket gone')) }) },
+      log: (m, e) => logged.push(`${m}: ${(e as Error).message}`),
+    });
+    const r = await failingClose.deliver({ kind: 'sftp', config: { host: '93.184.216.34', port: 22, directory: '/in/' }, credentials: { username: 'u', password: 'p' } }, msg);
+    expect(r.ok).toBe(true);
+    expect(logged).toEqual(['hub delivery: closing the SFTP connection failed: socket gone']);
+  });
+
   it('polices every Kafka broker connection, including advertised brokers', async () => {
     const sock = policedKafkaSocketFactory(strict)({ host: '169.254.169.254', port: 80, ssl: false, onConnect: () => {} });
     await expect(new Promise((_res, rej) => sock.on('error', rej))).rejects.toThrow(/private or reserved/);

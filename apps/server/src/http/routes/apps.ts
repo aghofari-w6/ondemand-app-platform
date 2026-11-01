@@ -136,7 +136,14 @@ export function appRoutes(p: Platform) {
       });
       const deadline = Date.now() + 10 * 60_000;
       while (!closed && Date.now() < deadline) {
-        const snap = await p.database.withTenant(a.tenantId, (tx) => runSnapshot(tx, id)).catch(() => null);
+        let snap: Awaited<ReturnType<typeof runSnapshot>>;
+        try {
+          snap = await p.database.withTenant(a.tenantId, (tx) => runSnapshot(tx, id));
+        } catch (e) {
+          p.log.error({ err: String(e), run: id }, 'provisioning stream: reading the run failed');
+          res.write(`event: error\ndata: ${JSON.stringify({ message: 'could not read the run; reload to retry' })}\n\n`);
+          break;
+        }
         if (!snap) {
           res.write(`event: error\ndata: ${JSON.stringify({ message: 'run not found' })}\n\n`);
           break;

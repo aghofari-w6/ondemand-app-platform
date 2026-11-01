@@ -43,7 +43,7 @@ export function createPlatform(opts: { env?: Partial<Record<keyof Env, string>>;
       search: pgSearch,
       metrics,
       jobs: createPgBossJobs(env.DATABASE_URL, (m) => log.warn({}, m), { pollingIntervalSeconds: opts.jobsPollSeconds ?? 0.5 }),
-      webhooks: createDelivery(policyFrom(env.HUB_ALLOW_PRIVATE_HOSTS, env.NODE_ENV === 'production'), { production: env.NODE_ENV === 'production' }),
+      webhooks: createDelivery(policyFrom(env.HUB_ALLOW_PRIVATE_HOSTS, env.NODE_ENV === 'production'), { production: env.NODE_ENV === 'production', log: (msg, err) => log.warn({ err: String(err) }, msg) }),
       channel: createChannel(env.DEMO_MODE, (m) => log.info({}, m)),
       auth: createAuth({ allowInsecureIssuers: env.NODE_ENV !== 'production' }),
       vault: createVault(env.VAULT_KEY, (m) => log.warn({}, m)),
@@ -79,11 +79,16 @@ export async function startWorkers(p: Platform) {
   if (ownerUrl) {
     const builder = new IndexBuilder(p, ownerUrl);
     p.workers.indexes = builder;
+    const failed = (e: unknown) => p.log.error({ err: String(e) }, 'index builder failed');
     const loop = async () => {
-      await builder.runPending().catch((e) => p.log.error({ err: String(e) }, 'index builder failed'));
-      indexTimer = setTimeout(loop, 2000);
+      await builder.runPending().catch(failed);
+      indexTimer = setTimeout(() => {
+        loop().catch(failed);
+      }, 2000);
     };
-    indexTimer = setTimeout(loop, 500);
+    indexTimer = setTimeout(() => {
+      loop().catch(failed);
+    }, 500);
   }
 }
 

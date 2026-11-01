@@ -57,7 +57,9 @@ export class PgEventBus implements EventBus {
       this.ticking = this.tick().catch((e) => this.o.log.error({ err: e }, 'event bus tick failed'));
       await this.ticking;
       this.ticking = null;
-      if (this.running) this.timer = setTimeout(loop, this.o.intervalMs);
+      if (this.running) this.timer = setTimeout(() => {
+          loop().catch((e) => this.o.log.error({ err: e }, 'event bus loop failed'));
+        }, this.o.intervalMs);
     };
     await loop();
   }

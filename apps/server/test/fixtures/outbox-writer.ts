@@ -11,7 +11,10 @@ import { sinkConsumer } from './sink.ts';
 const [tenantA, tenantB] = (process.env.TENANTS ?? '').split(',');
 const p = createPlatform({ env: { DATABASE_URL: process.env.APP_URL!, NODE_ENV: 'test', DISPATCH_INTERVAL_MS: '5' }, log: { info() {}, warn() {}, error() {} } });
 p.ports.eventBus.subscribe(sinkConsumer);
-void p.ports.eventBus.start();
+p.ports.eventBus.start().catch((e: unknown) => {
+  console.error('outbox writer: event bus failed to start', e);
+  process.exit(1);
+});
 
 let n = 0;
 for (;;) {

@@ -112,6 +112,8 @@ e2e/               Playwright
   (`apps/web/src/screens/admin.tsx`, `PLANNED`).
 - Server code that touches bodies, streams, timers, workers, caches, clients, retries or
   unbounded loops follows the `memory-safe-code` skill (run its detection greps on review).
+- Promises follow the `promise-safety` skill: every promise is awaited, returned or caught
+  with a log; no unhandled `.finally()`, no empty `.catch`. `pnpm lint` enforces it.
 - Claude API model id comes from config (`CLAUDE_MODEL`, default `claude-opus-5-5`); use the `Llm` port.
 
 ## Git
