@@ -187,13 +187,13 @@ and the routes had no range cap.
 
 ## 8. Promise safety (process-killing, not just leaky)
 
-Node exits on an unhandled rejection, and in this container that kills the API and every
-worker at once.
-- Fire-and-forget calls get `.catch((e) => p.log.error({ err: String(e) }, '…'))`, as
-  the worker loops do. Mark them with `void`.
-- An empty `.catch(() => {})` is only acceptable where failure is truly irrelevant, with
-  a comment saying why (e.g. best-effort cleanup in `finally`).
-- No dangling `.finally()` chains without a `.catch()`.
+An unhandled rejection exits Node, and in this container that kills the API and every
+worker at once. Follow the **`promise-safety`** skill. Lint enforces it
+(`no-floating-promises`, `no-misused-promises`):
+- no unhandled `.finally()`;
+- no fire-and-forget without a `.catch` that logs;
+- timer and listener callbacks with block bodies;
+- no empty `.catch`.
 
 ---
 
@@ -232,8 +232,8 @@ grep -nE "^(export )?(const|let) \w+ = new (Map|Set)\(|^(export )?(const|let) \w
 grep -nE "^import .*(isolated-vm|pdf|xlsx|puppeteer|playwright|canvas|jsdom)" <files>
 # 7. unbounded reads (check each has .limit()/cursor, or is a small table)
 grep -nE "selectFrom\('(event_log|outbox_event|audit_log|hub_delivery|hub_delivery_attempt|workflow_run|workflow_node_run|custom_record)'" <files>
-# 8. floating promises in workers / loops
-grep -nE "^\s+void [a-zA-Z_.]+\(|\.catch\(\(\) => \{\}\)" <files>
+# 8. swallowed errors (floating promises are caught by `pnpm lint`)
+grep -nE "\.catch\(\(\) => (\{\}|undefined|null)\)|\.finally\(" <files>
 ```
 
 For every hit, the PR must show the bound, the cleanup, or a one-line justification.

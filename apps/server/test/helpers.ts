@@ -21,9 +21,10 @@ export function testPlatform(): Platform & { jobs: MemJobs } {
   const p = createPlatform({ env: { DATABASE_URL: APP_URL, MIGRATION_DATABASE_URL: ADMIN_URL, NODE_ENV: 'test', DEMO_MODE: 'true', PUBLIC_URL: 'http://localhost:3000', HUB_ALLOW_PRIVATE_HOSTS: 'localhost,127.0.0.1', HUB_BACKOFF_BASE_MS: '10', HUB_BREAKER_COOLDOWN_MS: '200', HUB_MAX_ATTEMPTS: '3', HUB_BREAKER_THRESHOLD: '3' }, log: silent });
   const jobs = new MemJobs();
   p.ports.jobs = jobs;
-  void jobs.work(QUEUES.provisionStep, (d: any, j: any) => handleStepJob(p, d, j.retryCount));
-  void jobs.work(QUEUES.tenantLifecycle, (d: any) => handleLifecycleJob(p, d));
-  void jobs.work(QUEUES.backfill, (d: any) => runBackfill(p, d));
+  const registerFailed = (e: unknown) => console.error('registering a test job handler failed', e);
+  jobs.work(QUEUES.provisionStep, (d: any, j: any) => handleStepJob(p, d, j.retryCount)).catch(registerFailed);
+  jobs.work(QUEUES.tenantLifecycle, (d: any) => handleLifecycleJob(p, d)).catch(registerFailed);
+  jobs.work(QUEUES.backfill, (d: any) => runBackfill(p, d)).catch(registerFailed);
   return Object.assign(p, { jobs });
 }
 

@@ -257,6 +257,8 @@ export class HubDeliverer {
   private running = false;
   private ticking: Promise<unknown> | null = null;
 
+  private readonly loopFailed = (e: unknown) => this.p.log.error({ err: String(e) }, 'hub loop failed');
+
   constructor(p: Platform, o?: Partial<HubOptions>) {
     this.p = p;
     this.o = { ...hubOptions(p), ...o };
@@ -269,9 +271,11 @@ export class HubDeliverer {
       this.ticking = this.tick().catch((e) => this.p.log.error({ err: String(e) }, 'hub tick failed'));
       await this.ticking;
       this.ticking = null;
-      if (this.running) this.timer = setTimeout(loop, this.p.env.HUB_INTERVAL_MS);
+      if (this.running) this.timer = setTimeout(() => {
+          loop().catch(this.loopFailed);
+        }, this.p.env.HUB_INTERVAL_MS);
     };
-    void loop();
+    loop().catch(this.loopFailed);
   }
 
   async stop() {

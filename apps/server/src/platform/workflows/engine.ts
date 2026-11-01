@@ -449,6 +449,8 @@ export class WorkflowRunner {
   private running = false;
   private ticking: Promise<unknown> | null = null;
 
+  private readonly loopFailed = (e: unknown) => this.p.log.error({ err: String(e) }, 'workflow loop failed');
+
   constructor(p: Platform) {
     this.p = p;
   }
@@ -460,9 +462,11 @@ export class WorkflowRunner {
       this.ticking = this.tick().catch((e) => this.p.log.error({ err: String(e) }, 'workflow tick failed'));
       await this.ticking;
       this.ticking = null;
-      if (this.running) this.timer = setTimeout(loop, this.p.env.WORKFLOW_INTERVAL_MS);
+      if (this.running) this.timer = setTimeout(() => {
+          loop().catch(this.loopFailed);
+        }, this.p.env.WORKFLOW_INTERVAL_MS);
     };
-    void loop();
+    loop().catch(this.loopFailed);
   }
 
   async stop() {

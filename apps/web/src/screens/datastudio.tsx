@@ -230,8 +230,8 @@ function EntitiesPanel({ def, editable, edit, context }: PanelProps) {
             fields={e.fields}
             {...(editable
               ? {
-                  onRemove: (k) => edit((d) => void (d.entities.find((x) => x.key === e.key)!.fields = d.entities.find((x) => x.key === e.key)!.fields.filter((f) => f.key !== k))),
-                  onTogglePii: (k) => edit((d) => { const f = d.entities.find((x) => x.key === e.key)!.fields.find((x) => x.key === k)!; f.pii = !f.pii; }),
+                  onRemove: (k) => void edit((d) => void (d.entities.find((x) => x.key === e.key)!.fields = d.entities.find((x) => x.key === e.key)!.fields.filter((f) => f.key !== k))),
+                  onTogglePii: (k) => void edit((d) => { const f = d.entities.find((x) => x.key === e.key)!.fields.find((x) => x.key === k)!; f.pii = !f.pii; }),
                 }
               : {})}
           />
@@ -344,8 +344,8 @@ function AppFieldsPanel({ def, editable, edit, context }: PanelProps) {
           fields={set?.fields ?? []}
           {...(editable
             ? {
-                onRemove: (k) => edit((d) => { const s = d.app_fields.find((x) => x.app === app && x.entity === entity)!; s.fields = s.fields.filter((f) => f.key !== k); }),
-                onTogglePii: (k) => edit((d) => { const f = d.app_fields.find((x) => x.app === app && x.entity === entity)!.fields.find((x) => x.key === k)!; f.pii = !f.pii; }),
+                onRemove: (k) => void edit((d) => { const s = d.app_fields.find((x) => x.app === app && x.entity === entity)!; s.fields = s.fields.filter((f) => f.key !== k); }),
+                onTogglePii: (k) => void edit((d) => { const f = d.app_fields.find((x) => x.app === app && x.entity === entity)!.fields.find((x) => x.key === k)!; f.pii = !f.pii; }),
               }
             : {})}
         />

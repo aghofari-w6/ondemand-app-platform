@@ -128,7 +128,7 @@ export class IndexBuilder {
         status = 'failed';
         error = (e as Error).message;
       } finally {
-        await client.end().catch(() => {});
+        await client.end().catch((e: unknown) => this.p.log.warn({ err: String(e) }, 'index builder: closing the owner connection failed'));
       }
       await this.p.database.withTenant(job.tenant_id, (tx) => tx.updateTable('index_request').set({ status, error, finished_at: new Date() }).where('id', '=', r.id).execute());
     }

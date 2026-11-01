@@ -254,7 +254,8 @@ export function WorkflowEditorScreen() {
     const t = setTimeout(() => {
       api<{ problems: string[] }>('/api/workflows/validate', { body: { graph } })
         .then((r) => setProblems(r.problems))
-        .catch(() => {});
+        // Live validation is advisory (Save and Publish validate again); keep the last result.
+        .catch((e: unknown) => console.warn('live validation failed', e));
     }, 400);
     return () => clearTimeout(t);
   }, [graph, dirty]);

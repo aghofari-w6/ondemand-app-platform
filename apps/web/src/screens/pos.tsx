@@ -296,19 +296,35 @@ export function SaleDetailScreen() {
           actions={(s, refresh) =>
             s.status === 'completed' &&
             allowed(meta, 'sale.void') && (
-              <Button
-                variant="danger"
-                onPress={async () => {
-                  await runCommand('pos', 'sale.void', { id: s.id, version: s.version, reason: 'Voided at register' }).catch(() => undefined);
-                  refresh();
-                }}
-              >
-                Void sale
-              </Button>
+              <VoidSaleButton sale={s} onDone={refresh} />
             )
           }
         />
       )}
     </AppGate>
+  );
+}
+
+/** Voids a sale; a refused void (permission, stale version) is shown, never swallowed. */
+function VoidSaleButton(props: { sale: { id: string; version: number }; onDone: () => void }) {
+  const [error, setError] = useState<string | null>(null);
+  return (
+    <div className="flex flex-col gap-2">
+      <Button
+        variant="danger"
+        onPress={async () => {
+          setError(null);
+          try {
+            await runCommand('pos', 'sale.void', { id: props.sale.id, version: props.sale.version, reason: 'Voided at register' });
+          } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+          }
+          props.onDone();
+        }}
+      >
+        Void sale
+      </Button>
+      {error && <Alert tone="error">The sale was not voided: {error}</Alert>}
+    </div>
   );
 }

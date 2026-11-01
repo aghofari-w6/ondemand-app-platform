@@ -23,7 +23,7 @@ export const RESPONSE_EXCERPT_BYTES = 2048;
  * Reads at most `maxBytes` of a response body, then cancels the stream, so a remote
  * endpoint cannot make us hold a large (or endless) body in memory.
  */
-export async function readExcerpt(res: Response, maxBytes = RESPONSE_EXCERPT_BYTES): Promise<string> {
+export async function readExcerpt(res: Response, maxBytes = RESPONSE_EXCERPT_BYTES, onCleanupError: (what: string, e: unknown) => void = () => undefined): Promise<string> {
   if (!res.body) return '';
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -40,7 +40,7 @@ export async function readExcerpt(res: Response, maxBytes = RESPONSE_EXCERPT_BYT
     // a body that fails mid-way still yields what was read
   } finally {
     // Stop the transfer; the connection is not reused for the rest of the body.
-    await reader.cancel().catch(() => undefined);
+    await reader.cancel().catch((e: unknown) => onCleanupError('cancelling the response body', e));
   }
   return new TextDecoder().decode(Buffer.concat(chunks)).replace(/\uFFFD$/, '');
 }
@@ -97,8 +97,10 @@ export function defaultFactories(policy: SsrfPolicy): ClientFactories {
 
 const errMessage = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 500);
 
-export function createDelivery(policy: SsrfPolicy, opts: { production: boolean; factories?: ClientFactories }): Webhooks {
+export function createDelivery(policy: SsrfPolicy, opts: { production: boolean; factories?: ClientFactories; log?: (msg: string, err: unknown) => void }): Webhooks {
   const f = opts.factories ?? defaultFactories(policy);
+  // Cleanup failures never fail the delivery, but they are logged, not swallowed.
+  const cleanupFailed = (what: string, e: unknown) => opts.log?.(`hub delivery: ${what} failed`, e);
   const agent = new Agent({ connect: { lookup: safeLookup(policy) as any, timeout: TIMEOUT_MS }, headersTimeout: TIMEOUT_MS, bodyTimeout: TIMEOUT_MS });
 
   const checkUrl = async (raw: string) => {
@@ -113,7 +115,7 @@ export function createDelivery(policy: SsrfPolicy, opts: { production: boolean; 
   async function http(url: string, method: string, body: string, headers: Record<string, string>): Promise<Omit<DeliveryResult, 'durationMs'>> {
     await checkUrl(url);
     const res = await fetch(url, { method, body, headers: { 'content-type': 'application/json', 'user-agent': 'apps-on-demand-hub/1', ...headers }, dispatcher: agent, redirect: 'manual', signal: AbortSignal.timeout(TIMEOUT_MS) });
-    const text = await readExcerpt(res);
+    const text = await readExcerpt(res, RESPONSE_EXCERPT_BYTES, cleanupFailed);
     if (res.status >= 300 && res.status < 400) return { ok: false, status: res.status, error: 'redirects are not followed', response: text };
     return { ok: res.status >= 200 && res.status < 300, status: res.status, response: text, ...(res.ok ? {} : { error: `HTTP ${res.status}` }) };
   }
@@ -190,7 +192,7 @@ export function createDelivery(policy: SsrfPolicy, opts: { production: boolean; 
               const id = await r.xadd(t.config.stream, ...trim, '*', 'event_id', msg.id, 'type', msg.type, 'body', msg.body);
               return done({ ok: true, response: String(id) });
             } finally {
-              await r.quit().catch(() => undefined);
+              await r.quit().catch((e: unknown) => cleanupFailed('closing the Redis connection', e));
             }
           }
           case 'sftp': {
@@ -202,7 +204,7 @@ export function createDelivery(policy: SsrfPolicy, opts: { production: boolean; 
               await c.put(Buffer.from(msg.body), path);
               return done({ ok: true, response: path });
             } finally {
-              await c.end().catch(() => undefined);
+              await c.end().catch((e: unknown) => cleanupFailed('closing the SFTP connection', e));
             }
           }
           case 'sqs': {
