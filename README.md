@@ -350,3 +350,5 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
 - **Notifications go through the outbox:** a `notify` node writes a `workflow.notification`
   event (user ids, never addresses) with its completion; the `platform.notifications`
   consumer calls the Channel port. A crash between send and commit can repeat a send.
+
+  
