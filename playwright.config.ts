@@ -1,6 +1,8 @@
 import { defineConfig, devices } from '@playwright/test';
 
 const PORT = Number(process.env.E2E_PORT ?? 3100);
+const MOCK_TELEGRAM_PORT = Number(process.env.E2E_TELEGRAM_PORT ?? 3111);
+const MOCK_GOOGLE_PORT = Number(process.env.E2E_GOOGLE_PORT ?? 3112);
 
 export default defineConfig({
   testDir: 'e2e',
@@ -33,6 +35,19 @@ export default defineConfig({
       HUB_BACKOFF_BASE_MS: '50',
       HUB_MAX_ATTEMPTS: '2',
       HUB_INTERVAL_MS: '200',
+      // Milestone E: the scripted model, the local embedder, and mock Telegram / Google
+      // servers the J5 spec starts on these ports (plan decision 6: no live calls). The
+      // OAuth client id and secret are placeholders the mock accepts; nothing real.
+      LLM_ADAPTER: 'fake',
+      EMBEDDINGS_ADAPTER: 'fake',
+      TELEGRAM_API_URL: `http://127.0.0.1:${MOCK_TELEGRAM_PORT}`,
+      GOOGLE_OAUTH_URL: `http://127.0.0.1:${MOCK_GOOGLE_PORT}`,
+      GOOGLE_TOKEN_URL: `http://127.0.0.1:${MOCK_GOOGLE_PORT}`,
+      GMAIL_API_URL: `http://127.0.0.1:${MOCK_GOOGLE_PORT}`,
+      GOOGLE_OAUTH_CLIENT_ID: 'test-client-id',
+      GOOGLE_OAUTH_CLIENT_SECRET: 'test-client-secret',
+      GMAIL_POLL_SECONDS: '2',
+      CHANNEL_INTERVAL_MS: '200',
     },
   },
 });

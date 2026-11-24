@@ -20,8 +20,9 @@ Synthetic data only. Never commit secrets or keys.
 | Demo tenant "Acme Coffee" | `pnpm seed` (`-- --reset` to re-create) |
 | Build SPA + run server on :3000 | `pnpm --filter @aod/web build && pnpm start` |
 | Dev (API :3000, Vite :5173) | `pnpm dev` |
-| E2E (J1, phase 2, J3, J4) + axe | `pnpm e2e` (needs a migrated `aod` DB and a built SPA) |
+| E2E (J1, phase 2, J3, J4, J5) + axe | `pnpm e2e` (needs a migrated `aod` DB and a built SPA) |
 | Redis for the Streams test | `redis-server --daemonize yes` (or set `TEST_REDIS_URL`) |
+| pgvector for local PostgreSQL 16 | `apt install postgresql-16-pgvector` (CI and compose use `pgvector/pgvector:pg17`) |
 
 Run `pnpm lint && pnpm typecheck && pnpm test && pnpm test:integration` before every
 commit. The server runs TypeScript directly on Node 24 (type stripping): use `.ts`
@@ -39,11 +40,14 @@ apps/server/src/
                datastudio (metadata versions), records (custom entities), links, hub,
                maintenance (backfills, index builder), openapi, workflows/ (definitions,
                engine, dry run), approvals, trace, analytics/ (metrics, query, dashboards,
-               reports, jobs), governance
+               reports, jobs), governance, knowledge (sources, indexing, retrieval),
+               assistant/ (tools, agent, usage), conversations/ (channels, inbox, jobs),
+               bot/ (flows, runner), packages (plan entitlement)
   http/        app.ts (hooks, errors, auth helpers) + routes/
 apps/web/src/  React SPA: components/ (ui, shell, workspace), screens/, lib/ (api, offline)
 packages/shared/src/  envelope, manifest (schema + validator), permissions (authorize),
-               template (TemplateModule contract), api (Zod request schemas), expr/
+               template (TemplateModule contract), api (Zod request schemas), expr/,
+               workflow (graphs), bot (bot flow graphs)
 templates/<app>/  manifest.yaml, migrations/*.sql, src/index.ts
 db/migrations/    platform migrations (roles, RLS helper, platform tables, definer functions)
 config/platform.yaml  plans, trial slots, release channels, capability rules
@@ -101,6 +105,26 @@ e2e/               Playwright
     capped at publish (`servicePrincipal()`), never `System`; run data shown to a viewer
     is masked with `redact()`.
 
+14. **Assistant.** Tools run only as the signed-in user: `toolsFor()` lists what the
+    principal holds and `runReadTool()` / `runWriteTool()` go through `authorize()`,
+    `executeCommand()` or `executeRecordWrite()` with origin `assistant` and idempotency key
+    `assistant:<tool call>`. Risk tiers are not negotiable: `read` runs, `low` waits for the
+    user's confirmation, `high` waits for an approval request. Tool results, retrieved
+    passages and customer text reach the model only as data (tool results, or inside
+    `<customer_message>` / `<passages>` with angle brackets neutralised), never in a system
+    prompt. PII fields are dropped before anything goes to the model. Transcripts are
+    append-only. Every model call goes through the `Llm` port and is metered with
+    `addUsage()` against the plan limit.
+15. **Conversations.** Customer message text never goes into event data or audit entries;
+    contact email and phone are encrypted and matched by keyed hashes. Inbound messages go
+    through `ingestMessage()` (idempotent by the channel's message id) and outbound ones
+    through `queueReply()`; only the `ChannelSender` talks to Telegram or Gmail, and only
+    through the `Channel` port's transports on the policed `OutboundHttp` client. Widget
+    endpoints check the origin, the signed session and the rate limits. Bots answer
+    customers with public knowledge only and look things up as `botPrincipal()` (a role
+    capped at publish), never `System`. Retrieval always goes through the `Retriever` port
+    (`searchKnowledge()`), scoped to one tenant.
+
 ## Conventions
 
 - Zod 4 for every external input (`parse()` in routes); errors are `CommandError(status, code, message)`.
@@ -119,6 +143,9 @@ e2e/               Playwright
 - Promises follow the `promise-safety` skill: every promise is awaited, returned or caught
   with a log; no unhandled `.finally()`, no empty `.catch`. `pnpm lint` enforces it.
 - Claude API model id comes from config (`CLAUDE_MODEL`, default `claude-opus-5-5`); use the `Llm` port.
+- No live calls to Claude, Voyage, Telegram or Google in tests (plan decision 6): use
+  `LLM_ADAPTER=fake`, the fake embedder and the mock servers in `apps/server/test/mocks/`.
+  SSE routes wait on the `Realtime` port with a per-stream cursor; they never poll in a loop.
 
 ## Git
 

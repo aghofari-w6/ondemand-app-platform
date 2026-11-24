@@ -1,7 +1,7 @@
 # Apps-on-Demand prototype: plan for phases 3–6 (Milestones C–F)
 
-Status: **v0.3, 2026-11-01.** All decisions in section 8 are answered except the time budget. Written after
-Milestones A (week 0 + phase 1) and B (phase 2) were merged.
+Status: **v0.3, 2026-11-01**; states updated 2026-11-24. All decisions in section 8 are answered except the
+time budget. Written after Milestones A (week 0 + phase 1) and B (phase 2) were merged.
 
 > The original implementation plan (`prototype-implementation-plan.md` v0.2) is not in this
 > repository. This plan is reconstructed from the product brief, the navigation
@@ -18,9 +18,9 @@ Milestones A (week 0 + phase 1) and B (phase 2) were merged.
 | --- | --- | --- | --- |
 | A | week 0 + 1 | Tenancy, RLS, outbox, sign-in (magic link, OIDC, SAML), roles, catalog and provisioning saga, Ordering/Payments/POS/Logistics, workspaces, J1 | merged (#1) |
 | B | 2 | Data studio, custom entities, link index, Integration Hub, public `/v1` | merged (#2) |
-| **C** | **3** | **Workflows on a visual canvas, Approvals, Trace viewer** (Apps package) | planned |
-| **D** | **4** | **Dashboards, Reports, Data governance** (Analytics package) | planned |
-| **E** | **5** | **Assistant (pgvector retrieval), Inbox, Channels (Telegram, Gmail, web chat widget), Bot Studio** (Bot + Omnichannel packages) | planned |
+| C | 3 | Workflows on a visual canvas, Approvals, Trace viewer (Apps package) | merged (#4) |
+| D | 4 | Dashboards, Reports, Data governance (Analytics package) | merged (#8) |
+| **E** | **5** | **Assistant (pgvector retrieval), Inbox, Channels (Telegram, Gmail, web chat widget), Bot Studio** (Bot + Omnichannel packages) | built on `proto/phase5`, in review |
 | **F** | **6** | **Billing and usage with iPaymu, hardening, launch readiness** | planned |
 
 ### Timeline for 2 engineers

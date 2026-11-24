@@ -125,6 +125,9 @@ const KIND_LABEL: Record<string, string> = {
   delivery: 'Hub delivery',
   approval: 'Approval',
   decision: 'Decision',
+  tool: 'Assistant tool',
+  message: 'Message',
+  bot: 'Bot',
 };
 
 export function TraceViewerScreen() {
@@ -175,6 +178,11 @@ export function TraceViewerScreen() {
                 {it.ids.run_id && it.kind === 'run' && (
                   <Link to={`/workflow-runs/${it.ids.run_id}`} className="inline-flex min-h-11 items-center text-accent underline">
                     Open execution view
+                  </Link>
+                )}
+                {it.ids.conversation_id && it.kind === 'message' && (
+                  <Link to="/inbox" search={{ c: it.ids.conversation_id } as never} className="inline-flex min-h-11 items-center text-accent underline">
+                    Open conversation
                   </Link>
                 )}
               </li>

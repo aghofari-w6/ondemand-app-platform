@@ -79,9 +79,9 @@ export function TextField(props: {
   );
 }
 
-export function TextArea(props: { label: string; value: string; onChange: (v: string) => void; description?: string; error?: string | undefined; rows?: number; className?: string; mono?: boolean }) {
+export function TextArea(props: { label: string; value: string; onChange: (v: string) => void; description?: string; error?: string | undefined; rows?: number; className?: string; mono?: boolean; isReadOnly?: boolean }) {
   return (
-    <AriaTextField className={`flex flex-col gap-1 ${props.className ?? ''}`} value={props.value} onChange={props.onChange} isInvalid={Boolean(props.error)}>
+    <AriaTextField className={`flex flex-col gap-1 ${props.className ?? ''}`} value={props.value} onChange={props.onChange} isInvalid={Boolean(props.error)} isReadOnly={props.isReadOnly}>
       <Label className="text-sm font-medium text-ink">{props.label}</Label>
       <AriaTextArea rows={props.rows ?? 4} className={`min-h-11 rounded-lg border border-line bg-white px-3 py-2 text-base text-ink ${props.mono ? 'font-mono text-sm' : ''}`} />
       {props.description && (
