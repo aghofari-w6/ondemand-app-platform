@@ -8,7 +8,7 @@ import { policyFrom } from '../src/adapters/ssrf.ts';
 import { principalFor } from '../src/auth/principal.ts';
 import { newId } from '../src/db/database.ts';
 import { buildApp } from '../src/http/app.ts';
-import { createConversation, decideToolCall, getConversation, resumeConversation, sendMessage, type AgentEvent } from '../src/platform/assistant/agent.ts';
+import { createConversation, decideToolCall, expireApprovals, getConversation, resumeConversation, sendMessage, type AgentEvent } from '../src/platform/assistant/agent.ts';
 import { usageMonth, usageSummary } from '../src/platform/assistant/usage.ts';
 import { decideApproval, listApprovals } from '../src/platform/approvals.ts';
 import { openDraft, publishDraft, saveDraft, sendJobs } from '../src/platform/datastudio.ts';
@@ -296,6 +296,23 @@ describe('assistant: tools run as the user, by risk tier', () => {
     const after = await view(A, A.owner, r.id);
     expect(after.tool_calls.find((t) => t.id === call.id)!.status).toBe('rejected');
     expect(after.messages.at(-1)!.text).toMatch(/rejected, so order .* is unchanged/);
+  });
+
+  it('an approval nobody decided in time is expired with an audit entry, and the conversation continues', async () => {
+    const o = await order(A);
+    const r = await chat(A, A.owner, `Cancel order ${o.number}`);
+    const call = r.view.tool_calls.find((t) => t.status === 'pending_approval')!;
+    await p.database.withTenant(A.tenantId, (tx) => sql`UPDATE approval_request SET expires_at = now() - interval '1 minute' WHERE id = ${call.approval_request_id}`.execute(tx));
+    expect(await expireApprovals(p, A.tenantId, r.id)).toBe(1);
+    expect(await expireApprovals(p, A.tenantId, r.id)).toBe(0);
+    await settle();
+    const after = await view(A, A.owner, r.id);
+    expect(after.conversation.status).toBe('idle');
+    expect(after.tool_calls.find((t) => t.id === call.id)!.status).toBe('expired');
+    expect(after.messages.at(-1)!.text).toMatch(/expired, so order .* is unchanged/);
+    expect((await orderRow(A, o.id)).status).toBe('new');
+    const audit = await p.database.withTenant(A.tenantId, (tx) => tx.selectFrom('audit_log').select('action').where('resource_id', '=', call.approval_request_id!).execute());
+    expect(audit.map((a) => a.action)).toEqual(expect.arrayContaining(['platform:approval.requested', 'platform:approval.expired']));
   });
 
   it('can never exceed the user: missing permissions hide the tool, and a permission lost before approval blocks the action', async () => {

@@ -2,9 +2,11 @@ import { action, authorize, backoffMs, CommandError, type Principal } from '@aod
 import { sql } from 'kysely';
 import { newId, type Tx } from '../../db/database.ts';
 import type { ChannelSendResult, Consumer } from '../../ports/index.ts';
+import { assertWritableTenant } from '../commands.ts';
 import type { Platform } from '../context.ts';
 import { hubOptions } from '../hub.ts';
 import { linksFor } from '../links.ts';
+import { OMNICHANNEL_PACKAGE, requirePackage } from '../packages.ts';
 import { recordChange } from '../record.ts';
 import { markNeedsReconnect, openSecrets, type ChannelRow } from './channels.ts';
 
@@ -106,6 +108,9 @@ export async function botServes(tx: Tx, channel: string): Promise<boolean> {
  */
 export async function ingestMessage(p: Platform, tenantId: string, account: Pick<ChannelRow, 'id' | 'kind' | 'config'>, m: InboundMessage): Promise<{ conversationId: string; messageId: string; created: boolean } | { duplicate: true; conversationId: string }> {
   const out = await p.database.withTenant(tenantId, async (tx) => {
+    // A suspended or deleted workspace, or a plan without the package, takes no new messages.
+    await assertWritableTenant(tx);
+    await requirePackage(p, tx, OMNICHANNEL_PACKAGE);
     const contactId = await resolveContact(p, tx, tenantId, m);
     const existing = (await sql<any>`SELECT * FROM conversation WHERE account_id = ${account.id} AND thread_key = ${m.threadKey} FOR UPDATE`.execute(tx)).rows[0];
     const bot = await botServes(tx, account.kind);

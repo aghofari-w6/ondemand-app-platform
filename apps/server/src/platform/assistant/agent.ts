@@ -133,7 +133,8 @@ async function processToolUses(p: Platform, t: Turn, uses: Extract<LlmBlock, { t
       let approvalId: string | null = null;
       if (status === 'pending_approval' && def) {
         approvalId = newId();
-        const title = `${def.label}${(await targetTitle(tx, def, use.input)) ? `: ${await targetTitle(tx, def, use.input)}` : ''}`;
+        const target = await targetTitle(tx, def, use.input);
+        const title = target ? `${def.label}: ${target}` : def.label;
         await tx
           .insertInto('approval_request')
           .values({ id: approvalId, tenant_id: t.tenantId, source: 'assistant', source_ref: id, title, details: `Requested through the assistant. Tool ${def.name}; input fields: ${Object.keys(use.input ?? {}).join(', ') || 'none'}.`, approver_roles: ASSISTANT_APPROVER_ROLES, quorum: 1, correlation_id: t.correlationId, requested_by: t.principal.id, expires_at: new Date(Date.now() + APPROVAL_HOURS * 3600_000) })
@@ -310,18 +311,22 @@ export function assistantApprovalsConsumer(p: Platform): Consumer {
   };
 }
 
-/** Marks actions whose approval request expired undecided, so the conversation is not stuck. */
-export async function expireApprovals(p: Platform, tenantId: string, conversationId: string): Promise<boolean> {
+/**
+ * Resolves approval requests of this conversation that expired undecided, so it is not
+ * stuck: the request becomes `expired` with its audit entry and `approval.resolved` event,
+ * and the approvals consumer then closes the tool call and continues the conversation.
+ */
+export async function expireApprovals(p: Platform, tenantId: string, conversationId: string): Promise<number> {
   return p.database.withTenant(tenantId, async (tx) => {
-    const expired = await sql<{ id: string; request_id: string }>`
-      SELECT c.id, r.id AS request_id FROM assistant_tool_call c JOIN approval_request r ON r.id = c.approval_request_id
+    const expired = await sql<{ id: string; correlation_id: string | null }>`
+      SELECT r.id, r.correlation_id FROM approval_request r JOIN assistant_tool_call c ON c.approval_request_id = r.id
       WHERE c.conversation_id = ${conversationId} AND c.status = 'pending_approval' AND r.status = 'pending' AND r.expires_at < now()
-      FOR UPDATE OF c, r`.execute(tx);
-    for (const e of expired.rows) {
-      await tx.updateTable('approval_request').set({ status: 'expired', decided_at: new Date(), version: sql`version + 1` }).where('id', '=', e.request_id).execute();
-      await tx.updateTable('assistant_tool_call').set({ status: 'expired', decided_at: new Date() }).where('id', '=', e.id).execute();
+      FOR UPDATE OF r`.execute(tx);
+    for (const r of expired.rows) {
+      await tx.updateTable('approval_request').set({ status: 'expired', decided_at: new Date(), version: sql`version + 1` }).where('id', '=', r.id).execute();
+      await recordChange(p, tx, { tenantId, actor: { type: 'System', id: 'assistant' }, action: 'platform:approval.expired', resourceType: 'platform::ApprovalRequest', resourceId: r.id, correlationId: r.correlation_id ?? newId(), events: [{ type: 'approval.resolved', data: { request_id: r.id, status: 'expired' } }] });
     }
-    return expired.rows.length > 0;
+    return expired.rows.length;
   });
 }
 

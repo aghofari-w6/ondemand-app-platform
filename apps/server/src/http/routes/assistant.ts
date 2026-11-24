@@ -76,7 +76,7 @@ export function assistantRoutes(p: Platform) {
       const a = requirePermission(req, 'platform:assistant.use');
       const id = idParam(req);
       // An approval nobody decided in time must not leave the conversation stuck.
-      if (await expireApprovals(p, a.tenantId, id)) await resumeConversation(p, { tenantId: a.tenantId, conversationId: id });
+      await expireApprovals(p, a.tenantId, id);
       return p.database.withTenant(a.tenantId, (tx) => getConversation(p, tx, a.principal, id));
     });
 

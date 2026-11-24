@@ -434,6 +434,14 @@ describe('inbox', () => {
     const trial = await newTenant(p, 'conv-trial');
     expect((await app.inject({ method: 'POST', url: '/api/channels/widget', headers: auth(trial), payload: { name: 'W', allowed_origins: ['https://x.example'] } })).json()).toMatchObject({ error: 'not_in_plan' });
     expect((await app.inject({ method: 'GET', url: '/api/inbox/conversations', headers: auth(trial) })).json()).toMatchObject({ enabled: false, conversations: [] });
+    // A workspace that loses the package stops taking customer messages on its existing widget.
+    const paid = await newTenant(p, 'conv-down');
+    await setPlan(p, paid, 'growth');
+    const pw = await p.database.withTenant(paid.tenantId, (tx) => createWidget(p, tx, paid.tenantId, paid.owner, { name: 'W', allowed_origins: ['https://shop.example'] }, c()));
+    const pv = await visitor(widgetKey(paid.tenantId, pw.id));
+    expect((await pv.say('hello')).statusCode).toBe(201);
+    await setPlan(p, paid, 'starter');
+    expect((await pv.say('still there?')).json()).toMatchObject({ error: 'not_in_plan' });
     const staff = await user(A, 'Staff');
     const viewer = await user(A, 'Viewer');
     expect((await app.inject({ method: 'GET', url: '/api/inbox/conversations', headers: auth(staff) })).statusCode).toBe(200);
