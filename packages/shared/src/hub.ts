@@ -86,7 +86,8 @@ export const ConnectorInput = z.object({ name, spec: ConnectorSpec });
 
 export const SyncInput = z.object({
   name,
-  entity: z.string().regex(/^[a-z][a-z0-9_]*$/),
+  /** a custom entity key, or `<app>:<entity>` for an app entity whose manifest declares `sync` */
+  entity: z.string().regex(/^[a-z][a-z0-9_]*(:[a-z][a-z0-9_]*)?$/),
   endpoint_id: z.uuid().optional(),
   conflict_rule: z.enum(['platform_wins', 'remote_wins', 'last_write_wins']),
   /** local field -> remote field */
@@ -99,6 +100,8 @@ export const SyncInbound = z.object({
   updated_at: z.iso.datetime({ offset: true }),
   data: z.record(z.string(), z.unknown()),
   deleted: z.boolean().default(false),
+  /** app-entity syncs: links `external_id` to an existing record that has no mapping yet */
+  local_id: z.uuid().optional(),
 });
 
 // ------------------------------------------------------------------ public API scopes

@@ -6,7 +6,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { verifyWebhook } from '../src/adapters/delivery.ts';
 import { newId } from '../src/db/database.ts';
 import { openDraft, publishDraft, saveDraft } from '../src/platform/datastudio.ts';
-import { applyInbound, endpointView, replayDeliveries, saveEndpoint } from '../src/platform/hub.ts';
+import { principalFor } from '../src/auth/principal.ts';
+import { applyInbound, assertSyncTarget, endpointView, replayDeliveries, saveEndpoint, syncTargets } from '../src/platform/hub.ts';
 import { writeOutbox } from '../src/platform/outbox.ts';
 import { executeRecordWrite } from '../src/platform/records.ts';
 import { admin, closePlatform, cmd, newTenant, runSaga, setPlan, testPlatform, type TestTenant } from './helpers.ts';
@@ -295,5 +296,142 @@ describe('Integration Hub', () => {
     // A new record created remotely gets a local twin.
     const created = await applyInbound(p, t.tenantId, t.owner, syncId, { external_id: 'ERP-NEW', updated_at: new Date().toISOString(), data: { company_name: 'Teh Jawa' }, deleted: false }, 'e');
     expect(created).toMatchObject({ result: 'created' });
+  });
+  describe('two-way sync for orders (manifest `sync`)', () => {
+    let syncId = '';
+    const at = (seconds: number) => new Date(Date.now() + seconds * 1000).toISOString();
+    const row = (id: string) => p.database.withTenant(t.tenantId, (tx) => tx.selectFrom('ord_order').select(['status', 'notes', 'version', 'customer_name']).where('id', '=', id).executeTakeFirstOrThrow());
+    const mapOf = (id: string) => p.database.withTenant(t.tenantId, (tx) => tx.selectFrom('external_id_map').selectAll().where('sync_id', '=', syncId).where('local_id', '=', id).executeTakeFirst());
+    const audits = (id: string, action: string) => p.database.withTenant(t.tenantId, (tx) => tx.selectFrom('audit_log').select(['action', 'correlation_id', 'data']).where('resource_id', '=', id).where('action', '=', action).execute());
+    const inbound = (externalId: string, updatedAt: string, data: Record<string, unknown>, suffix: string, extra: { principal?: typeof t.owner; local_id?: string; deleted?: boolean } = {}) =>
+      applyInbound(p, t.tenantId, extra.principal ?? t.owner, syncId, { external_id: externalId, updated_at: updatedAt, data, deleted: extra.deleted ?? false, ...(extra.local_id ? { local_id: extra.local_id } : {}) }, suffix);
+    const setRule = (rule: string) => p.database.withTenant(t.tenantId, (tx) => tx.updateTable('hub_sync').set({ conflict_rule: rule }).where('id', '=', syncId).execute());
+    const place = async (notes = 'no sugar') => {
+      const o = await cmd(p, t, 'ordering', 'order.create', { channel: 'web', customer_name: 'Sari Dewi', customer_phone: '+62 811 0000 111', notes, lines: [{ sku: 'A', name: 'A', qty: 1, unit_price: 50 }] });
+      await until(async () => Boolean(await mapOf(o.body.id)));
+      return { id: o.body.id as string, number: o.body.number as number, ext: `ERP-${String(o.body.id).slice(0, 8)}` };
+    };
+    const sentFor = (id: string) => received('/erp-orders').filter((r) => JSON.parse(r.body).local_id === id);
+
+    beforeAll(async () => {
+      const ep = await endpoint({ kind: 'webhook', name: 'erp-orders', event_types: ['order.*'], config: { url: `${base}/erp-orders` } });
+      syncId = newId();
+      const fieldMap = { notes: 'remark', status: 'state' };
+      await p.database.withTenant(t.tenantId, async (tx) => {
+        await assertSyncTarget(p, tx, { entity: 'ordering:order', endpoint_id: ep.id, field_map: fieldMap });
+        await tx.insertInto('hub_sync').values({ id: syncId, tenant_id: t.tenantId, name: 'erp-orders', entity: 'ordering:order', endpoint_id: ep.id, conflict_rule: 'platform_wins', field_map: JSON.stringify(fieldMap) }).execute();
+      });
+    });
+
+    it('offers only declared app entities, and checks the endpoint and the field map', async () => {
+      const quiet = await endpoint({ kind: 'webhook', name: 'no-orders', event_types: ['record.*'], config: { url: `${base}/quiet` } });
+      await p.database.withTenant(t.tenantId, async (tx) => {
+        expect(await syncTargets(p, tx)).toEqual([expect.objectContaining({ id: 'ordering:order', inbound_fields: ['notes', 'status'] })]);
+        await expect(assertSyncTarget(p, tx, { entity: 'ordering:order_line', field_map: {} })).rejects.toMatchObject({ status: 422, code: 'not_syncable' });
+        await expect(assertSyncTarget(p, tx, { entity: 'payments:payment', field_map: {} })).rejects.toMatchObject({ code: 'not_syncable' });
+        await expect(assertSyncTarget(p, tx, { entity: 'ordering:order', field_map: { customer_phone: 'phone' } })).rejects.toMatchObject({ status: 422, code: 'invalid_field_map' });
+        await expect(assertSyncTarget(p, tx, { entity: 'ordering:order', endpoint_id: quiet.id, field_map: {} })).rejects.toMatchObject({ status: 422, code: 'endpoint_not_subscribed' });
+      });
+    });
+
+    it('sends the declared fields (never PII) and records the external id', async () => {
+      const o = await place();
+      const first = sentFor(o.id)[0]!;
+      expect(JSON.parse(first.body)).toEqual({
+        sync: 'erp-orders',
+        event_id: first.headers['webhook-id'],
+        op: 'created',
+        local_id: o.id,
+        external_id: null,
+        version: 1,
+        data: { number: o.number, state: 'new', channel: 'web', store: null, total: 50, remark: 'no sugar' },
+        occurred_at: expect.any(String),
+      });
+      expect(first.body).not.toMatch(/Sari|811|customer/);
+      expect(await mapOf(o.id)).toMatchObject({ external_id: o.ext, local_version: 1 });
+    });
+
+    it('applies inbound changes through the commands, audited as integration, without echoing them back', async () => {
+      const o = await place();
+      const sent = sentFor(o.id).length;
+      // new -> confirmed -> preparing: two advance commands; the note goes through order.update.
+      expect(await inbound(o.ext, at(1), { state: 'preparing', remark: 'extra hot', total: 1, customer_name: 'Mallory' }, 'in1')).toEqual({ result: 'updated', winner: undefined, local_id: o.id, ignored_fields: ['total', 'customer_name'] });
+      expect(await row(o.id)).toEqual({ status: 'preparing', notes: 'extra hot', version: 4, customer_name: 'Sari Dewi' });
+      expect((await mapOf(o.id))!.local_version).toBe(4);
+      const advances = await audits(o.id, 'ordering:order.advance');
+      expect(advances).toHaveLength(2);
+      for (const a of [...advances, ...(await audits(o.id, 'ordering:order.update'))]) {
+        expect(a.correlation_id).toBe(`sync:${syncId}:in1`);
+        expect((a.data as { origin: string }).origin).toBe('integration');
+      }
+      await pump();
+      await pump();
+      expect(sentFor(o.id).length).toBe(sent); // loop prevention: nothing goes back to the ERP
+
+      // The same or an older remote change is stale; an unchanged value is not a write.
+      expect(await inbound(o.ext, at(1 - 60), { state: 'ready' }, 'in2')).toMatchObject({ result: 'stale' });
+      expect(await inbound(o.ext, at(2), { state: 'preparing' }, 'in3')).toMatchObject({ result: 'unchanged' });
+      // Cancelling uses the cancel command.
+      expect(await inbound(o.ext, at(3), { state: 'cancelled' }, 'in4')).toMatchObject({ result: 'updated' });
+      expect((await row(o.id)).status).toBe('cancelled');
+      expect((await audits(o.id, 'ordering:order.cancel'))[0]).toMatchObject({ correlation_id: `sync:${syncId}:in4`, data: { origin: 'integration' } });
+      // What the order's own rules refuse is refused as a whole; nothing is half applied.
+      await expect(inbound(o.ext, at(4), { state: 'ready', remark: 'late' }, 'in5')).rejects.toMatchObject({ status: 409, code: 'unreachable_status' });
+      await expect(inbound(o.ext, at(4), { state: 'teleported' }, 'in6')).rejects.toMatchObject({ status: 422, code: 'invalid_status' });
+      expect(await row(o.id)).toMatchObject({ status: 'cancelled', notes: 'extra hot' });
+      expect(await inbound(o.ext, at(5), {}, 'in7', { deleted: true })).toMatchObject({ result: 'ignored' });
+      expect((await row(o.id)).status).toBe('cancelled');
+    });
+
+    it('links an unmapped order by local_id, ignores unknown ones, and needs the command permission', async () => {
+      const made = await cmd(p, t, 'ordering', 'order.create', { channel: 'phone', lines: [{ sku: 'B', name: 'B', qty: 1, unit_price: 20 }] });
+      const id = made.body.id as string;
+      // No delivery yet, so no mapping: the remote names the order it means.
+      expect(await inbound('ERP-UNKNOWN', at(1), { state: 'confirmed' }, 'l1')).toMatchObject({ result: 'ignored', reason: expect.stringMatching(/not created through sync/) });
+      await expect(inbound('ERP-X', at(1), { state: 'confirmed' }, 'l2', { local_id: newId() })).rejects.toMatchObject({ status: 404 });
+      const viewer = await p.database.withTenant(t.tenantId, (tx) => principalFor(tx, p.catalog, t.tenantId, { id: newId(), role: 'Viewer' }));
+      await expect(inbound('ERP-77', at(1), { state: 'confirmed' }, 'l3', { local_id: id, principal: viewer })).rejects.toMatchObject({ status: 403, code: 'forbidden' });
+      expect(await mapOf(id)).toBeUndefined(); // the refused change left nothing behind
+      expect((await row(id)).status).toBe('new');
+      expect(await inbound('ERP-77', at(1), { state: 'confirmed' }, 'l4', { local_id: id })).toMatchObject({ result: 'updated', local_id: id });
+      expect(await mapOf(id)).toMatchObject({ external_id: 'ERP-77', local_version: 2 });
+      await expect(inbound('ERP-78', at(2), { state: 'preparing' }, 'l5', { local_id: id })).rejects.toMatchObject({ status: 409, code: 'already_linked' });
+      await pump();
+    });
+
+    it('resolves conflicts by the sync rule: platform_wins, remote_wins, last_write_wins', async () => {
+      const o = await place('first');
+      const localEdit = async (notes: string) => cmd(p, t, 'ordering', 'order.update', { id: o.id, version: (await row(o.id)).version, notes });
+
+      // Both sides changed since the last sync (the local edit is not delivered yet).
+      await setRule('platform_wins');
+      await localEdit('ours');
+      expect(await inbound(o.ext, at(-7200), { remark: 'theirs' }, 'c1')).toEqual({ result: 'conflict', winner: 'platform', local_id: o.id });
+      expect((await row(o.id)).notes).toBe('ours');
+      await pump();
+      const conflicts = await p.database.withTenant(t.tenantId, (tx) => tx.selectFrom('event_log').select('payload').where('type', '=', 'hub.sync_conflict').execute());
+      expect(conflicts.map((c) => (c.payload as { data: Record<string, unknown> }).data)).toContainEqual({ sync_id: syncId, local_id: o.id, external_id: o.ext, rule: 'platform_wins', winner: 'platform' });
+      await until(async () => (await mapOf(o.id))!.local_version === (await row(o.id)).version); // our edit reached the ERP
+
+      await setRule('remote_wins');
+      await localEdit('ours again');
+      expect(await inbound(o.ext, at(-5400), { remark: 'theirs', state: 'confirmed' }, 'c2')).toMatchObject({ result: 'conflict', winner: 'remote' });
+      expect(await row(o.id)).toMatchObject({ notes: 'theirs', status: 'confirmed' });
+
+      await setRule('last_write_wins');
+      await localEdit('newest is ours');
+      // The remote change is older than ours: ours stays. A later one wins.
+      expect(await inbound(o.ext, at(-3600), { remark: 'older' }, 'c3')).toMatchObject({ result: 'conflict', winner: 'platform' });
+      expect((await row(o.id)).notes).toBe('newest is ours');
+      expect(await inbound(o.ext, at(60), { remark: 'newest is theirs' }, 'c4')).toMatchObject({ result: 'conflict', winner: 'remote' });
+      expect((await row(o.id)).notes).toBe('newest is theirs');
+      // Only our own changes were delivered (the create and three edits), none of the four
+      // events the applied remote changes produced. A delivery carries the order's state at
+      // send time, so our last edit, sent after the remote won, repeats what the ERP has.
+      await pump();
+      await pump();
+      expect(sentFor(o.id).map((r) => JSON.parse(r.body).op)).toEqual(['created', 'updated', 'updated', 'updated']);
+      expect(JSON.parse(sentFor(o.id).at(-1)!.body).data).toMatchObject({ remark: 'newest is theirs', state: 'confirmed' });
+    });
   });
 });

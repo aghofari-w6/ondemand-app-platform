@@ -6,7 +6,7 @@ import { sql } from 'kysely';
 import * as oidc from 'openid-client';
 import type { PlatformConfig } from '../config.ts';
 import { BoundedCache } from './bounded-cache.ts';
-import type { Auth, Billing, Channel, Llm, Metrics, OidcSettings, Retriever, SamlSettings, Search, Telemetry, Vault } from '../ports/index.ts';
+import type { Auth, Billing, Channel, GmailTransport, Llm, LlmBlock, LlmChatResult, LlmMessage, Metrics, OidcSettings, SamlSettings, Search, TelegramTransport, Telemetry, Vault } from '../ports/index.ts';
 
 // ------------------------------------------------------------------ Search
 
@@ -115,8 +115,9 @@ export function createVault(keyB64: string | undefined, log: (m: string) => void
 // ------------------------------------------------------------------ Channel
 
 /** Demo mode: nothing is sent; the API returns the message so the UI can show it. */
-export function createChannel(demoMode: boolean, log: (m: string) => void): Channel {
+export function createChannel(demoMode: boolean, log: (m: string) => void, transports: { telegram: TelegramTransport; gmail: GmailTransport }): Channel {
   return {
+    ...transports,
     async send(msg) {
       if (!demoMode) {
         // An email/SMS provider client plugs in here. Without one we log and still show nothing sensitive.
@@ -197,7 +198,26 @@ export function createAuth(opts: { allowInsecureIssuers?: boolean } = {}): Auth 
 
 // ------------------------------------------------------------------ Llm (Claude)
 
-export function createLlm(apiKey: string | undefined, model: string, make: (apiKey: string) => Anthropic = (k) => new Anthropic({ apiKey: k })): Llm {
+type BetaParam = Anthropic.Beta.BetaMessageParam;
+type BetaBlockParam = Anthropic.Beta.BetaContentBlockParam;
+
+const toParam = (m: LlmMessage): BetaParam => ({
+  role: m.role,
+  content:
+    typeof m.content === 'string'
+      ? m.content
+      : m.content.map((b): BetaBlockParam => {
+          if (b.type === 'text') return { type: 'text', text: b.text };
+          if (b.type === 'tool_use') return { type: 'tool_use', id: b.id, name: b.name, input: b.input };
+          if (b.type === 'tool_result') return { type: 'tool_result', tool_use_id: b.tool_use_id, content: b.content, ...(b.is_error ? { is_error: true } : {}) };
+          // Thinking and fallback blocks go back exactly as the API returned them.
+          return b.raw as BetaBlockParam;
+        }),
+});
+
+const STOP: Record<string, LlmChatResult['stopReason']> = { end_turn: 'end_turn', stop_sequence: 'end_turn', tool_use: 'tool_use', max_tokens: 'max_tokens', refusal: 'refusal' };
+
+export function createLlm(apiKey: string | undefined, model: string, make: (apiKey: string) => Anthropic = (k) => new Anthropic({ apiKey: k }), opts: { fallbacks?: boolean } = {}): Llm {
   // One client (and connection pool) per process, created on first use.
   let client: Anthropic | null = null;
   return {
@@ -213,6 +233,36 @@ export function createLlm(apiKey: string | undefined, model: string, make: (apiK
       const text = res.content.map((b) => (b.type === 'text' ? b.text : '')).join('');
       return { text, model: res.model };
     },
+    /**
+     * One streamed model turn. Thinking stays adaptive (the model default) and tool choice
+     * is never forced. Tool inputs stream eagerly, so the caller validates each input
+     * against its schema and never runs tools of a `max_tokens` or `refusal` turn.
+     */
+    async chat(p) {
+      if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not configured');
+      client ??= make(apiKey);
+      const tools = (p.tools ?? []).map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema as Anthropic.Beta.BetaTool.InputSchema, eager_input_streaming: true }));
+      const stream = client.beta.messages.stream(
+        {
+          model,
+          max_tokens: p.maxTokens ?? 16_000,
+          system: p.system,
+          messages: p.messages.map(toParam),
+          ...(tools.length ? { tools } : {}),
+          // A policy decline is re-run on the default fallback model inside the same call.
+          ...(opts.fallbacks === false ? {} : { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' as const }),
+        },
+        p.signal ? { signal: p.signal } : undefined,
+      );
+      if (p.onText) stream.on('text', (delta) => p.onText!(delta));
+      const msg = await stream.finalMessage();
+      const content: LlmBlock[] = msg.content.map((b) => {
+        if (b.type === 'text') return { type: 'text', text: b.text };
+        if (b.type === 'tool_use') return { type: 'tool_use', id: b.id, name: b.name, input: (b.input ?? {}) as Record<string, unknown> };
+        return { type: 'opaque', raw: b };
+      });
+      return { content, stopReason: STOP[msg.stop_reason ?? ''] ?? 'other', usage: { inputTokens: msg.usage.input_tokens, outputTokens: msg.usage.output_tokens }, model: msg.model };
+    },
   };
 }
 
@@ -227,11 +277,3 @@ export function createBilling(cfg: PlatformConfig): Billing {
     trialDays: () => cfg.trial.days,
   };
 }
-
-// ------------------------------------------------------------------ Stubs (ports not used in Milestone A)
-
-const notYet = (port: string, milestone: string) => () => {
-  throw new Error(`${port} port has no adapter before ${milestone}`);
-};
-
-export const stubRetriever: Retriever = { retrieve: notYet('Retriever', 'the assistant milestone') };

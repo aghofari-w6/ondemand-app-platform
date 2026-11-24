@@ -444,10 +444,6 @@ export function AuditScreen() {
 
 export const PLANNED: Record<string, { title: string; pkg: string; milestone: string; what: string }> = {
   '/billing': { title: 'Billing and usage', pkg: 'Platform', milestone: 'Milestone F (phase 6)', what: 'Invoices paid through iPaymu, usage meters and plan limits. Plan changes are under Settings for now.' },
-  '/assistant': { title: 'Assistant', pkg: 'Bot', milestone: 'Milestone E (phase 5)', what: 'A Claude-based assistant that uses app tools within their risk tiers.' },
-  '/inbox': { title: 'Inbox', pkg: 'Omnichannel', milestone: 'Milestone E (phase 5)', what: 'Customer conversations from every channel.' },
-  '/channels': { title: 'Channels', pkg: 'Omnichannel', milestone: 'Milestone E (phase 5)', what: 'Connect Telegram, a Gmail mailbox and a live chat widget for your website.' },
-  '/bot-studio': { title: 'Bot Studio', pkg: 'Bot', milestone: 'Milestone E (phase 5)', what: 'Design and test conversational bots.' },
 };
 
 export function PlannedScreen({ path }: { path: string }) {

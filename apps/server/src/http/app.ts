@@ -18,6 +18,9 @@ import { hubRoutes } from './routes/hub.ts';
 import { workflowRoutes } from './routes/workflows.ts';
 import { analyticsRoutes, fileRoutes } from './routes/analytics.ts';
 import { governanceRoutes } from './routes/governance.ts';
+import { assistantRoutes } from './routes/assistant.ts';
+import { conversationRoutes } from './routes/conversations.ts';
+import { widgetRoutes } from './routes/widget.ts';
 import { opsRoutes } from './routes/ops.ts';
 import { tenantRoutes } from './routes/tenant.ts';
 import { userRoutes } from './routes/users.ts';
@@ -76,7 +79,7 @@ export async function buildApp(p: Platform): Promise<FastifyInstance> {
             level: p.env.LOG_LEVEL,
             // Signed download tokens are bearer credentials: never write them to logs.
             serializers: {
-              req: (req: { method: string; url: string; id: string }) => ({ method: req.method, url: req.url.replace(/([?&]token=)[^&]+/g, '$1[redacted]'), id: req.id }),
+              req: (req: { method: string; url: string; id: string }) => ({ method: req.method, url: req.url.replace(/([?&](?:token|user_hash|code|state)=)[^&]+/g, '$1[redacted]'), id: req.id }),
             },
           },
     genReqId: (req) => {
@@ -132,6 +135,9 @@ export async function buildApp(p: Platform): Promise<FastifyInstance> {
   await app.register(analyticsRoutes(p));
   await app.register(governanceRoutes(p));
   await app.register(fileRoutes(p));
+  await app.register(assistantRoutes(p));
+  await app.register(conversationRoutes(p));
+  await app.register(widgetRoutes(p));
   await app.register(apiKeyRoutes(p));
   await app.register(v1Routes(p));
 
@@ -139,7 +145,7 @@ export async function buildApp(p: Platform): Promise<FastifyInstance> {
   if (existsSync(dist)) {
     await app.register(fastifyStatic, { root: dist });
     app.setNotFoundHandler((req, reply) => {
-      if (req.method === 'GET' && !req.url.startsWith('/api/') && !req.url.startsWith('/v1/')) return reply.sendFile('index.html');
+      if (req.method === 'GET' && !req.url.startsWith('/api/') && !req.url.startsWith('/v1/') && !req.url.startsWith('/widget/') && !req.url.startsWith('/hooks/')) return reply.sendFile('index.html');
       return reply.code(404).send({ error: 'not_found', message: 'not found' });
     });
   }

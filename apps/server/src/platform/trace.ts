@@ -4,14 +4,15 @@ import type { Tx } from '../db/database.ts';
 /**
  * Trace viewer: everything that happened under one correlation id, as a timeline —
  * command (audit) → events → consumers → workflow runs/nodes → Hub deliveries →
- * approvals. The query may be a correlation id, an event id, a record id, a workflow
- * run id or an approval request id. Event data is not returned (only metadata), so the
+ * approvals, plus assistant tool calls, customer messages and bot flow nodes. The query
+ * may be a correlation id, an event id, a record id, a workflow run id, an approval
+ * request id or a conversation id. Event data is not returned (only metadata), so the
  * trace never shows field values the viewer could not read elsewhere.
  */
 
 export interface TraceItem {
   at: string;
-  kind: 'audit' | 'event' | 'consumer' | 'run' | 'node' | 'delivery' | 'approval' | 'decision';
+  kind: 'audit' | 'event' | 'consumer' | 'run' | 'node' | 'delivery' | 'approval' | 'decision' | 'tool' | 'message' | 'bot';
   title: string;
   detail: string;
   status?: string;
@@ -32,6 +33,11 @@ async function correlationsFor(tx: Tx, q: string): Promise<string[]> {
   if (run) found.add(run.correlation_id);
   const ap = await tx.selectFrom('approval_request').select('correlation_id').where('id', '=', q).executeTakeFirst();
   if (ap?.correlation_id) found.add(ap.correlation_id);
+  if (!found.size) {
+    // A customer conversation: its most recent chains.
+    const msgs = await tx.selectFrom('conv_message').select(['correlation_id', 'seq']).where('conversation_id', '=', q).where('correlation_id', 'is not', null).orderBy('seq', 'desc').limit(20).execute();
+    for (const m of msgs) if (found.size < 5) found.add(m.correlation_id);
+  }
   if (!found.size) {
     // A record id: the most recent chains that touched it.
     const recs = await tx.selectFrom('event_log').select([sql<string>`payload ->> 'correlation_id'`.as('c'), 'seq']).where('aggregateid', '=', q).orderBy('seq', 'desc').limit(20).execute();
@@ -101,7 +107,16 @@ export async function traceQuery(tx: Tx, rawQuery: string) {
     for (const d of decisions) items.push({ at: iso(d.at), kind: 'decision', title: `${d.name} ${d.decision === 'approve' ? 'approved' : 'rejected'}`, detail: '', status: d.decision, correlation_id: aCorr.get(d.request_id)!, ids: { request_id: d.request_id, decision_id: d.id } });
   }
 
-  const order: Record<TraceItem['kind'], number> = { audit: 0, event: 1, consumer: 2, run: 3, node: 4, approval: 5, decision: 6, delivery: 7 };
+  // Milestone E: what the assistant, the channels and the bots did under these correlation ids.
+  // Only metadata: never message text or tool inputs.
+  const tools = await tx.selectFrom('assistant_tool_call').select(['id', 'tool', 'risk', 'status', 'created_at', 'decided_at', 'correlation_id', 'conversation_id', 'approval_request_id']).where('correlation_id', 'in', correlations).orderBy('created_at').limit(200).execute();
+  for (const t of tools) items.push({ at: iso(t.created_at), kind: 'tool', title: `Assistant tool: ${t.tool}`, detail: `risk ${t.risk}${t.decided_at ? ` · decided ${iso(t.decided_at)}` : ''}`, status: t.status, correlation_id: t.correlation_id, ids: { tool_call_id: t.id, assistant_conversation_id: t.conversation_id, ...(t.approval_request_id ? { request_id: t.approval_request_id } : {}) } });
+  const messages = await tx.selectFrom('conv_message as m').innerJoin('conversation as c', 'c.id', 'm.conversation_id').select(['m.id', 'm.direction', 'm.author_type', 'm.delivery', 'm.created_at', 'm.correlation_id', 'm.conversation_id', 'c.channel']).where('m.correlation_id', 'in', correlations).orderBy('m.seq').limit(200).execute();
+  for (const m of messages) items.push({ at: iso(m.created_at), kind: 'message', title: m.direction === 'in' ? `Customer message (${m.channel})` : m.direction === 'note' ? 'Internal note' : `Reply to customer (${m.channel})`, detail: `from ${m.author_type}`, ...(m.direction === 'out' ? { status: m.delivery } : {}), correlation_id: m.correlation_id!, ids: { message_id: m.id, conversation_id: m.conversation_id } });
+  const botSteps = await tx.selectFrom('bot_step').select(['id', 'node_id', 'port', 'flow_id', 'number', 'conversation_id', 'correlation_id', 'at']).where('correlation_id', 'in', correlations).orderBy('at').limit(200).execute();
+  for (const b of botSteps) items.push({ at: iso(b.at), kind: 'bot', title: `Bot node ${b.node_id}`, detail: `flow version ${b.number}${b.port ? ` · → ${b.port}` : ''}`, correlation_id: b.correlation_id!, ids: { flow_id: b.flow_id, conversation_id: b.conversation_id } });
+
+  const order: Record<TraceItem['kind'], number> = { audit: 0, event: 1, consumer: 2, run: 3, node: 4, approval: 5, decision: 6, delivery: 7, tool: 3, message: 2, bot: 4 };
   items.sort((a, b) => a.at.localeCompare(b.at) || order[a.kind] - order[b.kind]);
   return { query: q, correlation_ids: correlations, items, truncated: audit.length >= 500 || events.length >= 500 };
 }

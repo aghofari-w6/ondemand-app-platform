@@ -12,6 +12,10 @@ import { ApprovalsScreen, TraceViewerScreen } from './screens/operations';
 import { DashboardsScreen, ReportsScreen } from './screens/analytics';
 import { DataGovernanceScreen } from './screens/governance';
 import { WorkflowEditorScreen, WorkflowRunScreen, WorkflowsScreen } from './screens/workflows';
+import { AssistantScreen } from './screens/assistant';
+import { InboxScreen } from './screens/inbox';
+import { ChannelsScreen } from './screens/channels';
+import { BotFlowEditorScreen, BotStudioScreen } from './screens/botstudio';
 
 const root = createRootRoute({ component: () => <Outlet /> });
 
@@ -55,6 +59,11 @@ const routeTree = root.addChildren([
     r('/dashboards', DashboardsScreen),
     r('/reports', ReportsScreen),
     r('/data-governance', DataGovernanceScreen),
+    r('/assistant', AssistantScreen),
+    r('/inbox', InboxScreen),
+    r('/channels', ChannelsScreen),
+    r('/bot-studio', BotStudioScreen),
+    r('/bot-studio/$id', BotFlowEditorScreen),
     ...Object.keys(PLANNED).map((path) => r(path, () => <PlannedScreen path={path} />)),
   ]),
 ]);

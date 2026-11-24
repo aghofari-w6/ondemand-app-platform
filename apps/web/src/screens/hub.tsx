@@ -431,6 +431,9 @@ function SyncsPanel() {
   const model = useQuery({ queryKey: ['data-model'], queryFn: () => api('/api/data-model') });
   const [f, setF] = useState({ name: '', entity: '', endpoint_id: '', conflict_rule: 'platform_wins', field_map: '{}' });
   const [error, setError] = useState<string | null>(null);
+  // App entities whose manifest declares two-way sync (e.g. Ordering orders).
+  const targets: { id: string; label: string; events: string[]; fields: string[]; inbound_fields: string[] }[] = list.data?.targets ?? [];
+  const target = targets.find((t) => t.id === f.entity);
   return (
     <div className="grid gap-4 lg:grid-cols-2">
       <Card title="Syncs">
@@ -461,7 +464,12 @@ function SyncsPanel() {
           }}
         >
           <TextField label="Name" value={f.name} onChange={(v) => setF({ ...f, name: v })} />
-          <Select label="Custom entity" value={f.entity || null} onChange={(v) => setF({ ...f, entity: v })} options={(model.data?.entities ?? []).map((e: any) => ({ id: e.key, label: e.label }))} />
+          <Select label="Entity" value={f.entity || null} onChange={(v) => setF({ ...f, entity: v })} options={[...(model.data?.entities ?? []).map((e: any) => ({ id: e.key, label: e.label })), ...targets.map((t) => ({ id: t.id, label: t.label }))]} />
+          <p className="text-sm text-muted">
+            {target
+              ? `Sends ${target.fields.join(', ')}. Accepts ${target.inbound_fields.join(', ') || 'nothing'}; records are never created or deleted by the other system. The endpoint must subscribe to ${target.events.join(', ')}.`
+              : 'Choose a custom entity, or an app entity that supports sync (for example Ordering orders).'}
+          </p>
           <Select label="Outbound endpoint" value={f.endpoint_id || null} onChange={(v) => setF({ ...f, endpoint_id: v })} options={(eps.data?.endpoints ?? []).filter((e: any) => ['webhook', 'rest_push'].includes(e.kind)).map((e: any) => ({ id: e.id, label: e.name }))} />
           <Select label="When both sides changed" value={f.conflict_rule} onChange={(v) => setF({ ...f, conflict_rule: v })} options={[{ id: 'platform_wins', label: 'Keep our change' }, { id: 'remote_wins', label: 'Take their change' }, { id: 'last_write_wins', label: 'Latest change wins' }]} />
           <TextField label="Field map (JSON, our field → their field)" value={f.field_map} onChange={(v) => setF({ ...f, field_map: v })} />

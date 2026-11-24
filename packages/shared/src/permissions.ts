@@ -47,6 +47,15 @@ export const PLATFORM_PERMISSIONS: PermissionDef[] = [
   { id: 'platform:analytics.manage', label: 'Build and share dashboards and reports', level: 'manage' },
   { id: 'platform:governance.read', label: 'See the PII inventory, access review and retention', level: 'admin' },
   { id: 'platform:governance.manage', label: 'Run retention and data subject requests, export the audit log', level: 'admin' },
+  { id: 'platform:assistant.use', label: 'Use the assistant', level: 'operate' },
+  { id: 'platform:knowledge.manage', label: 'Manage documents and help articles the assistant and bots quote', level: 'manage' },
+  { id: 'platform:inbox.read', label: 'See customer conversations', level: 'operate' },
+  { id: 'platform:inbox.reply', label: 'Reply to customers, add notes and take conversations', level: 'operate' },
+  { id: 'platform:inbox.manage', label: 'Assign conversations to others and manage canned replies', level: 'manage' },
+  { id: 'platform:channels.read', label: 'See connected channels', level: 'manage' },
+  { id: 'platform:channels.manage', label: 'Connect and remove Telegram, Gmail and web chat channels', level: 'admin' },
+  { id: 'platform:bots.read', label: 'See bot flows', level: 'manage' },
+  { id: 'platform:bots.manage', label: 'Build, test and publish bot flows', level: 'manage' },
 ];
 
 export const ROLE_PRESETS = ['Owner', 'Admin', 'Manager', 'Staff', 'Viewer'] as const;

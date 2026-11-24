@@ -16,6 +16,11 @@ import { saveDashboard } from '../src/platform/analytics/dashboards.ts';
 import { ensureMetrics, reconcileTenant } from '../src/platform/analytics/metrics.ts';
 import { runReport, saveReport } from '../src/platform/analytics/reports.ts';
 import { runDsr, saveRetentionPolicy } from '../src/platform/governance.ts';
+import { createConversation, sendMessage } from '../src/platform/assistant/agent.ts';
+import { createFlow, publishFlow } from '../src/platform/bot/flows.ts';
+import { createWidget } from '../src/platform/conversations/channels.ts';
+import { ingestMessage, saveCanned } from '../src/platform/conversations/inbox.ts';
+import { createSource, indexSource } from '../src/platform/knowledge.ts';
 import { admin, closePlatform, cmd, newTenant, runSaga, setPlan, testPlatform, type TestTenant } from './helpers.ts';
 
 /**
@@ -101,6 +106,30 @@ async function populatePhase2(t: TestTenant) {
   }).then((client) => clientCredentialsGrant(p, client.client_id, client.client_secret));
   await populatePhase3(t);
   await populatePhase4(t);
+  await populatePhase5(t);
+}
+
+/**
+ * Milestone E tables: a knowledge source with embedded chunks, an assistant conversation
+ * with a tool call, a widget channel, a bot flow that answers a customer message (contact,
+ * identity, conversation, messages, bot steps) and a canned reply.
+ */
+async function populatePhase5(t: TestTenant) {
+  const c = () => randomUUID();
+  const tag = t.tenantId.slice(0, 8);
+  const src = await p.database.withTenant(t.tenantId, (tx) => createSource(p, tx, t.tenantId, t.owner, { kind: 'help', title: `Returns ${tag}`, body: `Returns for workspace ${tag} are accepted within 14 days with a receipt.`, public: true }, c()));
+  await indexSource(p, { tenantId: t.tenantId, sourceId: src.id });
+  const chat = await p.database.withTenant(t.tenantId, (tx) => createConversation(p, tx, t.tenantId, t.owner, {}, c()));
+  await sendMessage(p, { tenantId: t.tenantId, principal: t.owner, conversationId: chat.id, text: 'Which open orders do we have?', correlationId: c(), emit: () => {} });
+  const flow = await p.database.withTenant(t.tenantId, (tx) => createFlow(p, tx, t.tenantId, t.owner, { name: 'Iso', template: 'order_status', channels: ['widget'] }, c()));
+  await p.database.withTenant(t.tenantId, (tx) => publishFlow(p, tx, t.tenantId, t.owner, flow.id, 1, 'Viewer', c()));
+  const w = await p.database.withTenant(t.tenantId, (tx) => createWidget(p, tx, t.tenantId, t.owner, { name: 'Iso', allowed_origins: ['https://iso.example'] }, c()));
+  await ingestMessage(p, t.tenantId, { id: w.id, kind: 'widget', config: {} }, { threadKey: `visitor:${tag}`, externalId: `w:${c()}`, text: 'where is my order 1001?', contact: { name: null }, identities: [{ kind: 'widget_visitor', value: `${w.id}:${tag}`, verified: false }], correlationId: c() });
+  await p.database.withTenant(t.tenantId, (tx) => saveCanned(p, tx, t.tenantId, t.owner, { title: 'Iso', body: 'Hello' }, c()));
+  for (let i = 0; i < 3; i++) {
+    await p.ports.eventBus.drain();
+    await p.jobs.runAll();
+  }
 }
 
 /** Milestone D tables: metrics (rebuild + reconciliation), dashboard, report + run + file, retention, DSR. */
@@ -244,6 +273,20 @@ describe('tenant isolation (RLS)', () => {
       .then(() => null)
       .catch((e: Error) => e.message);
     expect(ins).toMatch(/row-level security/);
+  });
+
+  it('knowledge retrieval never crosses tenants (vector and full-text search)', async () => {
+    for (const [mine, other] of [[A, B], [B, A]] as const) {
+      // The query names the OTHER tenant's document: the best match in the table is not ours.
+      const hits = (await p.ports.retriever.retrieve(mine.tenantId, `returns for workspace ${other.tenantId.slice(0, 8)} receipt`, 10)).hits;
+      expect(hits.length).toBeGreaterThan(0);
+      expect(hits.map((h) => h.title)).toContain(`Returns ${mine.tenantId.slice(0, 8)}`);
+      expect(hits.map((h) => h.title)).not.toContain(`Returns ${other.tenantId.slice(0, 8)}`);
+      const own = await p.database.withTenant(mine.tenantId, (tx) => tx.selectFrom('doc_chunk').select('id').where('id', 'in', hits.map((h) => h.id)).execute());
+      expect(own).toHaveLength(hits.length);
+      const visible = await p.database.withTenant(other.tenantId, (tx) => tx.selectFrom('doc_chunk').select('id').where('id', 'in', hits.map((h) => h.id)).execute());
+      expect(visible).toEqual([]);
+    }
   });
 
   it('audit_log is append-only for the app role', async () => {

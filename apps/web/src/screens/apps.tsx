@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
-import { useParams } from '@tanstack/react-router';
+import { Link, useParams } from '@tanstack/react-router';
 import { useState, type FormEvent } from 'react';
+import { can, useMe } from '../components/shell';
 import { allowed, AppGate, Detail, runCommand, Workspace, type AppMeta } from '../components/workspace';
 import { Alert, Button, Card, ModalDialog, PageHeader, Select, TextField } from '../components/ui';
 import { api, ApiError, money } from '../lib/api';
@@ -130,8 +131,14 @@ export function OrderDetailScreen() {
 
 function OrderActions({ meta, order, refresh }: { meta: AppMeta; order: any; refresh: () => void }) {
   const { exec, error } = useCommand('ordering', refresh);
+  const me = useMe();
   return (
     <>
+      {can(me.data, 'platform:assistant.use') && (
+        <Link to={`/assistant?explain=${encodeURIComponent(`ordering::Order:${order.id}`)}`} className="inline-flex min-h-11 items-center rounded-lg border border-line bg-white px-4 text-sm font-medium text-accent">
+          Explain with the assistant
+        </Link>
+      )}
       {NEXT[order.status] && allowed(meta, 'order.advance') && <Button onPress={() => exec('order.advance', { id: order.id, version: order.version })}>{NEXT[order.status]}</Button>}
       {!['cancelled', 'completed'].includes(order.status) && allowed(meta, 'order.cancel') && (
         <Button variant="danger" onPress={() => exec('order.cancel', { id: order.id, version: order.version, reason: 'Cancelled by staff' })}>

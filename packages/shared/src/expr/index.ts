@@ -321,6 +321,8 @@ export const FUNCTIONS: Record<string, Fn> = {
     },
   },
   string: { arity: [1, 1], impl: ([a]) => str(a!) },
+  /** the first run of digits in a text (e.g. an order number in a sentence), or null */
+  digits: { arity: [1, 1], impl: ([a]) => /\d+/.exec(str(a!))?.[0] ?? null },
   now: { arity: [0, 0], impl: (_a, ctx) => new Date(ctx.now()).toISOString() },
   daysBetween: {
     arity: [2, 2],

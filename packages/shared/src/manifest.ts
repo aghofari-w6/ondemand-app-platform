@@ -112,6 +112,35 @@ export const AssistantTool = z.object({
   view: ident.optional(),
 });
 
+const commandName = z.string().regex(/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/);
+
+/**
+ * Two-way sync declaration (Integration Hub): which entity can be synced with an external
+ * system and how a change pushed by that system maps to this app's commands. The platform
+ * only follows the declaration; it knows nothing about the entity's semantics.
+ *
+ * Outbound: when one of `events` is delivered to a sync's endpoint, the body carries
+ * `fields` read from the entity's table. Inbound: `update.fields` are written with the
+ * update command; a new value of `status.field` runs the cancel command when it equals
+ * `cancel.value`, otherwise the advance command once per step until the value is reached.
+ * Every named command takes `{ id, version }` (the update command also the changed fields).
+ * PII fields may not be listed: they never leave through a sync body.
+ */
+export const SyncDecl = z.object({
+  entity: ident,
+  events: z.array(eventType).min(1),
+  fields: z.array(ident).min(1),
+  update: z.object({ command: commandName, fields: z.array(ident).min(1) }).optional(),
+  status: z
+    .object({
+      field: ident,
+      advance: commandName.optional(),
+      cancel: z.object({ command: commandName, value: z.string().min(1) }).optional(),
+    })
+    .optional(),
+});
+export type SyncDecl = z.infer<typeof SyncDecl>;
+
 export const Release = z.object({
   version: semver,
   channel: z.enum(['stable', 'canary']),
@@ -161,6 +190,7 @@ export const Manifest = z.object({
   }),
   permissions: z.array(ManifestPermission).min(1),
   links: z.array(LinkDecl).default([]),
+  sync: z.array(SyncDecl).default([]),
   config: z.record(z.string(), z.unknown()).default({}),
 });
 export type Manifest = z.infer<typeof Manifest>;
@@ -287,6 +317,35 @@ export function validateManifest(raw: unknown, migrationSources?: Record<string,
       const top = path.split('.')[1]!;
       if (ev && ev.data.length && !ev.data.includes(top)) problems.push(`link ${l.rel}: ${l.on} has no data.${top}`);
     }
+  }
+  const synced = new Set<string>();
+  for (const s of m.sync) {
+    const where = `sync ${s.entity}`;
+    const ent = entities.get(s.entity);
+    if (!ent) {
+      problems.push(`${where}: unknown entity`);
+      continue;
+    }
+    if (synced.has(s.entity)) problems.push(`${where}: declared twice`);
+    synced.add(s.entity);
+    if (!ent.workspace) problems.push(`${where}: only workspace entities (id, version) can be synced`);
+    const own = new Set(m.events.publishes.filter((e) => e.entity === s.entity).map((e) => e.type));
+    for (const ev of s.events) if (!own.has(ev)) problems.push(`${where}: event ${ev} is not published by this entity`);
+    const field = (key: string) => ent.fields.find((f) => f.key === key);
+    for (const key of new Set([...s.fields, ...(s.update?.fields ?? []), ...(s.status ? [s.status.field] : [])])) {
+      const f = field(key);
+      if (!f) problems.push(`${where}: unknown field ${key}`);
+      else if (f.pii) problems.push(`${where}: field ${key} is PII and may not be synced`);
+    }
+    for (const c of [s.update?.command, s.status?.advance, s.status?.cancel?.command]) {
+      if (!c) continue;
+      const cmd = m.commands.find((x) => x.name === c);
+      if (!cmd) problems.push(`${where}: unknown command ${c}`);
+      else if (cmd.entity !== s.entity) problems.push(`${where}: command ${c} belongs to entity ${cmd.entity}`);
+    }
+    if (s.status && !s.status.advance && !s.status.cancel) problems.push(`${where}: status needs an advance or a cancel command`);
+    const options = s.status ? field(s.status.field)?.options : undefined;
+    if (s.status?.cancel && options && !options.includes(s.status.cancel.value)) problems.push(`${where}: cancel value ${s.status.cancel.value} is not an option of ${s.status.field}`);
   }
   for (const e of m.entities) {
     if (e.title_field && !e.fields.some((f) => f.key === e.title_field)) problems.push(`entity ${e.name}: title_field ${e.title_field} is not a field`);

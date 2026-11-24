@@ -18,14 +18,18 @@ External services are only called as API clients. Synthetic data only; never com
 | A | Week 0 + phase 1 (journey J1) | merged |
 | B | Phase 2: Data studio, custom entities, link index, Integration Hub, public `/v1` | merged |
 | C | Phase 3: workflows on a visual canvas, Approvals, Trace viewer | merged |
-| D | Phase 4: dashboards, reports, data governance | this branch |
+| D | Phase 4: dashboards, reports, data governance | merged |
+| E | Phase 5: Assistant with pgvector retrieval, Inbox, Channels (Telegram, Gmail, web chat widget), Bot Studio | this branch |
+| F | Phase 6: billing and usage (iPaymu), hardening, launch readiness | not started |
 
 Screens for later milestones are in the navigation and show an empty state naming the
 owning package and milestone.
 
 ## Run it
 
-Requirements: Node.js 24+, pnpm 10, PostgreSQL 17 (or `docker compose`).
+Requirements: Node.js 24+, pnpm 10, PostgreSQL 16 or 17 **with the pgvector extension**
+(`pgvector/pgvector:pg17` in CI and `docker compose`; `apt install postgresql-16-pgvector` locally;
+0.8+ recommended, older versions fall back to exact vector scans).
 
 ```bash
 pnpm install
@@ -61,6 +65,16 @@ builder; defaults to `MIGRATION_DATABASE_URL`), `HUB_ALLOW_PRIVATE_HOSTS` (dev/t
 `HUB_MAX_ATTEMPTS`, `HUB_BACKOFF_BASE_MS`, `HUB_BREAKER_THRESHOLD`, `HUB_BREAKER_COOLDOWN_MS`,
 `HUB_INTERVAL_MS`.
 
+Conversations (Milestone E): `LLM_ADAPTER` (`claude` | `fake`; `fake` is the scripted model
+used in CI, e2e and `docker compose`), `CLAUDE_FALLBACKS` (server-side refusal fallbacks,
+default on), `EMBEDDINGS_ADAPTER` (`voyage` | `fake`; defaults to `fake` without a key),
+`VOYAGE_API_KEY`, `EMBEDDINGS_MODEL`, `EMBEDDINGS_DIM` (must equal the `vector(n)` column:
+1024), `TELEGRAM_API_URL`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
+`GOOGLE_OAUTH_URL`, `GOOGLE_TOKEN_URL`, `GMAIL_API_URL`, `GMAIL_POLL_SECONDS` (default 30),
+`CHANNEL_INTERVAL_MS`. Keys and OAuth secrets live in the deployment's secret store, never
+in the repository. Until live checks are approved (plan decision 6) Telegram, Google and
+Voyage are only ever called as mock servers in tests.
+
 ## Tests
 
 ```bash
@@ -76,7 +90,7 @@ pnpm test:integration     # creates a fresh aod_test database (TEST_ADMIN_URL)
 ```
 
 ```bash
-pnpm e2e                  # Playwright J1, phase 2, J3 and J4 journeys + axe (needs a migrated `aod` database)
+pnpm e2e                  # Playwright J1, phase 2, J3, J4 and J5 journeys + axe (needs a migrated `aod` database)
 ```
 
 The integration suite includes the contracts that must hold from day one:
@@ -123,6 +137,27 @@ The integration suite includes the contracts that must hold from day one:
   exported without PII and left untouched by an erase, audit export paging), and links
   to report files and exports only for those allowed to see them. Kafka and SFTP run against
   Redpanda and atmoz/sftp containers in CI.
+- Phase 5 (`assistant.int.test.ts`, `conversations.int.test.ts`, plus the Hub file for the
+  order sync): knowledge retrieval on pgvector + full text (citations, documents from
+  Files, a tenant never retrieving another tenant's chunks even when those are the nearest
+  vectors, public vs internal sources, record chunks without PII, full-text answers during
+  an embeddings outage and the backfill after it, the Voyage adapter against a mock);
+  the assistant (read tools run as the user, low risk waits for a confirmation, high risk
+  for an approval and then runs as the requester exactly once, rejection, a permission
+  lost before approval, cut-off and refused model turns, instructions inside documents
+  treated as data, a model that obeys an injection still stopped by the risk tier, token
+  limits per tenant, private conversations, the SSE route); channels against mock
+  Telegram and Google servers (secret-token webhook, idempotent updates, threaded replies,
+  retries with backoff, dead letters and retry, undecryptable secrets, Gmail OAuth with a
+  signed state, History API polling, attachments in Files, `In-Reply-To`/`References`,
+  an expired history cursor, revoked access → reconnect); the web widget (allowed origins,
+  CORS and `frame-ancestors`, signed sessions, HMAC identity verification, rate and size
+  limits, encrypted email capture, live events); the Inbox (plan and permissions,
+  assignment, statuses with versions, canned replies, SLA timers, linked-record updates
+  posted once); Bot Studio flows (validation, a service role capped at the publisher,
+  rollback, J5 on the widget, Telegram and Gmail, `ask` nodes, the guardrailed assistant
+  refusing a prompt injection, exactly-once turns, the test console); and two-way sync for
+  orders (conflict rules, no echo, PII never in the body).
 
 CI (`.github/workflows/ci.yml`) runs all of it in one job against a Postgres 17 service
 (plus a test-only Redis service for the Redis Streams adapter). The e2e suite has four
@@ -132,7 +167,13 @@ outline → test run → publish → approval by a second manager → execution 
 J4 (dashboards with a store filter → scheduled report and CSV export → retention → data
 subject export and erase → audit export),
 with axe checks on every screen. A second CI job builds the Docker image, runs it against
-a migrated database and waits for `/api/health`.
+a migrated database and waits for `/api/health`. The fifth journey, J5: a visitor asks the web
+widget where their order is and the bot flow answers; asking to cancel hands over to the
+Inbox; staff ask the assistant to cancel, a second manager approves, the order is cancelled
+and the visitor is told; the same question by Telegram and Gmail (mock APIs) is answered in
+the right thread; a policy question is answered with a citation from an uploaded document;
+a prompt injection is refused; the Trace viewer shows the chain. Both jobs use the
+`pgvector/pgvector:pg17` image.
 
 ## Layout
 
@@ -140,10 +181,12 @@ a migrated database and waits for `/api/health`.
 apps/server/        Fastify API + SSE; starts the outbox dispatcher and pg-boss workers in-process
   src/db/           Kysely database, tenant-scoped transactions, migrate script
   src/ports/        Port interfaces (EventBus, Search, Metrics, Jobs, Webhooks, Channel, Auth,
-                    Vault, Files, Telemetry, Llm, Retriever, Sandbox, Billing)
+                    Vault, Files, Telemetry, Llm, Embeddings, Retriever, Sandbox, Billing,
+                    OutboundHttp, RateLimit, Realtime)
   src/adapters/     One prototype adapter per port (stubs only for ports unused in Milestone A)
   src/platform/     Catalog, command pipeline, outbox, audit, consumers, provisioning saga,
-                    tenant lifecycle, workspaces, custom fields
+                    tenant lifecycle, workspaces, custom fields, …, knowledge, assistant/,
+                    conversations/ (channels, inbox), bot/ (flows, runner)
   src/http/         Routes
 apps/web/           React 19 SPA (TanStack Router/Query, React Aria Components, Tailwind 4)
 packages/shared/    Zod schemas, event envelope, manifest schema + validator, permission
@@ -302,6 +345,75 @@ back compensates completed steps in reverse. Deprovisioning is the reverse saga 
   policies (anonymise PII on app entities, anonymise or delete custom records; audited
   nightly jobs), data subject requests (find by email or phone across apps and the link
   index; export JSON or erase PII while amounts and the audit log stay), audit-log export.
+
+## Phase 5 in one page
+
+**Knowledge retrieval (Retriever port, pgvector).** Help articles, text documents (stored
+through the Files port) and custom records become `doc_source` rows, chunked into
+`doc_chunk` with a generated `tsvector` and an `embedding vector(1024)` behind one shared
+HNSW index. Retrieval fuses cosine distance with full-text rank (reciprocal-rank fusion),
+runs under RLS and also filters by `tenant_id`, with pgvector's iterative index scans so
+the tenant filter keeps recall. Embeddings come from the `Embeddings` adapter: Voyage AI as
+an API client (document / query input types, retries with backoff, model and dimension
+from config) or a deterministic fake in CI and local runs. Chunks are stored before they
+are embedded, so full-text search answers during an embeddings outage and a sweep
+backfills. Sources are internal or public; bots only ever quote public ones. Record chunks
+hold only fields every role may read (never PII) and need `platform:records.read`.
+
+**Assistant (Bot package).** A tool-use loop on the `Llm` port (Claude, model from
+`CLAUDE_MODEL`; streamed, adaptive thinking, no forced tool choice, server-side refusal
+fallbacks; a scripted fake in CI). Tools are generated from the active apps' manifest
+`assistant.tools` (views are read tools, commands keep their risk tier) plus knowledge
+search, custom records and Hub status. Every tool runs as the signed-in user through
+`authorize()`: the model only sees tools the user holds, and each execution is checked
+again. `read` runs at once; `low` waits for the user to confirm in the chat; `high`
+creates an approval request (the Milestone C service) and, once another approver decides,
+runs as the requester with the permissions they hold then, exactly once. Tool results and
+retrieved passages reach the model only as tool results (data). PII fields are dropped
+from what the model sees. The transcript is append-only. Token usage is metered per tenant
+and month against the plan's limit. Every tool call is audited with origin `assistant`
+under the turn's correlation id, so the Trace viewer shows the chain. The chat streams
+over Server-Sent Events.
+
+**Channels (Omnichannel package, Channel port).** Telegram: Bot API client, webhook
+verified by its secret token, bot token in the vault. Gmail: OAuth with offline access (the
+deployment's Google client), refresh token in the vault, History API polling through
+pg-boss (30 s by default), replies with `threadId`, `In-Reply-To` and `References`,
+attachments stored through Files; a revoked or expired grant turns the channel into
+"reconnect Gmail". Web chat widget: an embeddable script and an accessible chat frame
+served by the platform, per-widget keys and allowed origins (CORS + `frame-ancestors`),
+signed visitor sessions, optional email capture, HMAC identity verification for signed-in
+site users, SSE + POST, rate limits per visitor and tenant. Every outbound API call goes
+through one policed HTTP client (SSRF check, timeouts, capped responses). Outbound
+messages are queued with attempts, backoff, a dead letter and a retry from the Inbox.
+
+**Inbox.** Conversations from all channels with contacts resolved by keyed hashes of the
+identities each channel establishes itself (mail sender, Telegram user, signed widget
+session, HMAC-verified site user; email and phone are encrypted at rest). An address a
+visitor types into the widget is only a claim: it never merges contacts, agents get a
+"possibly the same person" hint. Also: assignment, statuses with optimistic
+versions, internal notes, canned replies, first-response SLA timers, live updates over
+SSE, and links to orders and shipments through the link index. A record a customer names to a bot is linked as
+"mentioned"; once an agent confirms the link, the customer gets an update in their
+conversation when that record changes status. Message text never
+enters event data or the audit log.
+
+**Bot Studio.** Bot flows on the workflow canvas (and its keyboard outline) with the node
+types `message`, `ask`, `lookup`, `ask_assistant`, `handoff`, `condition` and `switch`;
+draft / publish / rollback with version history; a test console that stores and sends
+nothing. A published flow looks things up with a service role capped at its publisher.
+Lookups match exactly one record by its non-PII title field (an order number), never a
+prefix or a name. A turn is computed without a transaction (lookups, the model call) and
+applied once.
+`ask_assistant` is the guardrailed customer assistant: no tools, public knowledge only,
+the customer's text wrapped as data.
+
+**Two-way sync for orders.** A manifest `sync` declaration lets the Hub sync an app entity:
+outbound bodies carry declared non-PII fields; inbound changes run the declared commands
+with origin `integration` under the same conflict rules as custom records.
+
+Live-readiness checklists for Claude, Telegram, Voyage AI and Gmail are in
+`docs/implementation-kit/plan-phases-3-6.md` (section 10); none has been run.
 
 ## Decisions worth knowing
 

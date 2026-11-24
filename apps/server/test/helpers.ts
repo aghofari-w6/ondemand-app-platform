@@ -8,6 +8,7 @@ import type { Logger, Platform } from '../src/platform/context.ts';
 import { createPlatform } from '../src/platform/create.ts';
 import { runBackfill } from '../src/platform/maintenance.ts';
 import { rebuildMetric } from '../src/platform/analytics/metrics.ts';
+import { registerConversationJobs } from '../src/platform/conversations/jobs.ts';
 import { enqueueStep, handleStepJob, SAGAS, startRun, type RunKind } from '../src/platform/provisioning.ts';
 import { QUEUES } from '../src/platform/queues.ts';
 import { changeTenantStatus, handleLifecycleJob, signup } from '../src/platform/tenants.ts';
@@ -18,8 +19,8 @@ export const silent: Logger = { info: () => {}, warn: () => {}, error: () => {} 
 export { InlineJobs as MemJobs } from '../src/adapters/inline-jobs.ts';
 import { InlineJobs as MemJobs } from '../src/adapters/inline-jobs.ts';
 
-export function testPlatform(): Platform & { jobs: MemJobs } {
-  const p = createPlatform({ env: { DATABASE_URL: APP_URL, MIGRATION_DATABASE_URL: ADMIN_URL, NODE_ENV: 'test', DEMO_MODE: 'true', PUBLIC_URL: 'http://localhost:3000', HUB_ALLOW_PRIVATE_HOSTS: 'localhost,127.0.0.1', HUB_BACKOFF_BASE_MS: '10', HUB_BREAKER_COOLDOWN_MS: '200', HUB_MAX_ATTEMPTS: '3', HUB_BREAKER_THRESHOLD: '3' }, log: silent });
+export function testPlatform(extraEnv: Record<string, string> = {}): Platform & { jobs: MemJobs } {
+  const p = createPlatform({ env: { DATABASE_URL: APP_URL, MIGRATION_DATABASE_URL: ADMIN_URL, NODE_ENV: 'test', DEMO_MODE: 'true', PUBLIC_URL: 'http://localhost:3000', HUB_ALLOW_PRIVATE_HOSTS: 'localhost,127.0.0.1', HUB_BACKOFF_BASE_MS: '10', HUB_BREAKER_COOLDOWN_MS: '200', HUB_MAX_ATTEMPTS: '3', HUB_BREAKER_THRESHOLD: '3', LLM_ADAPTER: 'fake', EMBEDDINGS_ADAPTER: 'fake', ...extraEnv }, log: silent });
   const jobs = new MemJobs();
   p.ports.jobs = jobs;
   const registerFailed = (e: unknown) => console.error('registering a test job handler failed', e);
@@ -27,6 +28,7 @@ export function testPlatform(): Platform & { jobs: MemJobs } {
   jobs.work(QUEUES.tenantLifecycle, (d: any) => handleLifecycleJob(p, d)).catch(registerFailed);
   jobs.work(QUEUES.backfill, (d: any) => runBackfill(p, d)).catch(registerFailed);
   jobs.work(QUEUES.metricRebuild, (d: any) => rebuildMetric(p, d)).catch(registerFailed);
+  registerConversationJobs(p, { schedules: false }).catch(registerFailed);
   return Object.assign(p, { jobs });
 }
 
@@ -73,6 +75,7 @@ export function cmd(p: Platform, t: TestTenant, app: string, command: string, in
 export async function closePlatform(p: Platform) {
   await p.workers.hub.stop();
   await p.workers.workflows.stop();
+  await p.workers.channels.stop();
   await p.ports.eventBus.stop();
   await p.database.close();
 }

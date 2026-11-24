@@ -1,4 +1,4 @@
-import { outputPorts, type WorkflowGraph, type WorkflowNode } from '@aod/shared';
+import { BOT_NODE_TYPES, botOutputPorts, outputPorts, type WorkflowEdge, type WorkflowNode } from '@aod/shared';
 import {
   Background,
   Controls,
@@ -39,7 +39,31 @@ export const NODE_LABELS: Record<string, string> = {
   code: 'Code',
   parallel: 'Parallel',
   merge: 'Merge',
+  // Bot Studio node types (the same canvas edits bot flows)
+  start: 'Start',
+  message: 'Message',
+  ask: 'Ask',
+  lookup: 'Lookup',
+  ask_assistant: 'Ask assistant',
+  handoff: 'Hand off',
 };
+
+/** What the canvas needs from a graph: workflows and bot flows both fit. */
+export interface CanvasNode {
+  id: string;
+  type: string;
+  name: string;
+  position: { x: number; y: number };
+  config: Record<string, unknown>;
+}
+export interface CanvasGraph {
+  nodes: CanvasNode[];
+  edges: WorkflowEdge[];
+}
+
+/** The node a graph starts from: a workflow's trigger or a bot flow's start. */
+export const isEntry = (type: string) => type === 'trigger' || type === 'start';
+export const portsOf = (n: Pick<CanvasNode, 'type' | 'config'>): string[] => ((BOT_NODE_TYPES as readonly string[]).includes(n.type) ? botOutputPorts(n) : outputPorts(n as Pick<WorkflowNode, 'type' | 'config'>));
 
 export interface NodeOverlay {
   status: string;
@@ -48,7 +72,7 @@ export interface NodeOverlay {
 }
 
 interface WfNodeData extends Record<string, unknown> {
-  node: WorkflowNode;
+  node: CanvasNode;
   problems: string[];
   overlay: NodeOverlay | null;
 }
@@ -64,11 +88,11 @@ const statusRing: Record<string, string> = {
 
 const WfNode = memo(function WfNode({ data, selected }: NodeProps<Node<WfNodeData>>) {
   const { node, problems, overlay } = data;
-  const ports = outputPorts(node);
+  const ports = portsOf(node);
   const ring = problems.length ? 'border-bad' : overlay ? (statusRing[overlay.status] ?? 'border-line') : 'border-line';
   return (
     <div className={`w-56 rounded-lg border-2 bg-white text-left shadow-sm ${ring} ${selected ? 'outline-2 outline-offset-2 outline-accent' : ''}`}>
-      {node.type !== 'trigger' && <Handle type="target" position={Position.Left} className="aod-port !h-3.5 !w-3.5 !border-2 !border-white !bg-muted" />}
+      {!isEntry(node.type) && <Handle type="target" position={Position.Left} className="aod-port !h-3.5 !w-3.5 !border-2 !border-white !bg-muted" />}
       <div className="border-b border-line px-3 py-1.5 text-xs font-medium text-muted">{NODE_LABELS[node.type] ?? node.type}</div>
       <div className="px-3 py-2">
         <p className="text-sm font-semibold text-ink">{node.name}</p>
@@ -109,7 +133,7 @@ function FitOnCountChange({ count }: { count: number }) {
 }
 
 /** First free spot at or below `want` (no node within a node's footprint). */
-export function freeSpot(g: WorkflowGraph, want: { x: number; y: number }) {
+export function freeSpot(g: CanvasGraph, want: { x: number; y: number }) {
   const p = { ...want };
   while (g.nodes.some((n) => Math.abs(n.position.x - p.x) < 240 && Math.abs(n.position.y - p.y) < 160)) p.y += 180;
   return p;
@@ -125,15 +149,15 @@ export function problemsByNode(problems: string[]): Map<string, string[]> {
   return m;
 }
 
-export function describeNode(n: WorkflowNode, problems: string[] = []) {
-  const ports = outputPorts(n);
+export function describeNode(n: CanvasNode, problems: string[] = []) {
+  const ports = portsOf(n);
   return `${NODE_LABELS[n.type] ?? n.type} node ${n.name}. Outputs: ${ports.join(', ')}.${problems.length ? ` ${problems.length} problem(s).` : ''}`;
 }
 
 /** Layered layout: column = longest path from the trigger, rows in order of discovery. */
-export function autoLayout(g: WorkflowGraph): WorkflowGraph {
+export function autoLayout<G extends CanvasGraph>(g: G): G {
   const depth = new Map<string, number>();
-  const trigger = g.nodes.find((n) => n.type === 'trigger');
+  const trigger = g.nodes.find((n) => isEntry(n.type));
   if (trigger) depth.set(trigger.id, 0);
   for (let i = 0; i < g.nodes.length; i++) {
     for (const e of g.edges) {
@@ -154,8 +178,8 @@ export function autoLayout(g: WorkflowGraph): WorkflowGraph {
   };
 }
 
-export function WorkflowCanvas(props: {
-  graph: WorkflowGraph;
+export function WorkflowCanvas<G extends CanvasGraph>(props: {
+  graph: G;
   problems?: string[];
   overlay?: Record<string, NodeOverlay>;
   /** edges taken in a run (execution view) */
@@ -163,7 +187,7 @@ export function WorkflowCanvas(props: {
   selected?: string | null;
   onSelect?: (id: string | null) => void;
   /** omitted: read-only */
-  onChange?: (g: WorkflowGraph, opts?: { silent?: boolean }) => void;
+  onChange?: (g: G, opts?: { silent?: boolean }) => void;
   label: string;
 }) {
   const { graph, onChange } = props;
@@ -178,7 +202,7 @@ export function WorkflowCanvas(props: {
     ariaLabel: describeNode(n, byNode.get(n.id)),
     ...(measured[n.id] ? { measured: measured[n.id] } : {}),
     data: { node: n, problems: byNode.get(n.id) ?? [], overlay: props.overlay?.[n.id] ?? null },
-    deletable: Boolean(onChange) && n.type !== 'trigger',
+    deletable: Boolean(onChange) && !isEntry(n.type),
   }));
   const edges: Edge[] = graph.edges.map((e) => ({
     id: e.id,
@@ -211,7 +235,7 @@ export function WorkflowCanvas(props: {
         if (!c.dragging) silent = false;
       }
       if (c.type === 'remove') {
-        g = { nodes: g.nodes.filter((n) => n.id !== c.id), edges: g.edges.filter((e) => e.from !== c.id && e.to !== c.id) };
+        g = { ...g, nodes: g.nodes.filter((n) => n.id !== c.id), edges: g.edges.filter((e) => e.from !== c.id && e.to !== c.id) };
         silent = false;
       }
     }
@@ -261,7 +285,7 @@ export function WorkflowCanvas(props: {
 }
 
 /** Connects `from:port` to `to`; a port feeds one node, except a parallel node's branches. */
-export function connect(g: WorkflowGraph, from: string, port: string, to: string): WorkflowGraph {
+export function connect<G extends CanvasGraph>(g: G, from: string, port: string, to: string): G {
   const src = g.nodes.find((n) => n.id === from);
   if (!src || g.edges.some((e) => e.from === from && e.port === port && e.to === to)) return g;
   const keep = src.type === 'parallel' ? g.edges : g.edges.filter((e) => !(e.from === from && e.port === port));
@@ -271,10 +295,10 @@ export function connect(g: WorkflowGraph, from: string, port: string, to: string
 }
 
 /** Nodes in reading order: breadth-first from the trigger, then anything unreachable. */
-export function orderedNodes(g: WorkflowGraph): WorkflowNode[] {
-  const out: WorkflowNode[] = [];
+export function orderedNodes<G extends CanvasGraph>(g: G): G['nodes'][number][] {
+  const out: G['nodes'][number][] = [];
   const seen = new Set<string>();
-  const trigger = g.nodes.find((n) => n.type === 'trigger');
+  const trigger = g.nodes.find((n) => isEntry(n.type));
   const queue = trigger ? [trigger.id] : [];
   while (queue.length) {
     const id = queue.shift()!;
