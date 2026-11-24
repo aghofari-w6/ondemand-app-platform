@@ -79,7 +79,7 @@ export async function buildApp(p: Platform): Promise<FastifyInstance> {
             level: p.env.LOG_LEVEL,
             // Signed download tokens are bearer credentials: never write them to logs.
             serializers: {
-              req: (req: { method: string; url: string; id: string }) => ({ method: req.method, url: req.url.replace(/([?&]token=)[^&]+/g, '$1[redacted]'), id: req.id }),
+              req: (req: { method: string; url: string; id: string }) => ({ method: req.method, url: req.url.replace(/([?&](?:token|user_hash|code|state)=)[^&]+/g, '$1[redacted]'), id: req.id }),
             },
           },
     genReqId: (req) => {

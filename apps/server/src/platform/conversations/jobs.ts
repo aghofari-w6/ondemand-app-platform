@@ -19,8 +19,12 @@ export async function registerConversationJobs(p: Platform, opts: { schedules: b
   await jobs.work(QUEUES.knowledgeSweep, async () => {
     await indexPending(p);
   });
-  await jobs.work<{ tenantId: string; conversationId: string }>(QUEUES.assistantResume, async (d) => {
-    await resumeConversation(p, d);
+  await jobs.work<{ tenantId: string; conversationId: string; attempt?: number }>(QUEUES.assistantResume, async (d) => {
+    const r = await resumeConversation(p, { tenantId: d.tenantId, conversationId: d.conversationId });
+    // Another turn of the conversation was still running: come back when it is done
+    // (bounded, so a conversation that never frees up does not keep a job alive).
+    const attempt = d.attempt ?? 0;
+    if (r === 'busy' && attempt < 20) await jobs.send(QUEUES.assistantResume, { tenantId: d.tenantId, conversationId: d.conversationId, attempt: attempt + 1 }, { startAfter: 3 });
   });
   await jobs.work<{ tenantId: string; conversationId: string; messageId: string }>(QUEUES.botTurn, (d) => handleBotTurn(p, d));
   await jobs.work(QUEUES.gmailPoll, async () => {

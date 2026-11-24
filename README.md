@@ -387,18 +387,24 @@ site users, SSE + POST, rate limits per visitor and tenant. Every outbound API c
 through one policed HTTP client (SSRF check, timeouts, capped responses). Outbound
 messages are queued with attempts, backoff, a dead letter and a retry from the Inbox.
 
-**Inbox.** Conversations from all channels with contacts resolved by keyed hashes of their
-identities (email and phone are encrypted at rest), assignment, statuses with optimistic
+**Inbox.** Conversations from all channels with contacts resolved by keyed hashes of the
+identities each channel establishes itself (mail sender, Telegram user, signed widget
+session, HMAC-verified site user; email and phone are encrypted at rest). An address a
+visitor types into the widget is only a claim: it never merges contacts, agents get a
+"possibly the same person" hint. Also: assignment, statuses with optimistic
 versions, internal notes, canned replies, first-response SLA timers, live updates over
-SSE, and links to orders and shipments through the link index. When a linked record
-changes status the customer gets an update in their conversation. Message text never
+SSE, and links to orders and shipments through the link index. A record a customer names to a bot is linked as
+"mentioned"; once an agent confirms the link, the customer gets an update in their
+conversation when that record changes status. Message text never
 enters event data or the audit log.
 
 **Bot Studio.** Bot flows on the workflow canvas (and its keyboard outline) with the node
 types `message`, `ask`, `lookup`, `ask_assistant`, `handoff`, `condition` and `switch`;
 draft / publish / rollback with version history; a test console that stores and sends
 nothing. A published flow looks things up with a service role capped at its publisher.
-A turn is computed without a transaction (lookups, the model call) and applied once.
+Lookups match exactly one record by its non-PII title field (an order number), never a
+prefix or a name. A turn is computed without a transaction (lookups, the model call) and
+applied once.
 `ask_assistant` is the guardrailed customer assistant: no tools, public knowledge only,
 the customer's text wrapped as data.
 

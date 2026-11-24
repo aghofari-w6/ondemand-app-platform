@@ -191,6 +191,7 @@ export function ChannelsScreen() {
 function ChannelCard(props: { channel: Channel; manage: boolean; run: (fn: () => Promise<Notice | string>) => Promise<void>; onReconnect: () => void; onDelete: () => void; onSecret: (value: string) => void }) {
   const { channel: c, manage, run } = props;
   const [copied, setCopied] = useState(false);
+  const [newToken, setNewToken] = useState('');
   const address = c.kind === 'telegram' ? (c.config.bot_username ? `@${c.config.bot_username}` : null) : c.kind === 'gmail' ? (c.config.email ?? null) : (c.config.allowed_origins ?? []).join(', ');
   const name = <span className="sr-only">: {c.name}</span>;
   return (
@@ -258,7 +259,28 @@ function ChannelCard(props: { channel: Channel; manage: boolean; run: (fn: () =>
         )}
         {c.secret_unreadable && (
           <Alert tone="warn" title="Stored credentials cannot be read">
-            The stored credentials of this channel can no longer be decrypted (was the vault key changed?). {c.kind === 'gmail' ? 'Reconnect the mailbox.' : c.kind === 'widget' ? 'Rotate the identity secret.' : 'Delete the channel and connect the bot again.'}
+            The stored credentials of this channel can no longer be decrypted (was the vault key changed?). {c.kind === 'gmail' ? 'Reconnect the mailbox.' : c.kind === 'widget' ? 'Rotate the identity secret.' : 'Enter the bot token again below.'}
+          </Alert>
+        )}
+        {c.kind === 'telegram' && (c.status === 'needs_reconnect' || c.secret_unreadable) && manage && (
+          <Alert tone="warn" title="Reconnect Telegram">
+            <p>{c.status === 'needs_reconnect' ? (c.last_error ?? 'Telegram no longer accepts the stored bot token.') : 'No messages can be sent until the bot token is entered again.'} Conversations stay as they are.</p>
+            <form
+              className="mt-2 flex flex-wrap items-end gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void run(async () => {
+                  await api(`/api/channels/${c.id}/telegram-token`, { body: { token: newToken.trim() } });
+                  setNewToken('');
+                  return `${c.name} is connected to Telegram again.`;
+                });
+              }}
+            >
+              <TextField className="min-w-64 flex-1" label={`New bot token for ${c.name}`} type="password" value={newToken} onChange={setNewToken} autoComplete="off" description="The token of the same bot, from @BotFather." />
+              <Button type="submit" variant="secondary" isDisabled={!newToken.trim()}>
+                Save bot token
+              </Button>
+            </form>
           </Alert>
         )}
         {c.last_error && c.status !== 'needs_reconnect' && <Alert tone="error">{c.last_error}</Alert>}

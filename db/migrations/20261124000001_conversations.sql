@@ -167,17 +167,23 @@ CREATE TABLE conv_contact (
   -- PII: encrypted with the Vault port; lookups use the keyed hashes in conv_identity
   email_enc text,
   phone_enc text,
+  -- keyed hash of the address: only to SUGGEST that two contacts may be the same person
+  -- (an address typed into the widget is a claim, never an identity)
+  email_hash text,
   version integer NOT NULL DEFAULT 1,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 SELECT aod_enable_tenant_rls('conv_contact');
+CREATE INDEX conv_contact_email ON conv_contact (tenant_id, email_hash) WHERE email_hash IS NOT NULL;
 
 CREATE TABLE conv_identity (
   tenant_id uuid NOT NULL,
   contact_id uuid NOT NULL REFERENCES conv_contact(id) ON DELETE CASCADE,
   kind text NOT NULL CHECK (kind IN ('email', 'phone', 'telegram', 'widget_visitor', 'widget_user')),
-  -- HMAC of the normalised value (Vault port); the value itself is never stored in clear
+  -- HMAC of the normalised value (Vault port); the value itself is never stored in clear.
+  -- Only identities the channel itself establishes are stored here (the sender of a mail,
+  -- a Telegram user, a signed widget session or user); `verified` says whether it was proven.
   value_hash text NOT NULL,
   verified boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now(),

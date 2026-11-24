@@ -4,7 +4,7 @@ import { sql } from 'kysely';
 import { newId, type Tx } from '../../db/database.ts';
 import { ReconnectRequired } from '../../ports/index.ts';
 import type { Platform } from '../context.ts';
-import { OMNICHANNEL_PACKAGE, planLimit, requirePackage } from '../packages.ts';
+import { OMNICHANNEL_PACKAGE, packageEnabled, planLimit, requirePackage } from '../packages.ts';
 import { recordChange } from '../record.ts';
 import { ingestMessage } from './inbox.ts';
 
@@ -106,6 +106,33 @@ export async function connectTelegram(p: Platform, tenantId: string, actor: Prin
     await connected(p, tx, tenantId, actor, id, 'telegram', correlationId);
   });
   return { id };
+}
+
+/**
+ * Gives an existing Telegram channel a new bot token (the old one was revoked, or the
+ * stored one can no longer be read). The bot must be the same one, so its conversations
+ * stay with their chats.
+ */
+export async function reconnectTelegram(p: Platform, tenantId: string, actor: Principal, id: string, token: string, correlationId: string) {
+  const a = (await p.database.withTenant(tenantId, (tx) => tx.selectFrom('channel_account').selectAll().where('id', '=', id).where('kind', '=', 'telegram').executeTakeFirst())) as ChannelRow | undefined;
+  if (!a) throw new CommandError(404, 'not_found', 'Telegram channel not found');
+  let me: { id: number; username: string };
+  try {
+    me = await p.ports.channel.telegram.getMe(token);
+  } catch (e) {
+    throw new CommandError(422, 'invalid_token', `Telegram did not accept this bot token: ${(e as Error).message}`);
+  }
+  if (a.config.bot_username && me.username !== a.config.bot_username) throw new CommandError(409, 'different_bot', `this channel belongs to @${a.config.bot_username}; use that bot's token, or add @${me.username} as a new channel`);
+  const webhookSecret = randomBytes(24).toString('hex');
+  try {
+    await p.ports.channel.telegram.setWebhook(token, `${p.env.PUBLIC_URL}/hooks/telegram/${tenantId}/${id}`, webhookSecret);
+  } catch (e) {
+    throw new CommandError(502, 'webhook_failed', `Telegram refused the webhook: ${(e as Error).message}`);
+  }
+  await p.database.withTenant(tenantId, async (tx) => {
+    await tx.updateTable('channel_account').set({ status: 'active', secret_enc: seal(p, tenantId, id, { token, webhook_secret: webhookSecret }), config: JSON.stringify({ ...a.config, bot_username: me.username }), last_error: null, updated_at: new Date(), version: sql`version + 1` }).where('id', '=', id).execute();
+    await connected(p, tx, tenantId, actor, id, 'telegram', correlationId);
+  });
 }
 
 const safeEqual = (a: string, b: string) => {
@@ -227,10 +254,10 @@ const parseFrom = (from: string) => {
   return { name: m?.[1]?.trim() || null, email: /^[^@\s]+@[^@\s]+$/.test(email) ? email : null };
 };
 
-async function needsReconnect(p: Platform, tenantId: string, accountId: string, reason: string) {
+async function needsReconnect(p: Platform, tenantId: string, accountId: string, kind: 'gmail' | 'telegram', reason: string) {
   await p.database.withTenant(tenantId, async (tx) => {
     const r = await tx.updateTable('channel_account').set({ status: 'needs_reconnect', last_error: reason, updated_at: new Date(), version: sql`version + 1` }).where('id', '=', accountId).where('status', '=', 'active').returning('id').executeTakeFirst();
-    if (r) await recordChange(p, tx, { tenantId, actor: { type: 'System', id: 'channel:gmail' }, action: 'platform:channel.needs_reconnect', resourceType: RESOURCE, resourceId: accountId, correlationId: `gmail:${accountId}`, events: [{ type: 'channel.needs_reconnect', data: { account_id: accountId, kind: 'gmail' } }] });
+    if (r) await recordChange(p, tx, { tenantId, actor: { type: 'System', id: `channel:${kind}` }, action: 'platform:channel.needs_reconnect', resourceType: RESOURCE, resourceId: accountId, correlationId: `${kind}:${accountId}`, events: [{ type: 'channel.needs_reconnect', data: { account_id: accountId, kind } }] });
   });
   p.ports.realtime.publish(`inbox:${tenantId}`);
 }
@@ -246,9 +273,16 @@ export const markNeedsReconnect = needsReconnect;
 export async function pollGmail(p: Platform, tenantId: string, accountId: string): Promise<{ ingested: number; status: string }> {
   const account = (await p.database.withTenant(tenantId, (tx) => tx.selectFrom('channel_account').selectAll().where('id', '=', accountId).where('kind', '=', 'gmail').executeTakeFirst())) as ChannelRow | undefined;
   if (!account || account.status !== 'active') return { ingested: 0, status: account?.status ?? 'missing' };
+  // A suspended or deleted workspace, or a plan without the package, takes no messages:
+  // nothing is fetched or stored for it, and its cursor waits where it is.
+  const open = await p.database.withTenant(tenantId, async (tx) => {
+    const t = await tx.selectFrom('tenant').select('status').executeTakeFirst();
+    return Boolean(t) && !['suspended', 'deleted'].includes(t!.status) && (await packageEnabled(p, tx, OMNICHANNEL_PACKAGE));
+  });
+  if (!open) return { ingested: 0, status: 'paused' };
   const refresh = openSecrets(p, account)?.refresh_token;
   if (!refresh) {
-    await needsReconnect(p, tenantId, accountId, 'the stored Gmail grant cannot be read (was the vault key changed?); reconnect the mailbox');
+    await needsReconnect(p, tenantId, accountId, 'gmail', 'the stored Gmail grant cannot be read (was the vault key changed?); reconnect the mailbox');
     return { ingested: 0, status: 'needs_reconnect' };
   }
   const gmail = p.ports.channel.gmail;
@@ -261,40 +295,68 @@ export async function pollGmail(p: Platform, tenantId: string, accountId: string
       h = { messageIds: await gmail.listRecent(token, 20), historyId: profile.historyId, expired: false };
     }
     let ingested = 0;
+    let skipped = 0;
+    const removeFiles = async (ids: string[]) => {
+      for (const id of ids) await p.ports.files.remove(tenantId, id).catch((e: unknown) => p.log.warn({ err: String(e), account: accountId }, 'gmail: removing a stored attachment failed'));
+    };
     for (const id of h.messageIds.slice(0, 100)) {
-      const m = await gmail.getMessage(token, id);
-      if (!m || m.labelIds.includes('SENT') || m.labelIds.includes('DRAFT')) continue;
-      const from = parseFrom(m.from);
-      if (!from.email || from.email === account.config.email) continue;
-      const attachments: { file_id: string; name: string; size: number }[] = [];
-      for (const att of m.attachments.slice(0, MAX_ATTACHMENTS)) {
-        if (att.size > MAX_ATTACHMENT_BYTES) continue;
-        try {
-          const body = await gmail.attachment(token, m.id, att.attachmentId, MAX_ATTACHMENT_BYTES);
-          const f = await p.ports.files.put(tenantId, { name: att.filename, contentType: att.mimeType, purpose: `conversation:gmail:${accountId}`, createdBy: 'channel:gmail' }, body, { maxBytes: MAX_ATTACHMENT_BYTES });
-          attachments.push({ file_id: f.id, name: att.filename, size: f.size });
-        } catch (e) {
-          if (e instanceof ReconnectRequired) throw e;
-          p.log.warn({ err: String(e), account: accountId }, 'gmail: an attachment could not be stored');
+      // Already stored (a repeated poll, the first poll, an expired cursor): fetch nothing again.
+      const known = await p.database.withTenant(tenantId, (tx) => tx.selectFrom('conv_message as m').innerJoin('conversation as c', 'c.id', 'm.conversation_id').select('m.id').where('c.account_id', '=', accountId).where('m.external_id', '=', id).executeTakeFirst());
+      if (known) continue;
+      const stored: string[] = [];
+      try {
+        const m = await gmail.getMessage(token, id);
+        if (!m || m.labelIds.includes('SENT') || m.labelIds.includes('DRAFT')) continue;
+        const from = parseFrom(m.from);
+        if (!from.email || from.email === account.config.email) continue;
+        const attachments: { file_id: string; name: string; size: number }[] = [];
+        for (const att of m.attachments.slice(0, MAX_ATTACHMENTS)) {
+          if (att.size > MAX_ATTACHMENT_BYTES) continue;
+          try {
+            const body = await gmail.attachment(token, m.id, att.attachmentId, MAX_ATTACHMENT_BYTES);
+            const f = await p.ports.files.put(tenantId, { name: att.filename, contentType: att.mimeType, purpose: `conversation:gmail:${accountId}`, createdBy: 'channel:gmail' }, body, { maxBytes: MAX_ATTACHMENT_BYTES });
+            stored.push(f.id);
+            attachments.push({ file_id: f.id, name: att.filename, size: f.size });
+          } catch (e) {
+            if (e instanceof ReconnectRequired) throw e;
+            p.log.warn({ err: String(e), account: accountId }, 'gmail: an attachment could not be stored');
+          }
         }
+        const r = await ingestMessage(p, tenantId, account, {
+          threadKey: m.threadId,
+          externalId: m.id,
+          text: m.text || '(no text)',
+          subject: m.subject.slice(0, 300),
+          contact: { name: from.name, email: from.email },
+          identities: [{ kind: 'email', value: from.email, verified: false }],
+          meta: { message_id: m.messageId, references: m.references, ...(attachments.length ? { attachments } : {}) },
+          correlationId: `gmail:${m.id}`,
+        });
+        if ('duplicate' in r) await removeFiles(stored);
+        else ingested++;
+      } catch (e) {
+        // Nothing stored for a message that was not ingested.
+        await removeFiles(stored);
+        if (e instanceof ReconnectRequired) throw e;
+        // The workspace stopped taking messages mid-poll: stop here, keep the cursor.
+        if (e instanceof CommandError && [403, 410, 423].includes(e.status)) return { ingested, status: 'paused' };
+        // A message that can never be read (too large, malformed), or one that failed on
+        // five polls in a row, is skipped so it cannot hold the mailbox back for ever.
+        const stuck = (account.cursor.stuck ?? null) as { id: string; n: number } | null;
+        const hopeless = (e as Error).name === 'ResponseTooLarge' || e instanceof CommandError || (stuck?.id === id && stuck.n >= 4);
+        if (!hopeless) {
+          await p.database.withTenant(tenantId, (tx) => tx.updateTable('channel_account').set({ cursor: JSON.stringify({ ...account.cursor, stuck: { id, n: stuck?.id === id ? stuck.n + 1 : 1 } }) }).where('id', '=', accountId).execute());
+          throw e;
+        }
+        skipped++;
+        p.log.warn({ err: String(e), account: accountId }, 'gmail: a message could not be read and was skipped');
       }
-      const r = await ingestMessage(p, tenantId, account, {
-        threadKey: m.threadId,
-        externalId: m.id,
-        text: m.text || '(no text)',
-        subject: m.subject.slice(0, 300),
-        contact: { name: from.name, email: from.email },
-        identities: [{ kind: 'email', value: from.email, verified: false }],
-        meta: { message_id: m.messageId, references: m.references, ...(attachments.length ? { attachments } : {}) },
-        correlationId: `gmail:${m.id}`,
-      });
-      if (!('duplicate' in r)) ingested++;
     }
-    await p.database.withTenant(tenantId, (tx) => tx.updateTable('channel_account').set({ cursor: JSON.stringify({ history_id: h.historyId }), last_error: null, updated_at: new Date() }).where('id', '=', accountId).execute());
+    await p.database.withTenant(tenantId, (tx) => tx.updateTable('channel_account').set({ cursor: JSON.stringify({ history_id: h.historyId }), last_error: skipped ? `${skipped} message(s) could not be read (too large or malformed) and were skipped` : null, updated_at: new Date() }).where('id', '=', accountId).execute());
     return { ingested, status: 'active' };
   } catch (e) {
     if (e instanceof ReconnectRequired) {
-      await needsReconnect(p, tenantId, accountId, 'Gmail access expired or was revoked; reconnect the mailbox');
+      await needsReconnect(p, tenantId, accountId, 'gmail', 'Gmail access expired or was revoked; reconnect the mailbox');
       return { ingested: 0, status: 'needs_reconnect' };
     }
     await p.database.withTenant(tenantId, (tx) => tx.updateTable('channel_account').set({ last_error: (e as Error).message.slice(0, 300), updated_at: new Date() }).where('id', '=', accountId).execute());

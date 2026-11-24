@@ -13,13 +13,14 @@ export const WIDGET_JS = String.raw`(function () {
   if (!key || window.__aodWidget) return;
   window.__aodWidget = true;
   var base = new URL(script.src).origin;
-  var identity = '';
+  // The signed-in user's id and hash go to the chat frame by postMessage, never in a URL.
+  var identity = null;
   if (script.getAttribute('data-user-id') && script.getAttribute('data-user-hash')) {
-    identity = '&user_id=' + encodeURIComponent(script.getAttribute('data-user-id')) + '&user_hash=' + encodeURIComponent(script.getAttribute('data-user-hash'));
+    identity = { user_id: script.getAttribute('data-user-id'), hash: script.getAttribute('data-user-hash') };
   }
   var frame = document.createElement('iframe');
   frame.title = 'Chat with us';
-  frame.src = base + '/widget/frame?key=' + encodeURIComponent(key) + identity;
+  frame.src = base + '/widget/frame?embedded=1&key=' + encodeURIComponent(key);
   frame.style.cssText = 'position:fixed;right:16px;bottom:76px;width:min(380px,calc(100vw - 32px));height:min(560px,calc(100vh - 100px));border:1px solid #c9ced6;border-radius:12px;background:#fff;box-shadow:0 8px 30px rgba(0,0,0,.18);z-index:2147483646;display:none';
   var button = document.createElement('button');
   button.type = 'button';
@@ -31,7 +32,7 @@ export const WIDGET_JS = String.raw`(function () {
     frame.style.display = open ? 'block' : 'none';
     button.setAttribute('aria-expanded', String(open));
     button.textContent = open ? 'Close chat' : 'Chat with us';
-    if (open) frame.contentWindow && frame.contentWindow.postMessage({ type: 'aod-widget-open' }, base);
+    if (open) frame.contentWindow && frame.contentWindow.postMessage({ type: 'aod-widget-open', identity: identity }, base);
   });
   document.body.appendChild(frame);
   document.body.appendChild(button);
@@ -74,7 +75,12 @@ const FRAME_JS = String.raw`(function () {
   var input = document.getElementById('text');
   var emailForm = document.getElementById('email-form');
   var emailInput = document.getElementById('email');
-  var token = null, lastSeq = 0, source = null, seen = {};
+  var pending = null;
+  var token = null, lastSeq = 0, source = null, seen = {}, started = false, identity = null;
+  function newId() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
+  }
   function say(t) { status.textContent = t; }
   function readable(hex) {
     var n = parseInt(hex.slice(1), 16), c = [n >> 16 & 255, n >> 8 & 255, n & 255].map(function (v) { v /= 255; return v <= .03928 ? v / 12.92 : Math.pow((v + .055) / 1.055, 2.4); });
@@ -115,10 +121,12 @@ const FRAME_JS = String.raw`(function () {
     source.addEventListener('ready', function () { refresh().catch(function () {}); });
   }
   function start() {
+    if (started) return;
+    started = true;
     var saved = null;
     try { saved = localStorage.getItem(store); } catch (e) { saved = null; }
     var body = { key: key, visitor_token: saved || undefined };
-    if (q.get('user_id') && q.get('user_hash')) body.identity = { user_id: q.get('user_id'), hash: q.get('user_hash') };
+    if (identity && identity.user_id && identity.hash) body.identity = { user_id: String(identity.user_id), hash: String(identity.hash) };
     fetch('/widget/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
       .then(function (r) { return r.json().then(function (d) { if (!r.ok) throw new Error(d.message || 'Chat is unavailable'); return d; }); })
       .then(function (d) {
@@ -140,8 +148,10 @@ const FRAME_JS = String.raw`(function () {
     if (!text || !token) return;
     var button = form.querySelector('button');
     button.disabled = true;
-    api('messages', { text: text })
-      .then(function (d) { input.value = ''; add(d.message); say('Sent'); })
+    // The id makes a resend after a lost response the same message, not a second one.
+    pending = pending && pending.text === text ? pending : { text: text, id: newId() };
+    api('messages', { text: text, client_id: pending.id })
+      .then(function (d) { pending = null; input.value = ''; add(d.message); say('Sent'); })
       .catch(function (e) { say(e.message); })
       .then(function () { button.disabled = false; input.focus(); });
   });
@@ -155,7 +165,14 @@ const FRAME_JS = String.raw`(function () {
       .catch(function (e) { say(e.message); });
   });
   window.addEventListener('pagehide', function () { if (source) source.close(); });
-  start();
+  // Embedded: nothing is opened (no session, no stream) until the visitor opens the chat;
+  // the host page's script then says so and passes the signed-in user, if any.
+  window.addEventListener('message', function (ev) {
+    if (ev.source !== window.parent || !ev.data || ev.data.type !== 'aod-widget-open') return;
+    identity = ev.data.identity || null;
+    start();
+  });
+  if (q.get('embedded') !== '1' || window.parent === window) start();
 })();`;
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);

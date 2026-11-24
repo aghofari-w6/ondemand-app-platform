@@ -154,6 +154,17 @@ describe('knowledge retrieval (pgvector + full text)', () => {
     const sentToModel = await p.database.withTenant(A.tenantId, (tx) => tx.selectFrom('assistant_message').select('content').where('conversation_id', '=', found.id).execute());
     expect(JSON.stringify(sentToModel)).toContain('single origin arabica');
     expect(JSON.stringify(sentToModel)).not.toContain('62811999000');
+    // A role that has one field of the entity hidden gets no record passages of it at all,
+    // rather than a passage that could contain the hidden value.
+    const restricted = await p.database.withTenant(A.tenantId, async (tx) => {
+      const id = newId();
+      await tx.insertInto('custom_role').values({ id, tenant_id: A.tenantId, name: 'Buyer', permissions: ['platform:assistant.use', 'platform:records.read'], field_rules: JSON.stringify([{ resource: 'custom::Supplier', field: 'speciality', access: 'hidden' }]) }).execute();
+      return id;
+    });
+    const buyer = await user(A, restricted);
+    const forBuyer = await searchKnowledge(p, A.tenantId, { audience: 'staff', principal: buyer.principal }, 'who supplies single origin arabica beans from Aceh');
+    expect(forBuyer.some((h) => h.kind === 'record')).toBe(false);
+    expect(JSON.stringify(forBuyer)).not.toContain('arabica');
     const helpdesk = await user(A, noRecords);
     expect((await searchKnowledge(p, A.tenantId, { audience: 'staff', principal: helpdesk.principal }, 'single origin arabica beans from Aceh')).some((h) => h.kind === 'record')).toBe(false);
   });
@@ -362,6 +373,41 @@ describe('assistant: tools run as the user, by risk tier', () => {
         p.ports.llm = real;
       }
     }
+    expect((await orderRow(A, o.id)).status).toBe('new');
+  });
+});
+
+describe('assistant: the transcript stays valid', () => {
+  it('answers tool calls that were never recorded before taking a new question', async () => {
+    const r = await chat(A, A.owner, 'Which open orders do we have?');
+    // A crash between the model's message and its tool calls leaves an unanswered call.
+    await p.database.withTenant(A.tenantId, (tx) => tx.insertInto('assistant_message').values({ id: newId(), tenant_id: A.tenantId, conversation_id: r.id, role: 'assistant', content: JSON.stringify([{ type: 'tool_use', id: 'lost_1', name: 'ordering__list_open_orders', input: {} }]) }).execute());
+    const real = p.ports.llm;
+    const seen: string[][] = [];
+    p.ports.llm = { ...real, chat: (req) => (seen.push(req.messages.map((m) => (typeof m.content === 'string' ? `${m.role}:text` : `${m.role}:${m.content.map((b) => b.type).join('+')}`))), real.chat(req)) };
+    try {
+      expect((await chat(A, A.owner, 'Which open orders do we have?', r.id)).status).toBe('idle');
+    } finally {
+      p.ports.llm = real;
+    }
+    // …assistant:tool_use → user:tool_result (failed) → user:text, never a question right after an open call.
+    expect(seen[0]!.slice(-3)).toEqual(['assistant:tool_use', 'user:tool_result', 'user:text']);
+    const stored = await p.database.withTenant(A.tenantId, (tx) => tx.selectFrom('assistant_message').select('content').where('conversation_id', '=', r.id).orderBy('seq').execute());
+    expect(JSON.stringify(stored)).toContain('the action was not recorded; nothing ran');
+  });
+
+  it('a background resume waits for a running turn, and a waiting status with nothing pending does not lock the conversation', async () => {
+    const o = await order(A);
+    const r = await chat(A, A.owner, `Please advance order ${o.number}`);
+    const call = r.view.tool_calls.find((t) => t.status === 'pending_confirm')!;
+    await p.database.withTenant(A.tenantId, (tx) => sql`UPDATE assistant_conversation SET status = 'running', running_until = now() + interval '1 minute' WHERE id = ${r.id}`.execute(tx));
+    expect(await resumeConversation(p, { tenantId: A.tenantId, conversationId: r.id })).toBe('busy');
+    await p.database.withTenant(A.tenantId, (tx) => sql`UPDATE assistant_conversation SET status = 'waiting_confirm', running_until = NULL WHERE id = ${r.id}`.execute(tx));
+    // The decision lands, but nobody resumed (e.g. the browser closed): the next question still works.
+    await decideToolCall(p, { tenantId: A.tenantId, principal: A.owner, toolCallId: call.id, decision: 'decline' });
+    const next = await chat(A, A.owner, 'Which open orders do we have?', r.id);
+    expect(next.status).toBe('idle');
+    expect(next.answer).toContain(`#${o.number}`);
     expect((await orderRow(A, o.id)).status).toBe('new');
   });
 });

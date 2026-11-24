@@ -75,7 +75,8 @@ export function assistantRoutes(p: Platform) {
     app.get('/api/assistant/conversations/:id', async (req) => {
       const a = requirePermission(req, 'platform:assistant.use');
       const id = idParam(req);
-      // An approval nobody decided in time must not leave the conversation stuck.
+      // Ownership first; then an approval nobody decided in time must not leave the conversation stuck.
+      await p.database.withTenant(a.tenantId, (tx) => getConversation(p, tx, a.principal, id));
       await expireApprovals(p, a.tenantId, id);
       return p.database.withTenant(a.tenantId, (tx) => getConversation(p, tx, a.principal, id));
     });

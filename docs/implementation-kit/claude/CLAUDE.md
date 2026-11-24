@@ -116,7 +116,12 @@ e2e/               Playwright
     append-only. Every model call goes through the `Llm` port and is metered with
     `addUsage()` against the plan limit.
 15. **Conversations.** Customer message text never goes into event data or audit entries;
-    contact email and phone are encrypted and matched by keyed hashes. Inbound messages go
+    contact email and phone are encrypted. A contact is resolved only from identities the
+    channel itself establishes (mail sender, Telegram user, signed widget session or
+    HMAC-verified site user); an address a visitor typed is a claim that never merges
+    contacts (`setContactEmail`, `possible_matches`). A record a customer names to a bot
+    is linked as `mentioned`; only a link an agent confirms (`about`) sends that customer
+    updates, and bot lookups match one record exactly by its non-PII title field. Inbound messages go
     through `ingestMessage()` (idempotent by the channel's message id) and outbound ones
     through `queueReply()`; only the `ChannelSender` talks to Telegram or Gmail, and only
     through the `Channel` port's transports on the policed `OutboundHttp` client. Widget

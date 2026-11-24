@@ -17,6 +17,7 @@ import { backfillTenant } from '../src/platform/consumers.ts';
 import { connectTelegram, createWidget, deleteChannel, finishGmailConnect, identityHash, pollGmail, startGmailConnect, widgetKey } from '../src/platform/conversations/channels.ts';
 import { assignConversation, getConversation, linkedUpdatesConsumer, listConversations, queueReply, setConversationStatus } from '../src/platform/conversations/inbox.ts';
 import { createSource, indexSource } from '../src/platform/knowledge.ts';
+import { changeTenantStatus } from '../src/platform/tenants.ts';
 import { traceQuery } from '../src/platform/trace.ts';
 import { admin, closePlatform, cmd, newTenant, runSaga, setPlan, testPlatform, type TestTenant } from './helpers.ts';
 import { startGoogleMock } from './mocks/google.ts';
@@ -193,6 +194,29 @@ describe('Telegram channel (mock Bot API)', () => {
     expect((await app.inject({ method: 'POST', url: `/api/inbox/messages/${down}/retry`, headers: auth(A), payload: {} })).statusCode).toBe(409);
   });
 
+  it('asks for a new token when Telegram rejects the bot, and reconnects the same channel', async () => {
+    const conv = (await conversationOf(A, accountId, '4401'))!;
+    tg.failures.push(401);
+    const id = await tenant(A, (tx) => queueReply(p, tx, A.tenantId, conv.id, { authorType: 'agent', authorId: A.ownerId, body: 'token was revoked', correlationId: c(), actor: A.owner }));
+    await p.workers.channels.drain();
+    expect((await messages(A, conv.id)).find((m) => m.id === id)).toMatchObject({ delivery: 'dead', attempts: 1 });
+    expect((await account(A, accountId)).status).toBe('needs_reconnect');
+    await p.ports.eventBus.drain();
+    const ev = await tenant(A, (tx) => tx.selectFrom('event_log').select('payload').where('type', '=', 'channel.needs_reconnect').execute());
+    expect(ev.map((e) => (e.payload as any).data)).toEqual([{ account_id: accountId, kind: 'telegram' }]);
+
+    tg.addBot('777777:another-bot-token-bbbbbbbbbbbb', 'someone_elses_bot');
+    expect((await app.inject({ method: 'POST', url: `/api/channels/${accountId}/telegram-token`, headers: auth(A), payload: { token: '777777:another-bot-token-bbbbbbbbbbbb' } })).json()).toMatchObject({ error: 'different_bot' });
+    expect((await app.inject({ method: 'POST', url: `/api/channels/${accountId}/telegram-token`, headers: auth(B), payload: { token: TOKEN } })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'POST', url: `/api/channels/${accountId}/telegram-token`, headers: auth(A), payload: { token: TOKEN } })).statusCode).toBe(200);
+    expect((await account(A, accountId)).status).toBe('active');
+    // The conversation is still there, and the queued message can be retried.
+    await app.inject({ method: 'POST', url: `/api/inbox/messages/${id}/retry`, headers: auth(A), payload: {} });
+    await p.workers.channels.drain();
+    expect(tg.sent.at(-1)!.text).toBe('token was revoked');
+    expect((await telegramIn(A, accountId, 4401, 'thanks')).res.statusCode).toBe(200);
+  });
+
   it('dead-letters at once when the stored bot token cannot be decrypted (vault key changed)', async () => {
     const before = (await account(A, accountId)).secret_enc as string;
     const foreign = createVault(randomBytes(32).toString('base64'), () => {}).encrypt(JSON.stringify({ token: TOKEN, webhook_secret: 'x' }), `channel:${A.tenantId}:${accountId}`);
@@ -287,6 +311,38 @@ describe('Gmail channel (mock OAuth + Gmail API)', () => {
     expect((await messages(A, conv.id)).length).toBe(3);
   });
 
+  it('does not store attachments twice, skips a message that can never be read, and pauses for a suspended workspace', async () => {
+    const files = async () => (await tenant(A, (tx) => tx.selectFrom('file_object').select(sql<number>`count(*)::int`.as('n')).where('purpose', '=', `conversation:gmail:${accountId}`).executeTakeFirstOrThrow())).n;
+    const before = await files();
+    // An expired cursor makes the poll look at the recent inbox again: known messages are not fetched again.
+    google.expireHistory();
+    const reads = google.reads();
+    expect((await pollGmail(p, A.tenantId, accountId)).ingested).toBe(0);
+    expect(google.reads()).toBe(reads);
+    expect(await files()).toBe(before);
+
+    // A message Gmail keeps failing on: after five failed polls it is skipped and later mail arrives.
+    const bad = google.receive({ from: 'Budi Santoso <budi@customer.example>', subject: 'Broken', text: 'x' });
+    google.broken.add(bad.id);
+    const fine = google.receive({ from: 'Tono <tono@customer.example>', subject: 'After the broken one', text: 'Still there?' });
+    for (let i = 0; i < 4; i++) await expect(pollGmail(p, A.tenantId, accountId)).rejects.toThrow(/HTTP 500/);
+    expect(await pollGmail(p, A.tenantId, accountId)).toEqual({ ingested: 1, status: 'active' });
+    expect(await conversationOf(A, accountId, fine.threadId)).toBeTruthy();
+    expect((await account(A, accountId)).last_error).toMatch(/1 message\(s\) could not be read/);
+    expect((await pollGmail(p, A.tenantId, accountId)).ingested).toBe(0);
+
+    // A suspended workspace: nothing is fetched or stored, and the cursor waits.
+    const waiting = google.receive({ from: 'Tono <tono@customer.example>', subject: 'While suspended', text: 'Hello?', attachments: [{ filename: 'a.txt', mimeType: 'text/plain', data: Buffer.from('a') }] });
+    await tenant(A, (tx) => changeTenantStatus(p, tx, A.tenantId, 'suspended', A.owner, c()));
+    const paused = google.reads();
+    expect(await pollGmail(p, A.tenantId, accountId)).toEqual({ ingested: 0, status: 'paused' });
+    expect(google.reads()).toBe(paused);
+    await setPlan(p, A, 'growth');
+    expect((await pollGmail(p, A.tenantId, accountId)).ingested).toBe(1);
+    expect(await conversationOf(A, accountId, waiting.threadId)).toBeTruthy();
+    expect(await files()).toBe(before + 1);
+  });
+
   it('asks to reconnect when Google revokes access, dead-letters sends meanwhile, and resumes after reconnecting', async () => {
     const conv = (await tenant(A, (tx) => tx.selectFrom('conversation').selectAll().where('account_id', '=', accountId).where('subject', '=', 'Invoice').executeTakeFirstOrThrow()))!;
     google.revoke();
@@ -295,7 +351,8 @@ describe('Gmail channel (mock OAuth + Gmail API)', () => {
     const row = await account(A, accountId);
     expect(row).toMatchObject({ status: 'needs_reconnect', last_error: expect.stringMatching(/reconnect the mailbox/) });
     await p.ports.eventBus.drain();
-    expect(await tenant(A, (tx) => tx.selectFrom('event_log').select('id').where('type', '=', 'channel.needs_reconnect').execute())).toHaveLength(1);
+    const asked = await tenant(A, (tx) => tx.selectFrom('event_log').select('payload').where('type', '=', 'channel.needs_reconnect').execute());
+    expect(asked.map((e) => (e.payload as any).data).filter((d) => d.kind === 'gmail')).toEqual([{ account_id: accountId, kind: 'gmail' }]);
 
     const id = await tenant(A, (tx) => queueReply(p, tx, A.tenantId, conv.id, { authorType: 'agent', authorId: A.ownerId, body: 'Invoice attached', correlationId: c(), actor: A.owner }));
     await p.workers.channels.drain();
@@ -377,16 +434,28 @@ describe('web chat widget', () => {
     await p.ports.eventBus.drain();
     const leak = await tenant(A, (tx) => sql<{ n: number }>`SELECT (SELECT count(*) FROM audit_log WHERE data::text ILIKE '%dewi@customer.example%') + (SELECT count(*) FROM event_log WHERE payload::text ILIKE '%dewi@customer.example%' OR payload::text ILIKE '%please email me%') AS n`.execute(tx));
     expect(Number(leak.rows[0]!.n)).toBe(0);
-    // The captured address identifies the same person when they later write by email.
+    // A typed address is a claim, not an identity: it is saved once and cannot be replaced…
+    const again = await app.inject({ method: 'POST', url: '/widget/api/email', headers: { authorization: `Bearer ${anon.token}`, origin: 'https://shop.example' }, payload: { email: 'attacker@evil.example' } });
+    expect(again.json()).toMatchObject({ error: 'email_already_set' });
+    // …and mail from that address is NOT attached to the visitor who typed it. The agent only
+    // gets a hint, and a reply in the mail thread goes to the person who wrote the mail.
     const mail = await connectGmail(A);
     await finishGmailConnect(p, A.tenantId, A.owner, mail.state, mail.code, c());
     const m = google.receive({ from: 'Dewi <dewi@customer.example>', subject: 'Following up', text: 'As discussed in chat.' });
     await pollGmail(p, A.tenantId, mail.id);
     const byMail = (await conversationOf(A, mail.id, m.threadId))!;
-    const anonConv = (await tenant(A, (tx) => tx.selectFrom('conv_message').select('conversation_id').where('body', '=', 'please email me').executeTakeFirstOrThrow())).conversation_id;
+    const anonConv = (await tenant(A, (tx) => tx.selectFrom('conv_message').select(['conversation_id']).where('body', '=', 'please email me').executeTakeFirstOrThrow())).conversation_id;
+    const anonContact = (await tenant(A, (tx) => tx.selectFrom('conversation').select('contact_id').where('id', '=', anonConv).executeTakeFirstOrThrow())).contact_id;
+    expect(byMail.contact_id).not.toBe(anonContact);
     const other = await tenant(A, (tx) => getConversation(p, tx, A.tenantId, A.owner, byMail.id));
-    expect(other.other_conversations.map((x) => x.id)).toContain(anonConv);
+    expect(other.other_conversations).toEqual([]);
+    expect(other.possible_matches.map((x) => x.id)).toEqual([anonConv]);
     expect(other.contact.email).toBe('dewi@customer.example');
+    await tenant(A, (tx) => queueReply(p, tx, A.tenantId, byMail.id, { authorType: 'agent', authorId: A.ownerId, body: 'Here are the details.', correlationId: c(), actor: A.owner }));
+    await settle();
+    expect(google.sent.at(-1)!.headers.to).toBe('dewi@customer.example');
+    // The visitor still reads only their own chat.
+    expect((await anon.read()).map((x) => x.body)).toEqual(['please email me']);
   });
 
   it('pushes new messages to the visitor over Server-Sent Events and ends with the connection', async () => {
@@ -412,6 +481,26 @@ describe('web chat widget', () => {
     expect(await next(/event: changed/)).toBe(true);
     ac.abort();
     await reader.read().catch(() => undefined);
+
+    // A resent message (same client id) is stored once.
+    const h = { authorization: `Bearer ${v.token}`, origin: 'http://127.0.0.1' };
+    const first = await app.inject({ method: 'POST', url: '/widget/api/messages', headers: h, payload: { text: 'did this arrive?', client_id: 'c0ffee00-aaaa-bbbb-cccc-000000000001' } });
+    const resend = await app.inject({ method: 'POST', url: '/widget/api/messages', headers: h, payload: { text: 'did this arrive?', client_id: 'c0ffee00-aaaa-bbbb-cccc-000000000001' } });
+    expect([first.statusCode, resend.statusCode]).toEqual([201, 200]);
+    expect(resend.json().message.id).toBe(first.json().message.id);
+    expect((await v.read()).filter((x) => x.body === 'did this arrive?')).toHaveLength(1);
+
+    // Open streams per visitor are capped, and the slots come back with the connections.
+    await new Promise((r) => setTimeout(r, 100));
+    const acs = [new AbortController(), new AbortController(), new AbortController(), new AbortController()];
+    const open: number[] = [];
+    for (const a of acs) open.push((await fetch(`${base}/widget/api/events?token=${encodeURIComponent(v.token)}`, { signal: a.signal })).status);
+    expect(open).toEqual([200, 200, 200, 429]);
+    for (const a of acs) a.abort();
+    await new Promise((r) => setTimeout(r, 100));
+    const last = new AbortController();
+    expect((await fetch(`${base}/widget/api/events?token=${encodeURIComponent(v.token)}`, { signal: last.signal })).status).toBe(200);
+    last.abort();
   });
 });
 
@@ -570,7 +659,8 @@ describe('Bot Studio flows', () => {
     expect((await v.read()).at(-1)).toMatchObject({ from: 'bot', body: `Order ${o.number} is new.` });
     // The lookup tied the conversation to the order (link index); no customer PII went into the reply or the bot's data.
     const detail = await tenant(A, (tx) => getConversation(p, tx, A.tenantId, A.owner, conv.id));
-    expect(detail.links).toEqual([expect.objectContaining({ type: 'ordering::Order', id: o.id })]);
+    expect(detail.links).toEqual([expect.objectContaining({ type: 'ordering::Order', id: o.id, rel: 'mentioned' })]);
+    expect(await tenant(A, (tx) => tx.selectFrom('audit_log').select(['actor_type', 'data']).where('action', '=', 'platform:conversation.linked').where('resource_id', '=', conv.id).execute())).toEqual([{ actor_type: 'System', data: expect.objectContaining({ to_id: o.id, rel: 'mentioned' }) }]);
     const steps = await tenant(A, (tx) => tx.selectFrom('bot_step').select(['node_id', 'port']).where('conversation_id', '=', conv.id).orderBy('at').execute());
     expect(steps.map((s) => `${s.node_id}:${s.port}`)).toEqual(['start:out', 'intent:order', 'find:found', 'status:out']);
     expect(JSON.stringify(await tenant(A, (tx) => tx.selectFrom('conversation').select('bot').where('id', '=', conv.id).executeTakeFirst()))).not.toContain('Ana Pratama');
@@ -596,6 +686,10 @@ describe('Bot Studio flows', () => {
     await v.say('hello?');
     await settle();
     expect((await v.read()).filter((m) => m.from === 'bot')).toHaveLength(2);
+
+    // The agent who took the conversation confirms which order it is about.
+    expect((await app.inject({ method: 'POST', url: `/api/inbox/conversations/${conv.id}/link`, headers: auth(A), payload: { type: 'ordering::Order', id: o.id } })).statusCode).toBe(200);
+    expect((await tenant(A, (tx) => getConversation(p, tx, A.tenantId, A.owner, conv.id))).links.map((l) => l.rel)).toEqual(['about']);
 
     // Staff ask the assistant to cancel: high risk, so it waits for another manager.
     const manager = await user(A, 'Manager');
@@ -742,6 +836,19 @@ describe('Bot Studio flows', () => {
     await Promise.all([handleBotTurn(p, job), handleBotTurn(p, job)]);
     await settle();
     expect((await v.read()).filter((m) => m.from === 'bot').map((m) => m.body)).toEqual([`Order ${o.number} is new.`]);
+
+    // Naming an order does not prove it is yours: until an agent confirms the link, the
+    // visitor gets no updates about it.
+    await cmd(p, A, 'ordering', 'order.advance', { id: o.id, version: 1 });
+    await settle();
+    expect((await v.read()).filter((m) => m.from === 'system')).toEqual([]);
+    // A lookup must name the record exactly: a prefix or a longer number finds nothing.
+    for (const probe of [`where is order ${String(o.number).slice(0, 2)}`, `order ${o.number}0`]) {
+      const guess = await visitor(w.key);
+      await guess.say(probe);
+      await settle();
+      expect((await guess.read()).filter((m) => m.from === 'bot').at(-1)!.body).toMatch(/^I could not find order/);
+    }
 
     await tenant(A, (tx) => tx.updateTable('custom_role').set({ permissions: ['platform:tenant.read'] }).where('id', '=', role).execute());
     const v2 = await visitor(w.key);

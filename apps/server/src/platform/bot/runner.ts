@@ -221,8 +221,14 @@ export function botDeps(p: Platform, tenantId: string, principal: Principal): Bo
     async lookup(tool, input) {
       const def = (await p.database.withTenant(tenantId, (tx) => toolsFor(p, tx, principal))).find((t) => t.name === tool && t.kind === 'view');
       if (!def) throw new CommandError(403, 'forbidden', `the bot's role cannot use ${tool}`);
-      const r = (await runReadTool(p, tenantId, principal, def, input)) as { rows: Record<string, unknown>[] };
-      return { rows: r.rows, resource: def.entity?.resource ?? null };
+      // A bot answers people nobody has identified, so a lookup must name one record
+      // exactly by its (non-PII) title field, e.g. an order number. Prefix and full-text
+      // matches are dropped: no enumerating with "1", no probing for customer names.
+      const key = def.entity?.title_field;
+      const wanted = String(input.q ?? '').trim();
+      if (!key || !wanted || def.entity!.fields.find((f) => f.key === key)?.pii) return { rows: [], resource: def.entity?.resource ?? null };
+      const r = (await runReadTool(p, tenantId, principal, def, { q: wanted, limit: 25 })) as { rows: Record<string, unknown>[] };
+      return { rows: r.rows.filter((row) => String(row[key] ?? '') === wanted).slice(0, 1), resource: def.entity?.resource ?? null };
     },
     askAssistant: (question) => customerAnswer(p, tenantId, question),
   };
@@ -289,7 +295,9 @@ export async function handleBotTurn(p: Platform, job: { tenantId: string; conver
     if (!c || c.status !== 'bot') return false;
     const actor = { type: 'System' as const, id: loaded.chosen ? `bot:${loaded.chosen.flow_id}` : 'bot' };
     for (const msg of fx.messages) if (msg.text) await queueReply(p, tx, tenantId, conversationId, { authorType: 'bot', authorId: loaded.chosen?.flow_id ?? null, body: msg.text, correlationId: loaded.correlationId, actor, ...(msg.citations?.length ? { meta: { citations: msg.citations } } : {}) });
-    for (const l of fx.links) await linkRecord(p, tx, tenantId, actor, conversationId, l, loaded.correlationId, false);
+    // Knowing a record's number does not prove it is yours: the link is only "mentioned"
+    // (agents see it) until a person confirms it in the Inbox.
+    for (const l of fx.links) await linkRecord(p, tx, tenantId, actor, conversationId, l, loaded.correlationId, 'mentioned');
     await tx.updateTable('conversation').set({ bot: fx.session ? JSON.stringify(fx.session) : null }).where('id', '=', conversationId).execute();
     if (loaded.chosen && fx.trace.length) {
       await tx.insertInto('bot_step').values(fx.trace.map((s) => ({ id: newId(), tenant_id: tenantId, conversation_id: conversationId, message_id: messageId, flow_id: loaded.chosen!.flow_id, number: loaded.chosen!.number, node_id: s.node_id, port: s.port, detail: JSON.stringify(s.detail), correlation_id: loaded.correlationId }))).execute();

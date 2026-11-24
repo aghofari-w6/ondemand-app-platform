@@ -77,7 +77,12 @@ async function claim(p: Platform, tenantId: string, conversationId: string, user
     if (!c || (userId && c.user_id !== userId)) throw new CommandError(404, 'not_found', 'conversation not found');
     const stale = c.status === 'running' && (!c.running_until || new Date(c.running_until) < new Date());
     if (c.status === 'running' && !stale) throw new CommandError(409, 'busy', 'the assistant is still working on the previous message');
-    if (!stale && !allow.includes(c.status)) throw new CommandError(409, 'action_pending', c.status === 'waiting_confirm' ? 'confirm or decline the pending action first' : 'an action is waiting for approval');
+    if (!stale && !allow.includes(c.status)) {
+      // A waiting status with nothing left to decide (a decision landed while a turn was
+      // finishing) must not lock the conversation: the next turn settles it.
+      const pending = await tx.selectFrom('assistant_tool_call').select('id').where('conversation_id', '=', conversationId).where('status', 'in', ['pending_confirm', 'pending_approval']).limit(1).executeTakeFirst();
+      if (pending || !c.status.startsWith('waiting')) throw new CommandError(409, 'action_pending', c.status === 'waiting_confirm' ? 'confirm or decline the pending action first' : 'an action is waiting for approval');
+    }
     await tx.updateTable('assistant_conversation').set({ status: 'running', running_until: new Date(Date.now() + LEASE_MS), updated_at: new Date() }).where('id', '=', conversationId).execute();
     return c as { id: string; user_id: string; title: string };
   });
@@ -164,28 +169,39 @@ async function citationsFor(tx: Tx, conversationId: string, text: string) {
   return passages.filter((x) => marks.includes(x.n)).map((x) => ({ n: x.n, source_id: x.source_id, chunk_id: x.chunk_id, title: x.title, kind: x.kind, excerpt: x.text.slice(0, 300) }));
 }
 
+/**
+ * Answers the tool calls of the transcript's last assistant message, all in one message:
+ * `waiting_*` while one of them is still pending, `settled` once their results were
+ * appended, `none` when nothing was unanswered. A call that was never recorded (a crash
+ * between the model's message and its tool calls) is answered as failed, so the transcript
+ * can never end in an unanswered tool call.
+ */
+async function settle(p: Platform, t: Pick<Turn, 'tenantId' | 'conversationId' | 'correlationId'>): Promise<'none' | 'settled' | 'waiting_confirm' | 'waiting_approval'> {
+  return p.database.withTenant(t.tenantId, async (tx) => {
+    const last = await tx.selectFrom('assistant_message').select(['role', 'content']).where('conversation_id', '=', t.conversationId).orderBy('seq', 'desc').limit(1).executeTakeFirst();
+    const uses = last?.role === 'assistant' ? toolUses(last.content) : [];
+    if (!uses.length) return 'none';
+    const calls = await tx.selectFrom('assistant_tool_call').select(['call_ref', 'status', 'result', 'error']).where('conversation_id', '=', t.conversationId).where('call_ref', 'in', uses.map((u) => u.id)).execute();
+    if (calls.some((c) => c.status === 'pending_confirm')) return 'waiting_confirm';
+    if (calls.some((c) => c.status === 'pending_approval')) return 'waiting_approval';
+    const results: LlmBlock[] = uses.map((u) => {
+      const c = calls.find((x) => x.call_ref === u.id);
+      return { type: 'tool_result', tool_use_id: u.id, content: c ? resultContent(c as any) : JSON.stringify({ status: 'failed', error: 'the action was not recorded; nothing ran' }), ...(c && c.status === 'executed' ? {} : { is_error: true }) };
+    });
+    await tx.insertInto('assistant_message').values({ id: newId(), tenant_id: t.tenantId, conversation_id: t.conversationId, role: 'user', content: JSON.stringify(results), correlation_id: t.correlationId }).execute();
+    return 'settled';
+  });
+}
+
 /** Runs model turns until the assistant answers, or an action waits for the user or an approver. */
 async function runLoop(p: Platform, t: Turn): Promise<ConversationStatus> {
   for (let step = 0; step < MAX_STEPS; step++) {
+    const settled = await settle(p, t);
+    if (settled === 'waiting_confirm' || settled === 'waiting_approval') return settled;
     const rows = await p.database.withTenant(t.tenantId, (tx) => tx.selectFrom('assistant_message').select(['id', 'role', 'content']).where('conversation_id', '=', t.conversationId).orderBy('seq').limit(MAX_MESSAGES + 1).execute());
     if (rows.length > MAX_MESSAGES) throw new CommandError(409, 'conversation_too_long', 'this conversation is too long; start a new one');
-    const last = rows.at(-1);
-    if (!last) return 'idle';
-
-    if (last.role === 'assistant') {
-      const uses = toolUses(last.content);
-      if (!uses.length) return 'idle';
-      // Every tool call of the turn must be answered together, in one message.
-      const calls = await p.database.withTenant(t.tenantId, (tx) => tx.selectFrom('assistant_tool_call').select(['call_ref', 'status', 'result', 'error']).where('conversation_id', '=', t.conversationId).where('call_ref', 'in', uses.map((u) => u.id)).execute());
-      if (calls.some((c) => c.status === 'pending_confirm')) return 'waiting_confirm';
-      if (calls.some((c) => c.status === 'pending_approval')) return 'waiting_approval';
-      const results: LlmBlock[] = uses.map((u) => {
-        const c = calls.find((x) => x.call_ref === u.id);
-        return { type: 'tool_result', tool_use_id: u.id, content: c ? resultContent(c as any) : JSON.stringify({ status: 'failed', error: 'the action was not recorded' }), ...(c && c.status === 'executed' ? {} : { is_error: true }) };
-      });
-      await p.database.withTenant(t.tenantId, (tx) => tx.insertInto('assistant_message').values({ id: newId(), tenant_id: t.tenantId, conversation_id: t.conversationId, role: 'user', content: JSON.stringify(results), correlation_id: t.correlationId }).execute());
-      continue;
-    }
+    // The model speaks only after a user turn (a question or tool results).
+    if (rows.at(-1)?.role !== 'user') return 'idle';
 
     const tools = await p.database.withTenant(t.tenantId, async (tx) => {
       await assertBudget(p, tx);
@@ -202,10 +218,13 @@ async function runLoop(p: Platform, t: Turn): Promise<ConversationStatus> {
     });
     p.ports.metrics.increment('aod_assistant_turns_total', { stop: res.stopReason });
     if (res.stopReason === 'refusal') t.emit({ type: 'error', message: 'The model declined this request.' });
+    if (!uses.length) return 'idle';
     // Never run the tools of a refused or cut-off turn; they are answered as failed.
-    if (uses.length) await processToolUses(p, t, uses, tools, res.stopReason === 'refusal' || res.stopReason === 'max_tokens');
-    else return 'idle';
+    await processToolUses(p, t, uses, tools, res.stopReason === 'refusal' || res.stopReason === 'max_tokens');
   }
+  // Out of steps: still answer the last tool calls, or keep waiting for the pending ones.
+  const settled = await settle(p, t);
+  if (settled === 'waiting_confirm' || settled === 'waiting_approval') return settled;
   t.emit({ type: 'error', message: `Stopped after ${MAX_STEPS} steps; ask again to continue.` });
   return 'idle';
 }
@@ -230,6 +249,15 @@ async function runTurn(p: Platform, t: Turn): Promise<ConversationStatus> {
 /** A new user message: runs the assistant until it answers or waits. */
 export async function sendMessage(p: Platform, input: { tenantId: string; principal: Principal; conversationId: string; text: string; correlationId: string; emit: Emit; signal?: AbortSignal }) {
   const c = await claim(p, input.tenantId, input.conversationId, input.principal.id, ['idle']);
+  // The transcript must not get a new question after an unanswered tool call.
+  const open = await settle(p, input).catch(async (e: unknown) => {
+    await release(p, input.tenantId, input.conversationId, 'idle');
+    throw e;
+  });
+  if (open === 'waiting_confirm' || open === 'waiting_approval') {
+    await release(p, input.tenantId, input.conversationId, open);
+    throw new CommandError(409, 'action_pending', open === 'waiting_confirm' ? 'confirm or decline the pending action first' : 'an action is waiting for approval');
+  }
   await p.database.withTenant(input.tenantId, async (tx) => {
     await tx.insertInto('assistant_message').values({ id: newId(), tenant_id: input.tenantId, conversation_id: input.conversationId, role: 'user', content: JSON.stringify([{ type: 'text', text: input.text }]), correlation_id: input.correlationId }).execute();
     if (c.title === 'New conversation') await tx.updateTable('assistant_conversation').set({ title: input.text.slice(0, 80) }).where('id', '=', input.conversationId).execute();
@@ -237,13 +265,18 @@ export async function sendMessage(p: Platform, input: { tenantId: string; princi
   return runTurn(p, input);
 }
 
-/** Continues after a pending action was decided. Without a user (job), the turn runs as the conversation's owner. */
-export async function resumeConversation(p: Platform, input: { tenantId: string; conversationId: string; principal?: Principal; correlationId?: string; emit?: Emit; signal?: AbortSignal }) {
+/**
+ * Continues after a pending action was decided. Without a user (job), the turn runs as the
+ * conversation's owner; `busy` then means another turn of the conversation is still
+ * running and the caller should come back, `null` that there is nothing to continue.
+ */
+export async function resumeConversation(p: Platform, input: { tenantId: string; conversationId: string; principal?: Principal; correlationId?: string; emit?: Emit; signal?: AbortSignal }): Promise<ConversationStatus | 'busy' | null> {
   let c: { user_id: string };
   try {
     c = await claim(p, input.tenantId, input.conversationId, input.principal?.id ?? null, ['waiting_confirm', 'waiting_approval']);
   } catch (e) {
-    // Already continued (or still running): nothing to do for a background resume.
+    if (!input.principal && e instanceof CommandError && e.code === 'busy') return 'busy';
+    // Already continued, or gone: nothing to do for a background resume.
     if (!input.principal && e instanceof CommandError && [404, 409].includes(e.status)) return null;
     throw e;
   }

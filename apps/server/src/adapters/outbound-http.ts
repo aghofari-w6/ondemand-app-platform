@@ -14,7 +14,7 @@ export class ResponseTooLarge extends Error {
 }
 
 /** Reads a body up to `maxBytes`; a larger body fails instead of being held in memory. */
-async function* capped(res: Response, maxBytes: number): AsyncIterable<Uint8Array> {
+async function* capped(res: Response, maxBytes: number, cleanupFailed: (e: unknown) => void): AsyncIterable<Uint8Array> {
   if (!res.body) return;
   const reader = res.body.getReader();
   let size = 0;
@@ -28,7 +28,7 @@ async function* capped(res: Response, maxBytes: number): AsyncIterable<Uint8Arra
     }
   } finally {
     // Stops the transfer whether the consumer finished, stopped early or failed.
-    await reader.cancel().catch(() => undefined);
+    await reader.cancel().catch(cleanupFailed);
   }
 }
 
@@ -38,7 +38,9 @@ async function* capped(res: Response, maxBytes: number): AsyncIterable<Uint8Arra
  * connection resolved through the private-address check, redirects not followed,
  * connect/headers/body timeouts, and a byte cap on every response.
  */
-export function createOutboundHttp(policy: SsrfPolicy): OutboundHttp {
+export function createOutboundHttp(policy: SsrfPolicy, log: (msg: string, err: unknown) => void = (msg, err) => console.warn(msg, String(err))): OutboundHttp {
+  // Cleanup failures never fail the call, but they are logged, not swallowed.
+  const cleanupFailed = (e: unknown) => log('outbound http: cancelling a response body failed', e);
   // One agent (connection pool) per process.
   const agent = new Agent({ connect: { lookup: safeLookup(policy) as any, timeout: TIMEOUT_MS }, headersTimeout: TIMEOUT_MS, bodyTimeout: TIMEOUT_MS });
   const check = async (raw: string) => {
@@ -63,7 +65,7 @@ export function createOutboundHttp(policy: SsrfPolicy): OutboundHttp {
       }
       const res = await call(req.url, { method: req.method ?? (body === undefined ? 'GET' : 'POST'), headers, ...(body !== undefined ? { body } : {}) });
       const chunks: Uint8Array[] = [];
-      for await (const c of capped(res, req.maxBytes ?? DEFAULT_MAX_BYTES)) chunks.push(c);
+      for await (const c of capped(res, req.maxBytes ?? DEFAULT_MAX_BYTES, cleanupFailed)) chunks.push(c);
       const text = Buffer.concat(chunks).toString('utf8');
       let parsed: unknown;
       try {
@@ -76,7 +78,7 @@ export function createOutboundHttp(policy: SsrfPolicy): OutboundHttp {
     },
     async stream(req) {
       const res = await call(req.url, { ...(req.headers ? { headers: req.headers } : {}) });
-      return { status: res.status, ok: res.status >= 200 && res.status < 300, body: capped(res, req.maxBytes) };
+      return { status: res.status, ok: res.status >= 200 && res.status < 300, body: capped(res, req.maxBytes, cleanupFailed) };
     },
   };
 }

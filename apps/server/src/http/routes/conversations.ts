@@ -6,7 +6,7 @@ import { toolsFor } from '../../platform/assistant/tools.ts';
 import { botContext, createFlow, discardFlowDraft, getFlow, publishFlow, rollbackFlow, saveFlowDraft, setFlowStatus } from '../../platform/bot/flows.ts';
 import { botDeps, runBotTurn, type BotSession } from '../../platform/bot/runner.ts';
 import type { Platform } from '../../platform/context.ts';
-import { channelView, connectTelegram, createWidget, deleteChannel, finishGmailConnect, handleTelegramUpdate, pollGmail, rotateWidgetSecret, startGmailConnect, updateChannel, type ChannelRow } from '../../platform/conversations/channels.ts';
+import { channelView, connectTelegram, createWidget, deleteChannel, finishGmailConnect, handleTelegramUpdate, pollGmail, reconnectTelegram, rotateWidgetSecret, startGmailConnect, updateChannel, type ChannelRow } from '../../platform/conversations/channels.ts';
 import { addNote, assignConversation, deleteCanned, getConversation, linkRecord, listCanned, listConversations, markRead, notifyConversation, queueReply, retryMessage, saveCanned, setConversationStatus } from '../../platform/conversations/inbox.ts';
 import { BOT_PACKAGE, OMNICHANNEL_PACKAGE, packageEnabled, requirePackage } from '../../platform/packages.ts';
 import { correlationId, parse, requirePermission } from '../app.ts';
@@ -21,7 +21,7 @@ const WidgetBody = z.object({ name: z.string().trim().min(1).max(80), allowed_or
 const GmailStartBody = z.object({ name: z.string().trim().min(1).max(80).optional(), account_id: z.uuid().optional(), sla_minutes: sla });
 const ChannelPatch = z.object({ name: z.string().trim().min(1).max(80).optional(), status: z.enum(['active', 'disabled']).optional(), widget: WidgetBody.omit({ name: true }).optional(), sla_minutes: sla });
 
-const ListQuery = z.object({ status: z.enum(['active', 'bot', 'open', 'pending', 'resolved', 'all']).default('active'), assignee: z.string().max(40).optional(), channel: z.enum(BOT_CHANNELS).optional(), q: z.string().max(100).optional() });
+const ListQuery = z.object({ status: z.enum(['active', 'bot', 'open', 'pending', 'resolved', 'all']).default('active'), assignee: z.union([z.enum(['me', 'unassigned']), z.uuid()]).optional(), channel: z.enum(BOT_CHANNELS).optional(), q: z.string().max(100).optional() });
 const TextBody = z.object({ body: z.string().trim().min(1).max(4000) });
 const AssignBody = z.object({ assignee_id: z.uuid().nullable(), version: z.int().positive().optional() });
 const StatusBody = z.object({ status: z.enum(['open', 'pending', 'resolved']), version: z.int().positive().optional() });
@@ -31,7 +31,8 @@ const CannedBody = z.object({ title: z.string().trim().min(1).max(80), body: z.s
 const FlowBody = z.object({ name: z.string().trim().min(1).max(80), description: z.string().max(500).optional(), template: z.enum(['order_status']).optional(), channels: z.array(z.enum(BOT_CHANNELS)).min(1).optional() });
 const DraftBody = z.object({ graph: z.unknown(), version: z.int().positive().optional() });
 const PublishBody = z.object({ version: z.int().positive(), service_role: z.string().min(1).max(80) });
-const TestBody = z.object({ graph: z.unknown(), text: z.string().trim().min(1).max(2000), channel: z.enum(BOT_CHANNELS).default('widget'), session: z.unknown().optional() });
+const TestSession = z.object({ node: z.string().max(60).nullable(), attempts: z.int().min(0).max(10), vars: z.record(z.string(), z.unknown()), steps: z.record(z.string(), z.object({ output: z.unknown(), port: z.string().nullable() })) });
+const TestBody = z.object({ graph: z.unknown(), text: z.string().trim().min(1).max(2000), channel: z.enum(BOT_CHANNELS).default('widget'), session: TestSession.nullable().optional() });
 
 const SSE_HEADERS = { 'content-type': 'text/event-stream', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' };
 const STREAM_MAX_MS = 15 * 60_000;
@@ -52,6 +53,14 @@ export function conversationRoutes(p: Platform) {
       const a = requirePermission(req, 'platform:channels.manage');
       const body = parse(TelegramBody, req.body);
       return reply.code(201).send(await connectTelegram(p, a.tenantId, a.principal, body, correlationId(req)));
+    });
+
+    /** A new token for an existing bot (revoked token, or stored secrets that can no longer be read). */
+    app.post('/api/channels/:id/telegram-token', async (req) => {
+      const a = requirePermission(req, 'platform:channels.manage');
+      const body = parse(z.object({ token: z.string().trim().min(10).max(100) }), req.body);
+      await reconnectTelegram(p, a.tenantId, a.principal, idParam(req), body.token, correlationId(req));
+      return { ok: true };
     });
 
     app.post('/api/channels/widget', async (req, reply) => {
@@ -338,8 +347,8 @@ export function conversationRoutes(p: Platform) {
         return validateBotGraph(graph.data, await botContext(p, tx));
       });
       if (problems.length) throw Object.assign(new CommandError(422, 'invalid_flow', `fix ${problems.length} problem(s) before testing: ${problems.slice(0, 3).join('; ')}`), { details: { problems } });
-      const session = (body.session ?? null) as BotSession | null;
-      const fx = await runBotTurn(graph.data, { id, number: 0 }, session ? { ...session, flow_id: id, number: 0 } : null, { text: body.text, channel: body.channel, contact: { name: 'Test visitor', verified: false } }, botDeps(p, a.tenantId, a.principal));
+      const session: BotSession | null = body.session ? { ...body.session, flow_id: id, number: 0 } : null;
+      const fx = await runBotTurn(graph.data, { id, number: 0 }, session, { text: body.text, channel: body.channel, contact: { name: 'Test visitor', verified: false } }, botDeps(p, a.tenantId, a.principal));
       return { messages: fx.messages, handoff: fx.handoff, trace: fx.trace, session: fx.session, ended: !fx.session };
     });
   };

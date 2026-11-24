@@ -38,6 +38,9 @@ export async function startGoogleMock(opts: { email?: string; clientId?: string;
   const mails: MockMail[] = [];
   const sent: { raw: string; threadId: string | null; headers: Record<string, string>; text: string; id: string }[] = [];
   const consents: { redirect_uri: string; scope: string; access_type: string }[] = [];
+  /** message ids the API fails to return (HTTP 500), like a message Gmail cannot serve */
+  const broken = new Set<string>();
+  let reads = 0;
   const unauthorized: MockReply = { status: 401, json: { error: { code: 401, message: 'Invalid Credentials' } } };
 
   const authed = (h: Record<string, unknown>) => {
@@ -105,6 +108,8 @@ export async function startGoogleMock(opts: { email?: string; clientId?: string;
     }
     const one = /^\/messages\/([^/]+)$/.exec(g);
     if (one) {
+      reads++;
+      if (broken.has(one[1]!)) return { status: 500, json: { error: { code: 500, message: 'Backend Error' } } };
       const m = mails.find((x) => x.id === one[1]);
       if (!m) return { status: 404, json: { error: { code: 404, message: 'Not Found' } } };
       return {
@@ -139,6 +144,9 @@ export async function startGoogleMock(opts: { email?: string; clientId?: string;
     clientSecret,
     sent,
     consents,
+    broken,
+    /** how many times a message was fetched (`messages.get`) */
+    reads: () => reads,
     /** Delivers a message to the mailbox, as if a customer had emailed it. */
     receive(m: { from: string; subject: string; text: string; threadId?: string; references?: string; labelIds?: string[]; attachments?: { filename: string; mimeType: string; data: Buffer }[] }) {
       const id = `msg-${mails.length + 1}-${randomUUID().slice(0, 8)}`;

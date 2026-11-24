@@ -9,6 +9,7 @@ import { publishedDefinition } from './datastudio.ts';
 import { BOT_PACKAGE, packageEnabled, planLimit } from './packages.ts';
 import { QUEUES } from './queues.ts';
 import { recordChange } from './record.ts';
+import { hiddenForPrincipal } from './records.ts';
 
 /**
  * Knowledge the assistant and bots can quote: help articles (text kept here), tenant
@@ -196,7 +197,24 @@ export interface Passage {
 export async function searchKnowledge(p: Platform, tenantId: string, reader: { audience: 'customer' } | { audience: 'staff'; principal: Principal }, query: string, k = 5): Promise<Passage[]> {
   const kinds: RetrievedChunk['kind'][] = ['help', 'document'];
   if (reader.audience === 'staff' && authorize(reader.principal, action('platform:records.read'), { type: 'platform::Tenant', id: tenantId, tenantId }).decision === 'allow') kinds.push('record');
-  const r = await p.ports.retriever.retrieve(tenantId, query, k, { kinds, publicOnly: reader.audience === 'customer' });
+  const r = await p.ports.retriever.retrieve(tenantId, query, k + (kinds.includes('record') ? 5 : 0), { kinds, publicOnly: reader.audience === 'customer' });
   if (r.tokens) await p.database.withTenant(tenantId, (tx) => addUsage(tx, tenantId, { embedTokens: r.tokens }));
-  return r.hits.map((h, i) => ({ n: i + 1, chunk_id: h.id, source_id: h.sourceId, title: h.title, kind: h.kind, ref: h.ref, text: h.text }));
+  let hits = r.hits;
+  if (reader.audience === 'staff' && hits.some((h) => h.kind === 'record')) {
+    // Field rules: a role that has any field of an entity hidden (by its own rules or by
+    // Data studio's) gets no record passages of that entity at all, rather than a passage
+    // that might hold the hidden value.
+    const principal = reader.principal;
+    const blocked = await p.database.withTenant(tenantId, async (tx) => {
+      const { definition } = await publishedDefinition(tx);
+      const out = new Set<string>();
+      for (const e of definition.entities) {
+        const d = authorize(principal, action('platform:records.read'), { type: customResource(e.key), id: '*', tenantId });
+        if (d.decision === 'deny' || hiddenForPrincipal(principal, definition, e, d).size > 0) out.add(customResource(e.key));
+      }
+      return out;
+    });
+    hits = hits.filter((h) => h.kind !== 'record' || (h.ref !== null && !blocked.has(h.ref.type)));
+  }
+  return hits.slice(0, k).map((h, i) => ({ n: i + 1, chunk_id: h.id, source_id: h.sourceId, title: h.title, kind: h.kind, ref: h.ref, text: h.text }));
 }

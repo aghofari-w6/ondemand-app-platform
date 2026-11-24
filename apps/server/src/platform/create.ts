@@ -47,7 +47,7 @@ export function createPlatform(opts: { env?: Partial<Record<keyof Env, string>>;
   const vault = createVault(env.VAULT_KEY, (m) => log.warn({}, m));
   const policy = policyFrom(env.HUB_ALLOW_PRIVATE_HOSTS, env.NODE_ENV === 'production');
   // Platform-configured API clients (Telegram, Google, Voyage) share one policed HTTP client.
-  const http = createOutboundHttp(policy);
+  const http = createOutboundHttp(policy, (msg, err) => log.warn({ err: String(err) }, msg));
   const useVoyage = (env.EMBEDDINGS_ADAPTER ?? (env.VOYAGE_API_KEY ? 'voyage' : 'fake')) === 'voyage';
   const embeddings = useVoyage ? createVoyageEmbeddings(http, { apiKey: env.VOYAGE_API_KEY, baseUrl: env.VOYAGE_API_URL, model: env.EMBEDDINGS_MODEL, dimension: env.EMBEDDINGS_DIM }) : createFakeEmbeddings(env.EMBEDDINGS_DIM);
   const p: Platform = {
@@ -72,7 +72,7 @@ export function createPlatform(opts: { env?: Partial<Record<keyof Env, string>>;
       files: createPgFiles(database, vault),
       telemetry: createTelemetry(),
       llm: env.LLM_ADAPTER === 'fake' ? createFakeLlm() : createLlm(env.ANTHROPIC_API_KEY, env.CLAUDE_MODEL, undefined, { fallbacks: env.CLAUDE_FALLBACKS }),
-      retriever: createPgVectorRetriever(database, embeddings),
+      retriever: createPgVectorRetriever(database, embeddings, (msg, err) => log.warn({ err: String(err) }, msg)),
       sandbox: createSandbox(),
       billing: createBilling(config),
       analytics: pgAnalytics,

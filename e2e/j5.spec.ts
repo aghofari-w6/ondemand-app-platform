@@ -186,6 +186,11 @@ test('J5: widget bot, handoff to the Inbox, assistant with approval, Gmail and T
   await expectAccessible(page, 'inbox');
   await page.getByRole('button', { name: 'Assign to me' }).click();
   await expect(page.getByText('Assigned to you.')).toBeVisible();
+  // The bot only noted which order the visitor named; the agent confirms it, and from then
+  // on the customer is told when that order changes.
+  await page.getByLabel('Order number').fill(String(order.number));
+  await page.getByRole('button', { name: 'Link order' }).click();
+  await expect(page.getByText(`Order ${order.number} linked.`)).toBeVisible();
 
   // ---- 3. Staff ask the assistant to cancel: high risk, so it waits for an approval
   await nav(page, 'Assistant');

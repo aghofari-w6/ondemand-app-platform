@@ -81,7 +81,8 @@ export function createVoyageEmbeddings(http: OutboundHttp, o: { apiKey: string |
           url: `${o.baseUrl.replace(/\/$/, '')}/v1/embeddings`,
           headers: { authorization: `Bearer ${o.apiKey}` },
           body: { input: texts, model: o.model, input_type: inputType, output_dimension: o.dimension },
-          maxBytes: 64 * 1024 * 1024,
+          // 64 texts × 1024 floats is about 1.5 MB of JSON; anything far larger is not an embeddings response
+          maxBytes: 8 * 1024 * 1024,
         });
         if (r.ok) {
           const data = [...((r.body?.data ?? []) as { index: number; embedding: number[] }[])].sort((a, b) => a.index - b.index);
@@ -107,7 +108,7 @@ const vec = (v: number[]) => `[${v.join(',')}]`;
  * filter by `tenant_id` explicitly. With pgvector >= 0.8 the HNSW scan is iterative, so the
  * tenant filter does not cost recall; older versions fall back to an exact scan.
  */
-export function createPgVectorRetriever(database: Database, embeddings: Embeddings): Retriever {
+export function createPgVectorRetriever(database: Database, embeddings: Embeddings, log: (msg: string, err: unknown) => void = () => undefined): Retriever {
   let ready: Promise<{ iterative: boolean }> | null = null;
   const prepare = () =>
     (ready ??= (async () => {
@@ -189,7 +190,8 @@ export function createPgVectorRetriever(database: Database, embeddings: Embeddin
         const e = await embeddings.embed([query], 'query');
         qvec = vec(e.vectors[0]!);
         tokens = e.tokens;
-      } catch {
+      } catch (e) {
+        log('retriever: embedding the query failed; answering from full text only', e);
         qvec = null;
       }
       const kinds = opts.kinds?.length ? opts.kinds : ['document', 'help', 'record'];

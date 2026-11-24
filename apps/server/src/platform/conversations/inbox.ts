@@ -42,7 +42,12 @@ export interface InboundMessage {
   correlationId: string;
 }
 
-/** Finds the contact behind any of the identities (verified ones first), or creates one; learns new identities. */
+/**
+ * Finds the contact behind one of the message's identities (verified ones first), or
+ * creates one. Only identities the channel itself establishes count: the sender of a mail,
+ * a Telegram user, a signed widget session or a verified site user. An address a visitor
+ * merely typed is never an identity (see setContactEmail).
+ */
 async function resolveContact(p: Platform, tx: Tx, tenantId: string, m: InboundMessage): Promise<string> {
   const hashed = m.identities.map((i) => ({ ...i, hash: identityHash(p, tenantId, i) }));
   let contactId: string | null = null;
@@ -54,14 +59,15 @@ async function resolveContact(p: Platform, tx: Tx, tenantId: string, m: InboundM
     }
   }
   const enc = (id: string, field: 'email' | 'phone', v: string | null | undefined) => (v ? p.ports.vault.encrypt(normalise(field, v), aadContact(tenantId, id, field)) : null);
+  const emailHash = m.contact.email ? identityHash(p, tenantId, { kind: 'email', value: m.contact.email }) : null;
   if (!contactId) {
     contactId = newId();
-    await tx.insertInto('conv_contact').values({ id: contactId, tenant_id: tenantId, name: m.contact.name?.slice(0, 120) ?? null, email_enc: enc(contactId, 'email', m.contact.email), phone_enc: enc(contactId, 'phone', m.contact.phone) }).execute();
+    await tx.insertInto('conv_contact').values({ id: contactId, tenant_id: tenantId, name: m.contact.name?.slice(0, 120) ?? null, email_enc: enc(contactId, 'email', m.contact.email), email_hash: emailHash, phone_enc: enc(contactId, 'phone', m.contact.phone) }).execute();
   } else {
     const c = await tx.selectFrom('conv_contact').select(['name', 'email_enc', 'phone_enc']).where('id', '=', contactId).executeTakeFirstOrThrow();
     const patch: Record<string, unknown> = {};
     if (!c.name && m.contact.name) patch.name = m.contact.name.slice(0, 120);
-    if (!c.email_enc && m.contact.email) patch.email_enc = enc(contactId, 'email', m.contact.email);
+    if (!c.email_enc && m.contact.email) Object.assign(patch, { email_enc: enc(contactId, 'email', m.contact.email), email_hash: emailHash });
     if (!c.phone_enc && m.contact.phone) patch.phone_enc = enc(contactId, 'phone', m.contact.phone);
     if (Object.keys(patch).length) await tx.updateTable('conv_contact').set({ ...patch, updated_at: new Date(), version: sql`version + 1` }).where('id', '=', contactId).execute();
   }
@@ -83,11 +89,22 @@ export function contactView(p: Platform, tenantId: string, c: { id: string; name
   return { id: c.id, name: c.name, email: dec('email', c.email_enc), phone: dec('phone', c.phone_enc) };
 }
 
-/** Email captured in the widget: encrypted on the contact, plus an unverified identity for matching. */
+/**
+ * An email address a widget visitor typed: stored encrypted on their own contact, once.
+ * It is a claim, not an identity: it never makes another channel's messages resolve to
+ * this contact and it cannot replace an address the contact already has. Agents only get
+ * a "possibly the same person" hint (getConversation).
+ */
 export async function setContactEmail(p: Platform, tx: Tx, tenantId: string, contactId: string, email: string, channel: string) {
   const value = normalise('email', email);
-  await tx.updateTable('conv_contact').set({ email_enc: p.ports.vault.encrypt(value, aadContact(tenantId, contactId, 'email')), updated_at: new Date(), version: sql`version + 1` }).where('id', '=', contactId).execute();
-  await tx.insertInto('conv_identity').values({ tenant_id: tenantId, contact_id: contactId, kind: 'email', value_hash: identityHash(p, tenantId, { kind: 'email', value }), verified: false }).onConflict((oc) => oc.doNothing()).execute();
+  const set = await tx
+    .updateTable('conv_contact')
+    .set({ email_enc: p.ports.vault.encrypt(value, aadContact(tenantId, contactId, 'email')), email_hash: identityHash(p, tenantId, { kind: 'email', value }), updated_at: new Date(), version: sql`version + 1` })
+    .where('id', '=', contactId)
+    .where('email_enc', 'is', null)
+    .returning('id')
+    .executeTakeFirst();
+  if (!set) throw new CommandError(409, 'email_already_set', 'an email address is already saved for this chat');
   // The address itself stays out of the audit entry and of events.
   await recordChange(p, tx, { tenantId, actor: SYSTEM(channel), action: 'platform:conversation.contact_updated', resourceType: 'platform::Contact', resourceId: contactId, correlationId: `contact:${contactId}`, data: { fields: ['email'] } });
 }
@@ -288,7 +305,7 @@ export class ChannelSender {
       }
     }
     p.ports.metrics.increment('aod_channel_messages_total', { channel: account.kind, direction: 'out', ok: String(result.ok) });
-    if (result.reconnect) await markNeedsReconnect(p, tenantId, account.id, result.error ?? 'reconnect the channel');
+    if (result.reconnect && account.kind !== 'widget') await markNeedsReconnect(p, tenantId, account.id, account.kind, result.error ?? 'reconnect the channel');
 
     await p.database.withTenant(tenantId, async (tx) => {
       const attempts = m.attempts + 1;
@@ -353,6 +370,11 @@ export async function getConversation(p: Platform, tx: Tx, tenantId: string, pri
   const related: typeof links.links = [];
   for (const l of links.links.slice(0, 5)) for (const x of (await linksFor(p, tx, principal, l.type, l.id)).links) if (x.type !== CONVERSATION && !links.links.some((y) => y.id === x.id)) related.push(x);
   const other = await tx.selectFrom('conversation').select(['id', 'channel', 'status', 'last_message_at']).where('contact_id', '=', c.contact_id).where('id', '<>', id).orderBy('last_message_at', 'desc').limit(5).execute();
+  // Same address on another contact: a hint for the agent, never an automatic merge.
+  const emailHash = (await tx.selectFrom('conv_contact').select('email_hash').where('id', '=', c.contact_id).executeTakeFirst())?.email_hash as string | null | undefined;
+  const possible = emailHash
+    ? await tx.selectFrom('conversation as o').innerJoin('conv_contact as k', 'k.id', 'o.contact_id').select(['o.id', 'o.channel', 'o.status', 'o.last_message_at']).where('k.email_hash', '=', emailHash).where('k.id', '<>', c.contact_id).orderBy('o.last_message_at', 'desc').limit(5).execute()
+    : [];
   return {
     conversation: { id: c.id, channel: c.channel, status: c.status, subject: c.subject, assignee, sla: sla(c), first_response_at: c.first_response_at, unread: c.unread, version: c.version, created_at: c.created_at, bot_active: c.status === 'bot' },
     account,
@@ -362,6 +384,7 @@ export async function getConversation(p: Platform, tx: Tx, tenantId: string, pri
     related: related.slice(0, 20),
     hidden_links: links.hidden,
     other_conversations: other,
+    possible_matches: possible,
   };
 }
 
@@ -422,15 +445,24 @@ export async function markRead(tx: Tx, id: string) {
   await tx.updateTable('conversation').set({ unread: 0 }).where('id', '=', id).where('unread', '>', 0).execute();
 }
 
-/** Links a conversation to a record (e.g. the order it is about) in the link index. */
-export async function linkRecord(p: Platform, tx: Tx, tenantId: string, actor: Pick<Principal, 'type' | 'id'>, conversationId: string, target: { type: string; id: string }, correlationId: string, audit = true) {
-  const ins = await tx
-    .insertInto('record_link')
-    .values({ tenant_id: tenantId, from_type: CONVERSATION, from_id: conversationId, rel: 'about', to_type: target.type, to_id: target.id, source_event: null })
-    .onConflict((oc) => oc.doNothing())
-    .returning('to_id')
-    .executeTakeFirst();
-  if (ins && audit) await recordChange(p, tx, { tenantId, actor, action: 'platform:conversation.linked', resourceType: CONVERSATION, resourceId: conversationId, correlationId, data: { to_type: target.type, to_id: target.id } });
+/**
+ * Links a conversation to a record in the link index, always with an audit entry.
+ *
+ * - `about`: confirmed — an agent linked it, or a verified customer named it. Only these
+ *   links make the customer receive updates about the record.
+ * - `mentioned`: an unverified customer named the record to a bot. Agents see it; the
+ *   customer gets nothing further until an agent confirms it.
+ */
+export async function linkRecord(p: Platform, tx: Tx, tenantId: string, actor: Pick<Principal, 'type' | 'id'>, conversationId: string, target: { type: string; id: string }, correlationId: string, rel: 'about' | 'mentioned' = 'about') {
+  const base = { tenant_id: tenantId, from_type: CONVERSATION, from_id: conversationId, to_type: target.type, to_id: target.id };
+  if (rel === 'mentioned') {
+    const confirmed = await tx.selectFrom('record_link').select('rel').where('from_type', '=', CONVERSATION).where('from_id', '=', conversationId).where('to_type', '=', target.type).where('to_id', '=', target.id).where('rel', '=', 'about').executeTakeFirst();
+    if (confirmed) return false;
+  } else {
+    await tx.deleteFrom('record_link').where('tenant_id', '=', tenantId).where('from_type', '=', CONVERSATION).where('from_id', '=', conversationId).where('to_type', '=', target.type).where('to_id', '=', target.id).where('rel', '=', 'mentioned').execute();
+  }
+  const ins = await tx.insertInto('record_link').values({ ...base, rel, source_event: null }).onConflict((oc) => oc.doNothing()).returning('to_id').executeTakeFirst();
+  if (ins) await recordChange(p, tx, { tenantId, actor, action: 'platform:conversation.linked', resourceType: CONVERSATION, resourceId: conversationId, correlationId, data: { to_type: target.type, to_id: target.id, rel } });
   return Boolean(ins);
 }
 
@@ -495,7 +527,9 @@ export function linkedUpdatesConsumer(p: Platform): Consumer {
       const w = watched.get(`${event.app}:${event.type}`);
       const recordId = w ? event.data[w.idPath] : null;
       if (!w || typeof recordId !== 'string') return;
-      const links = await tx.selectFrom('record_link').select('from_id').where('from_type', '=', CONVERSATION).where('to_type', '=', w.resource).where('to_id', '=', recordId).limit(20).execute();
+      // Only confirmed links (`about`): a record an unverified visitor merely named never
+      // subscribes that visitor to its updates.
+      const links = await tx.selectFrom('record_link').select('from_id').where('from_type', '=', CONVERSATION).where('rel', '=', 'about').where('to_type', '=', w.resource).where('to_id', '=', recordId).limit(20).execute();
       if (!links.length) return;
       // `cancelled` also emits a status change: announce the specific event only.
       if (event.type.endsWith('.status_changed') && event.data.to === 'cancelled') return;

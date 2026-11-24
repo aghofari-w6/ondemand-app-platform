@@ -21,7 +21,7 @@ import { WIDGET_JS, widgetDemoHtml, widgetFrameHtml } from '../widget-assets.ts'
 const SESSION_TTL_MS = 30 * 24 * 3600_000;
 const STREAM_MAX_MS = 15 * 60_000;
 const MAX_TEXT = 2000;
-const LIMITS = { sessionPerIp: 30, messagePerVisitor: 20, messagePerTenant: 600, streamsPerVisitor: 12 };
+const LIMITS = { sessionPerIp: 30, sessionPerWidget: 600, messagePerVisitor: 20, messagePerTenant: 600, streamsPerVisitor: 12, openStreamsPerWidget: 500, openStreamsPerVisitor: 3 };
 
 interface Session {
   t: string;
@@ -33,10 +33,23 @@ interface Session {
 }
 
 const SessionBody = z.object({ key: z.string().max(80), visitor_token: z.string().max(1000).optional(), identity: z.object({ user_id: z.string().min(1).max(200), hash: z.string().regex(/^[0-9a-fA-F]{64}$/) }).optional() });
-const MessageBody = z.object({ text: z.string().trim().min(1).max(MAX_TEXT) });
+const MessageBody = z.object({ text: z.string().trim().min(1).max(MAX_TEXT), client_id: z.string().regex(/^[A-Za-z0-9-]{8,64}$/).optional() });
 const EmailBody = z.object({ email: z.email().max(200) });
 
 export function widgetRoutes(p: Platform) {
+  // Open event streams per widget and per visitor: a hard ceiling whatever the request rate.
+  const openStreams = new Map<string, number>();
+  const hold = (key: string, max: number) => {
+    const n = openStreams.get(key) ?? 0;
+    if (n >= max) return false;
+    openStreams.set(key, n + 1);
+    return true;
+  };
+  const release = (key: string) => {
+    const n = (openStreams.get(key) ?? 1) - 1;
+    if (n <= 0) openStreams.delete(key);
+    else openStreams.set(key, n);
+  };
   const sign = (body: string) => p.ports.vault.mac(body, 'widget-session');
   const issue = (s: Session) => {
     const body = Buffer.from(JSON.stringify(s)).toString('base64url');
@@ -136,6 +149,8 @@ export function widgetRoutes(p: Platform) {
       if (!k) throw new CommandError(404, 'widget_not_found', 'this chat is not available');
       const account = await loadAccount(k.tenantId, k.accountId);
       cors(req, reply, account);
+      // The address can be forged behind a proxy, so the widget as a whole is limited too.
+      limited(`widget:session:${k.accountId}`, LIMITS.sessionPerWidget);
       // A returning visitor keeps their conversation; a token for another widget is ignored.
       const prior = read(body.visitor_token);
       const visitor = prior && prior.t === k.tenantId && prior.a === k.accountId ? prior.v : randomUUID();
@@ -164,12 +179,12 @@ export function widgetRoutes(p: Platform) {
       limited(`widget:msg:${s.a}:${s.v}`, LIMITS.messagePerVisitor);
       limited(`widget:tenant:${s.t}`, LIMITS.messagePerTenant);
       const body = parse(MessageBody, req.body);
-      const externalId = `w:${randomUUID()}`;
-      const r = await ingestMessage(p, s.t, account, { threadKey: threadKey(s), externalId, text: body.text, contact: { name: null }, identities: identities(s), correlationId: `widget:${externalId.slice(2)}` });
-      if ('duplicate' in r) throw new CommandError(409, 'duplicate', 'this message was already sent');
+      // The frame sends an id per message: a resend after a lost response is the same message.
+      const externalId = `w:${body.client_id ?? randomUUID()}`;
+      const r = await ingestMessage(p, s.t, account, { threadKey: threadKey(s), externalId, text: body.text, contact: { name: null }, identities: identities(s), correlationId: `widget:${randomUUID()}` });
       p.ports.realtime.publish(`widget:${s.a}:${threadKey(s)}`);
-      const m = await p.database.withTenant(s.t, (tx) => tx.selectFrom('conv_message').select(['id', 'seq', 'direction', 'author_type', 'body', 'meta', 'created_at']).where('id', '=', r.messageId).executeTakeFirstOrThrow());
-      return reply.code(201).send({ message: view(m as any) });
+      const m = await p.database.withTenant(s.t, (tx) => tx.selectFrom('conv_message').select(['id', 'seq', 'direction', 'author_type', 'body', 'meta', 'created_at']).where('conversation_id', '=', r.conversationId).where('external_id', '=', externalId).executeTakeFirstOrThrow());
+      return reply.code('duplicate' in r ? 200 : 201).send({ message: view(m as any) });
     });
 
     /** Optional email capture: stored encrypted on the contact, and as an (unverified) identity. */
@@ -191,6 +206,12 @@ export function widgetRoutes(p: Platform) {
     app.get('/widget/api/events', async (req, reply) => {
       const { s } = await sessionOf(req, reply, String((req.query as { token?: string }).token ?? ''));
       limited(`widget:sse:${s.a}:${s.v}`, LIMITS.streamsPerVisitor);
+      const slots = [`w:${s.a}`, `v:${s.a}:${s.v}`] as const;
+      if (!hold(slots[0], LIMITS.openStreamsPerWidget)) throw new CommandError(503, 'busy', 'the chat is busy; new messages still arrive when you send one');
+      if (!hold(slots[1], LIMITS.openStreamsPerVisitor)) {
+        release(slots[0]);
+        throw new CommandError(429, 'rate_limited', 'too many open chat windows');
+      }
       const origin = req.headers.origin;
       reply.hijack();
       const res = reply.raw;
@@ -205,19 +226,25 @@ export function widgetRoutes(p: Platform) {
       const mine = `widget:${s.a}:${threadKey(s)}`;
       try {
         res.write('event: ready\ndata: {}\n\n');
+        // The conversation is looked up once, and again only when this visitor's own topic
+        // is published (their first message): an idle visitor costs no queries.
+        let look = true;
         while (!ac.signal.aborted && Date.now() < deadline) {
-          if (!conversationId) {
+          if (!conversationId && look) {
             conversationId = (await conversationOf(s))?.id ?? null;
             // Anything that happened before we started listening is picked up by this refresh.
             if (conversationId) res.write('event: changed\ndata: {}\n\n');
           }
           const published = await p.ports.realtime.wait(conversationId ? [`conversation:${conversationId}`] : [mine], 25_000, ac.signal, cursor);
           if (ac.signal.aborted) break;
+          look = published;
           res.write(published && conversationId ? 'event: changed\ndata: {}\n\n' : ': keep-alive\n\n');
         }
       } catch (e) {
         p.log.warn({ err: String(e) }, 'widget stream failed');
       } finally {
+        release(slots[0]);
+        release(slots[1]);
         res.off('close', onClose);
         if (!res.writableEnded) res.end();
       }

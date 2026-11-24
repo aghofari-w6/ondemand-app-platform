@@ -466,6 +466,21 @@ function Conversation(props: { id: string; onGone: () => void }) {
           )}
         </Card>
 
+        {((detail.data.possible_matches ?? []) as any[]).length > 0 && (
+          <Card title="Possibly the same person">
+            <p className="text-sm text-muted">These conversations use the same email address. It was not verified, so they are not merged: check before you share anything.</p>
+            <ul className="flex flex-col text-sm">
+              {(detail.data.possible_matches as { id: string; channel: string; status: string; last_message_at: string }[]).map((o) => (
+                <li key={o.id}>
+                  <Link to="/inbox" search={conversationSearch(o.id)} className="inline-flex min-h-11 flex-wrap items-center gap-2 text-accent underline">
+                    {CHANNEL[o.channel] ?? o.channel} · {dateTime(o.last_message_at)} <Badge value={o.status} />
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </Card>
+        )}
+
         {(detail.data.other_conversations as any[]).length > 0 && (
           <Card title="Other conversations">
             <ul className="flex flex-col text-sm">
