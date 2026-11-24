@@ -1,7 +1,8 @@
 import type { Env, PlatformConfig } from '../config.ts';
 import type { Database } from '../db/database.ts';
-import type { Analytics, Auth, Billing, Channel, EventBus, Files, Jobs, Llm, Metrics, Retriever, Sandbox, Search, Telemetry, Vault, Webhooks } from '../ports/index.ts';
+import type { Analytics, Auth, Billing, Channel, EventBus, Files, Jobs, Llm, Metrics, RateLimit, Realtime, Retriever, Sandbox, Search, Telemetry, Vault, Webhooks } from '../ports/index.ts';
 import type { Catalog } from './catalog.ts';
+import type { ChannelSender } from './conversations/inbox.ts';
 import type { HubDeliverer } from './hub.ts';
 import type { IndexBuilder } from './maintenance.ts';
 import type { WorkflowRunner } from './workflows/engine.ts';
@@ -20,7 +21,7 @@ export interface Platform {
   database: Database;
   log: Logger;
   /** in-process background workers (started by startWorkers) */
-  workers: { hub: HubDeliverer; workflows: WorkflowRunner; indexes: IndexBuilder | null };
+  workers: { hub: HubDeliverer; workflows: WorkflowRunner; channels: ChannelSender; indexes: IndexBuilder | null };
   ports: {
     eventBus: EventBus;
     search: Search;
@@ -37,5 +38,7 @@ export interface Platform {
     sandbox: Sandbox;
     billing: Billing;
     analytics: Analytics;
+    rateLimit: RateLimit;
+    realtime: Realtime;
   };
 }

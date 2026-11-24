@@ -88,9 +88,103 @@ export interface DeliveryResult {
   durationMs: number;
 }
 
-/** Email/SMS/Telegram later; demo mode shows the message on screen. */
+/**
+ * Messaging channels. `send` notifies staff (demo mode shows the message on screen);
+ * `telegram` and `gmail` are API clients for customer conversations (Milestone E). Both go
+ * through the outbound policy (SSRF check, timeouts, capped responses) and are tested
+ * against mock servers only until live checks are approved (plan decision 6).
+ */
 export interface Channel {
   send(msg: { tenantId: string; to: string; subject: string; body: string; link?: string }): Promise<{ via: string; preview?: { subject: string; link?: string } }>;
+  telegram: TelegramTransport;
+  gmail: GmailTransport;
+}
+
+/** Result of one outbound send. `retryable: false` dead-letters at once; `reconnect` asks the tenant to connect again. */
+export interface ChannelSendResult {
+  ok: boolean;
+  externalId?: string;
+  /** channel thread the message landed in (Gmail thread id) */
+  threadId?: string;
+  error?: string;
+  retryable?: boolean;
+  reconnect?: boolean;
+}
+
+/** Telegram Bot API. */
+export interface TelegramTransport {
+  getMe(token: string): Promise<{ id: number; username: string }>;
+  setWebhook(token: string, url: string, secretToken: string): Promise<void>;
+  deleteWebhook(token: string): Promise<void>;
+  sendMessage(token: string, chatId: string, text: string, replyToMessageId?: number): Promise<ChannelSendResult>;
+}
+
+export interface GmailMessage {
+  id: string;
+  threadId: string;
+  historyId: string;
+  labelIds: string[];
+  from: string;
+  to: string;
+  subject: string;
+  /** RFC 5322 Message-ID and References headers (threading) */
+  messageId: string;
+  references: string;
+  text: string;
+  attachments: { attachmentId: string; filename: string; mimeType: string; size: number }[];
+}
+
+/** The mailbox must be connected again (revoked access, or a Testing-mode refresh token past its 7 days). */
+export class ReconnectRequired extends Error {
+  constructor(message = 'Gmail access expired or was revoked; reconnect the mailbox') {
+    super(message);
+    this.name = 'ReconnectRequired';
+  }
+}
+
+/** Gmail API + Google OAuth (offline access). The OAuth client belongs to the deployment (plan decision 8). */
+export interface GmailTransport {
+  configured(): boolean;
+  authorizationUrl(p: { redirectUri: string; state: string }): string;
+  exchangeCode(p: { code: string; redirectUri: string }): Promise<{ refreshToken: string; accessToken: string }>;
+  /** Throws ReconnectRequired on `invalid_grant`. */
+  accessToken(refreshToken: string): Promise<string>;
+  profile(accessToken: string): Promise<{ emailAddress: string; historyId: string }>;
+  /** Message ids added to the inbox since `startHistoryId`; `expired` when the cursor is too old. */
+  history(accessToken: string, startHistoryId: string): Promise<{ messageIds: string[]; historyId: string; expired: boolean }>;
+  /** Recent inbox message ids (used once after connecting or when the history cursor expired). */
+  listRecent(accessToken: string, max: number): Promise<string[]>;
+  getMessage(accessToken: string, id: string): Promise<GmailMessage | null>;
+  /** Streams an attachment's bytes, capped at `maxBytes`. */
+  attachment(accessToken: string, messageId: string, attachmentId: string, maxBytes: number): Promise<AsyncIterable<Uint8Array>>;
+  send(accessToken: string, msg: { from: string; to: string; subject: string; text: string; threadId?: string; inReplyTo?: string; references?: string }): Promise<ChannelSendResult>;
+}
+
+/**
+ * Plain HTTPS API calls to platform-configured services (Telegram, Google, Voyage) under
+ * the same outbound policy as Hub deliveries. Never used for tenant-supplied URLs.
+ */
+export interface OutboundHttp {
+  json(req: { url: string; method?: string; headers?: Record<string, string>; body?: unknown; form?: Record<string, string>; maxBytes?: number }): Promise<{ status: number; ok: boolean; body: any; retryAfterMs: number | null }>;
+  /** A capped byte stream of the response body. */
+  stream(req: { url: string; headers?: Record<string, string>; maxBytes: number }): Promise<{ status: number; ok: boolean; body: AsyncIterable<Uint8Array> }>;
+}
+
+/** Fixed-window request limits (a token bucket in PostgreSQL in Milestone F); in-process and bounded now. */
+export interface RateLimit {
+  /** True if the call is allowed; counts it. */
+  take(key: string, limit: number, windowMs: number): boolean;
+}
+
+/** In-process fan-out of "something changed" signals to open SSE streams (Redis pub/sub later). */
+export interface Realtime {
+  publish(topic: string): void;
+  /**
+   * Resolves true when one of `topics` was published since this `cursor` last saw it,
+   * false after `timeoutMs` or when `signal` aborts. The cursor (one per stream) makes a
+   * publish between two waits impossible to miss.
+   */
+  wait(topics: string[], timeoutMs: number, signal: AbortSignal, cursor: Map<string, number>): Promise<boolean>;
 }
 
 /** Keycloak later; in-process OIDC (openid-client) and SAML (node-saml) now. */
@@ -178,14 +272,64 @@ export interface Telemetry {
   traceparent(): string | null;
 }
 
-/** Claude API. Used by the assistant (later milestone); the adapter is real. */
-export interface Llm {
-  complete(p: { system?: string; messages: { role: 'user' | 'assistant'; content: string }[]; maxTokens?: number }): Promise<{ text: string; model: string }>;
+/** Provider-neutral content blocks. `opaque` blocks (e.g. thinking) are replayed to the provider unchanged. */
+export type LlmBlock =
+  | { type: 'text'; text: string }
+  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean }
+  | { type: 'opaque'; raw: unknown };
+export interface LlmMessage {
+  role: 'user' | 'assistant';
+  content: string | LlmBlock[];
+}
+export interface LlmTool {
+  name: string;
+  description: string;
+  /** JSON Schema of the tool input */
+  inputSchema: Record<string, unknown>;
+}
+export interface LlmChatResult {
+  content: LlmBlock[];
+  /** `refusal` and `max_tokens` turns must never have their tool calls executed */
+  stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | 'refusal' | 'other';
+  usage: { inputTokens: number; outputTokens: number };
+  model: string;
 }
 
-/** Vector search later. Not used before the assistant milestone. */
+/** Claude API (model id from CLAUDE_MODEL). `chat` streams text and supports tool use. */
+export interface Llm {
+  complete(p: { system?: string; messages: { role: 'user' | 'assistant'; content: string }[]; maxTokens?: number }): Promise<{ text: string; model: string }>;
+  chat(p: { system: string; messages: LlmMessage[]; tools?: LlmTool[]; maxTokens?: number; onText?: (delta: string) => void; signal?: AbortSignal }): Promise<LlmChatResult>;
+}
+
+export interface RetrievedChunk {
+  id: string;
+  sourceId: string;
+  title: string;
+  kind: 'document' | 'help' | 'record';
+  /** set for record chunks: the record the chunk describes */
+  ref: { type: string; id: string } | null;
+  text: string;
+  score: number;
+}
+
+/** Text embeddings (Voyage AI; a deterministic fake in CI and local runs). */
+export interface Embeddings {
+  model: string;
+  dimension: number;
+  embed(texts: string[], inputType: 'document' | 'query'): Promise<{ vectors: number[][]; tokens: number }>;
+}
+
+/**
+ * Knowledge retrieval: pgvector cosine similarity fused with PostgreSQL full-text ranking
+ * (reciprocal-rank fusion) over `doc_chunk`. Every call is scoped to one tenant.
+ */
 export interface Retriever {
-  retrieve(tenantId: string, query: string, k: number): Promise<{ id: string; text: string; score: number }[]>;
+  /** (Re)chunks and embeds one source. Chunks are searchable by text before their embeddings arrive. */
+  index(tenantId: string, sourceId: string, text: string): Promise<{ chunks: number; embedded: number; tokens: number }>;
+  /** Embeds chunks still missing an embedding (backfill after an embeddings outage or model change). */
+  embedPending(tenantId: string, sourceId: string): Promise<{ embedded: number; remaining: number; tokens: number }>;
+  retrieve(tenantId: string, query: string, k: number, opts?: { kinds?: RetrievedChunk['kind'][]; publicOnly?: boolean }): Promise<{ hits: RetrievedChunk[]; tokens: number }>;
 }
 
 /** isolated-vm sandbox for custom connector code steps (Milestone B). */
@@ -202,6 +346,11 @@ export interface PlanLimits {
   workflow_nodes: number;
   workflow_runs_month: number;
   workflow_runs_per_chain: number;
+  /** assistant + bot tokens (input + output) per calendar month */
+  assistant_tokens_month: number;
+  channels: number;
+  bot_flows: number;
+  knowledge_sources: number;
 }
 
 /** Billing provider later; plans from config/platform.yaml now. */

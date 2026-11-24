@@ -9,5 +9,11 @@ export const QUEUES = {
   reportSchedules: 'analytics-report-schedules',
   retention: 'governance-retention',
   filesCleanup: 'files-cleanup',
+  knowledgeIndex: 'knowledge-index',
+  knowledgeSweep: 'knowledge-sweep',
+  assistantResume: 'assistant-resume',
+  botTurn: 'bot-turn',
+  gmailSchedule: 'gmail-schedule',
+  gmailPoll: 'gmail-poll',
 } as const;
 export const ALL_QUEUES = Object.values(QUEUES);

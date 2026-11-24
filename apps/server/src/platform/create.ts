@@ -1,4 +1,8 @@
-import { createAuth, createBilling, createChannel, createLlm, createMetrics, createTelemetry, createVault, pgSearch, stubRetriever } from '../adapters/index.ts';
+import { createAuth, createBilling, createChannel, createLlm, createMetrics, createTelemetry, createVault, pgSearch } from '../adapters/index.ts';
+import { createGmail, createTelegram } from '../adapters/channels.ts';
+import { createFakeLlm } from '../adapters/fake-llm.ts';
+import { createOutboundHttp, createRateLimit, createRealtime } from '../adapters/outbound-http.ts';
+import { createFakeEmbeddings, createPgVectorRetriever, createVoyageEmbeddings } from '../adapters/retriever.ts';
 import { pgAnalytics } from '../adapters/pg-analytics.ts';
 import { createPgFiles } from '../adapters/pg-files.ts';
 import { registerAnalyticsJobs } from './analytics/jobs.ts';
@@ -20,6 +24,11 @@ import { handleStepJob } from './provisioning.ts';
 import { QUEUES } from './queues.ts';
 import { TEMPLATES } from './templates.ts';
 import { notificationsConsumer, WorkflowRunner, workflowsConsumer } from './workflows/engine.ts';
+import { assistantApprovalsConsumer } from './assistant/agent.ts';
+import { botConsumer } from './bot/runner.ts';
+import { ChannelSender, linkedUpdatesConsumer, realtimeConsumer } from './conversations/inbox.ts';
+import { registerConversationJobs } from './conversations/jobs.ts';
+import { knowledgeRecordsConsumer } from './knowledge.ts';
 import { handleLifecycleJob, lifecycleSweep } from './tenants.ts';
 
 const consoleLogger: Logger = {
@@ -36,6 +45,11 @@ export function createPlatform(opts: { env?: Partial<Record<keyof Env, string>>;
   const database = createDatabase(env.DATABASE_URL, { max: 15 });
   const metrics = createMetrics();
   const vault = createVault(env.VAULT_KEY, (m) => log.warn({}, m));
+  const policy = policyFrom(env.HUB_ALLOW_PRIVATE_HOSTS, env.NODE_ENV === 'production');
+  // Platform-configured API clients (Telegram, Google, Voyage) share one policed HTTP client.
+  const http = createOutboundHttp(policy);
+  const useVoyage = (env.EMBEDDINGS_ADAPTER ?? (env.VOYAGE_API_KEY ? 'voyage' : 'fake')) === 'voyage';
+  const embeddings = useVoyage ? createVoyageEmbeddings(http, { apiKey: env.VOYAGE_API_KEY, baseUrl: env.VOYAGE_API_URL, model: env.EMBEDDINGS_MODEL, dimension: env.EMBEDDINGS_DIM }) : createFakeEmbeddings(env.EMBEDDINGS_DIM);
   const p: Platform = {
     workers: undefined as unknown as Platform['workers'],
     env,
@@ -48,17 +62,22 @@ export function createPlatform(opts: { env?: Partial<Record<keyof Env, string>>;
       search: pgSearch,
       metrics,
       jobs: createPgBossJobs(env.DATABASE_URL, (m) => log.warn({}, m), { pollingIntervalSeconds: opts.jobsPollSeconds ?? 0.5 }),
-      webhooks: createDelivery(policyFrom(env.HUB_ALLOW_PRIVATE_HOSTS, env.NODE_ENV === 'production'), { production: env.NODE_ENV === 'production', log: (msg, err) => log.warn({ err: String(err) }, msg) }),
-      channel: createChannel(env.DEMO_MODE, (m) => log.info({}, m)),
+      webhooks: createDelivery(policy, { production: env.NODE_ENV === 'production', log: (msg, err) => log.warn({ err: String(err) }, msg) }),
+      channel: createChannel(env.DEMO_MODE, (m) => log.info({}, m), {
+        telegram: createTelegram(http, env.TELEGRAM_API_URL),
+        gmail: createGmail(http, { clientId: env.GOOGLE_OAUTH_CLIENT_ID, clientSecret: env.GOOGLE_OAUTH_CLIENT_SECRET, oauthUrl: env.GOOGLE_OAUTH_URL, tokenUrl: env.GOOGLE_TOKEN_URL, apiUrl: env.GMAIL_API_URL }),
+      }),
       auth: createAuth({ allowInsecureIssuers: env.NODE_ENV !== 'production' }),
       vault,
       files: createPgFiles(database, vault),
       telemetry: createTelemetry(),
-      llm: createLlm(env.ANTHROPIC_API_KEY, env.CLAUDE_MODEL),
-      retriever: stubRetriever,
+      llm: env.LLM_ADAPTER === 'fake' ? createFakeLlm() : createLlm(env.ANTHROPIC_API_KEY, env.CLAUDE_MODEL, undefined, { fallbacks: env.CLAUDE_FALLBACKS }),
+      retriever: createPgVectorRetriever(database, embeddings),
       sandbox: createSandbox(),
       billing: createBilling(config),
       analytics: pgAnalytics,
+      rateLimit: createRateLimit(),
+      realtime: createRealtime(),
     },
   };
   for (const c of templateConsumers(p)) p.ports.eventBus.subscribe(c);
@@ -67,7 +86,12 @@ export function createPlatform(opts: { env?: Partial<Record<keyof Env, string>>;
   p.ports.eventBus.subscribe(workflowsConsumer(p));
   p.ports.eventBus.subscribe(notificationsConsumer(p));
   p.ports.eventBus.subscribe(metricsConsumer(p));
-  p.workers = { hub: new HubDeliverer(p), workflows: new WorkflowRunner(p), indexes: null };
+  p.ports.eventBus.subscribe(knowledgeRecordsConsumer(p));
+  p.ports.eventBus.subscribe(assistantApprovalsConsumer(p));
+  p.ports.eventBus.subscribe(botConsumer(p));
+  p.ports.eventBus.subscribe(realtimeConsumer(p));
+  p.ports.eventBus.subscribe(linkedUpdatesConsumer(p));
+  p.workers = { hub: new HubDeliverer(p), workflows: new WorkflowRunner(p), channels: new ChannelSender(p), indexes: null };
   return p;
 }
 
@@ -80,9 +104,11 @@ export async function startWorkers(p: Platform) {
   await p.ports.jobs.schedule(QUEUES.lifecycleSweep, '*/5 * * * *');
   await p.ports.jobs.work<{ tenantId: string; runId: string }>(QUEUES.backfill, (data) => runBackfill(p, data));
   await registerAnalyticsJobs(p);
+  await registerConversationJobs(p, { schedules: true });
   await p.ports.eventBus.start();
   p.workers.hub.start();
   p.workers.workflows.start();
+  p.workers.channels.start();
   const ownerUrl = p.env.INDEX_DATABASE_URL ?? p.env.MIGRATION_DATABASE_URL;
   if (ownerUrl) {
     const builder = new IndexBuilder(p, ownerUrl);
@@ -106,6 +132,7 @@ export async function stopPlatform(p: Platform) {
   if (indexTimer) clearTimeout(indexTimer);
   await p.workers.hub.stop();
   await p.workers.workflows.stop();
+  await p.workers.channels.stop();
   await p.ports.eventBus.stop();
   await p.ports.jobs.stop();
   await p.database.close();

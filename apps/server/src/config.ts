@@ -46,6 +46,31 @@ const Env = z.object({
   HUB_BACKOFF_BASE_MS: z.coerce.number().int().min(1).default(2000),
   HUB_BREAKER_THRESHOLD: z.coerce.number().int().min(1).default(5),
   HUB_BREAKER_COOLDOWN_MS: z.coerce.number().int().min(1).default(60_000),
+  /** `claude` calls the Claude API; `fake` is the deterministic scripted model for CI, e2e and local demos */
+  LLM_ADAPTER: z.enum(['claude', 'fake']).default('claude'),
+  /** server-side refusal fallbacks on Claude requests (beta); turn off if the deployment must not use them */
+  CLAUDE_FALLBACKS: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
+  /** `voyage` calls Voyage AI; `fake` is the deterministic local embedder (default without a key) */
+  EMBEDDINGS_ADAPTER: z.enum(['voyage', 'fake']).optional(),
+  VOYAGE_API_KEY: z.string().optional(),
+  VOYAGE_API_URL: z.string().default('https://api.voyageai.com'),
+  EMBEDDINGS_MODEL: z.string().default('voyage-3.5'),
+  /** must equal the `doc_chunk.embedding vector(n)` column size */
+  EMBEDDINGS_DIM: z.coerce.number().int().min(8).default(1024),
+  TELEGRAM_API_URL: z.string().default('https://api.telegram.org'),
+  /** Gmail OAuth client of the deployment (the product owner's Google Cloud project); never in the repo */
+  GOOGLE_OAUTH_CLIENT_ID: z.string().optional(),
+  GOOGLE_OAUTH_CLIENT_SECRET: z.string().optional(),
+  GOOGLE_OAUTH_URL: z.string().default('https://accounts.google.com'),
+  GOOGLE_TOKEN_URL: z.string().default('https://oauth2.googleapis.com'),
+  GMAIL_API_URL: z.string().default('https://gmail.googleapis.com'),
+  /** Gmail History API polling interval, seconds */
+  GMAIL_POLL_SECONDS: z.coerce.number().int().min(1).default(30),
+  /** channel sender poll interval, ms */
+  CHANNEL_INTERVAL_MS: z.coerce.number().default(500),
 });
 export type Env = z.infer<typeof Env>;
 
@@ -63,6 +88,10 @@ const Plan = z.object({
     workflow_runs_month: z.int().nonnegative(),
     /** runs one correlation chain may start (fan-out budget; hops are capped separately) */
     workflow_runs_per_chain: z.int().positive(),
+    assistant_tokens_month: z.int().nonnegative(),
+    channels: z.int().nonnegative(),
+    bot_flows: z.int().nonnegative(),
+    knowledge_sources: z.int().nonnegative(),
   }),
 });
 const PlatformConfig = z.object({

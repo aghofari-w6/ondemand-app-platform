@@ -68,6 +68,12 @@ async function resolve(p: Platform, tx: Tx, principal: Principal, type: string, 
     }
     return { app: 'custom', entity: e.key, label: e.label, title: r ? (title ?? id.slice(0, 8)) : null, path: `/data/${e.key}/${id}` };
   }
+  if (type === 'platform::Conversation') {
+    // A customer conversation linked to a record: shown to those who may read the Inbox, without any message text.
+    if (authorize(principal, action('platform:inbox.read'), { type, id, tenantId: principal.tenantId }).decision === 'deny') return null;
+    const c = await tx.selectFrom('conversation').select(['channel', 'status']).where('id', '=', id).executeTakeFirst();
+    return c ? { app: 'platform', entity: 'conversation', label: 'Conversation', title: `${c.channel} (${c.status})`, path: `/inbox?c=${id}` } : null;
+  }
   for (const m of p.catalog.manifests()) {
     const e = m.entities.find((x) => x.resource === type);
     if (!e) continue;
