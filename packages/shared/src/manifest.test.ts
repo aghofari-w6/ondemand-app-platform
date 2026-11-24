@@ -56,6 +56,27 @@ describe('manifest validator', () => {
     expect(p).toMatch(/condition does not parse/);
   });
 
+  it('validates two-way sync declarations (no PII, own events, own commands)', () => {
+    const base = load('ordering').raw;
+    expect(base.sync[0]).toMatchObject({ entity: 'order', status: { field: 'status' } });
+    const pii = clone(base);
+    pii.sync[0].fields.push('customer_phone');
+    expect(problems(pii).join()).toMatch(/sync order: field customer_phone is PII and may not be synced/);
+    const bad = clone(base);
+    bad.sync[0].events.push('order.exploded');
+    bad.sync[0].update.command = 'order.teleport';
+    bad.sync[0].update.fields = ['weight'];
+    bad.sync[0].status.cancel.value = 'gone';
+    const p = problems(bad).join('\n');
+    expect(p).toMatch(/event order.exploded is not published by this entity/);
+    expect(p).toMatch(/unknown command order.teleport/);
+    expect(p).toMatch(/unknown field weight/);
+    expect(p).toMatch(/cancel value gone is not an option of status/);
+    const unknown = clone(base);
+    unknown.sync[0].entity = 'parcel';
+    expect(problems(unknown).join()).toMatch(/sync parcel: unknown entity/);
+  });
+
   it('requires later releases to be expand-only', () => {
     const { raw, sources } = load('ordering');
     const bad = { ...sources, '20261101100002_ordering_pickup_eta.sql': '-- Up Migration\nALTER TABLE ord_order DROP COLUMN notes;' };

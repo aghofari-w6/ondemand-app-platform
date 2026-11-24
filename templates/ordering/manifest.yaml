@@ -102,6 +102,7 @@ analytics:
 assistant:
   tools:
     - { name: list_open_orders, description: List open orders., risk: read, view: open }
+    - { name: find_order, description: Find orders by number or other search text., risk: read, view: all }
     - { name: advance_order, description: Move an order to its next status., risk: low, command: order.advance }
     - { name: cancel_order, description: Cancel an order., risk: high, command: order.cancel }
 
@@ -118,6 +119,17 @@ permissions:
 
 links:
   - { on: order.created, from: { resource: "ordering::Order", id: data.order_id }, to: { resource: "pos::Sale", id: data.pos_sale_id }, rel: from_sale }
+
+# Two-way sync (Integration Hub): non-PII fields go out; inbound changes run these commands.
+sync:
+  - entity: order
+    events: [order.created, order.updated, order.status_changed, order.cancelled]
+    fields: [number, status, channel, store, total, notes]
+    update: { command: order.update, fields: [notes] }
+    status:
+      field: status
+      advance: order.advance
+      cancel: { command: order.cancel, value: cancelled }
 
 config:
   currency: IDR

@@ -1,9 +1,10 @@
 import { randomBytes } from 'node:crypto';
-import { backoffMs, CommandError, ConnectorSpec, expr, type EndpointInput, type EventEnvelope, type Principal } from '@aod/shared';
+import { backoffMs, CommandError, ConnectorSpec, expr, type EndpointInput, type Entity, type EventEnvelope, type Principal, type SyncDecl } from '@aod/shared';
 import { sql } from 'kysely';
 import { z } from 'zod';
 import { newId, type Tx } from '../db/database.ts';
 import type { Consumer, DeliveryTarget, OutboundMessage } from '../ports/index.ts';
+import { activeApps, executeCommand } from './commands.ts';
 import type { Platform } from './context.ts';
 import { executeRecordWrite, loadEntity } from './records.ts';
 import { recordChange } from './record.ts';
@@ -302,7 +303,7 @@ export class HubDeliverer {
       const d = await tx.selectFrom('hub_delivery').selectAll().where('id', '=', deliveryId).executeTakeFirst();
       if (!d || d.status !== 'delivering') return null;
       const e = await tx.selectFrom('hub_endpoint').selectAll().where('id', '=', d.endpoint_id).executeTakeFirst();
-      const ev = await tx.selectFrom('event_log').select('payload').where('id', '=', d.event_id).executeTakeFirst();
+      const ev = await tx.selectFrom('event_log').select(['payload', 'aggregateid']).where('id', '=', d.event_id).executeTakeFirst();
       if (!e || !ev) {
         await tx.updateTable('hub_delivery').set({ status: 'dead', last_error: !e ? 'endpoint removed' : 'event not found', lease_until: null }).where('id', '=', d.id).execute();
         return null;
@@ -329,11 +330,10 @@ export class HubDeliverer {
         await tx.updateTable('hub_delivery').set({ status: 'pending', next_attempt_at: new Date(now + 1000), lease_until: null }).where('id', '=', d.id).execute();
         return null;
       }
-      const sync = await tx.selectFrom('hub_sync').selectAll().where('endpoint_id', '=', e.id).execute();
-      const recordId = (ev.payload as EventEnvelope).data.record_id;
-      const map = sync.length && typeof recordId === 'string' ? await tx.selectFrom('external_id_map').selectAll().where('local_id', '=', recordId).execute() : [];
+      const syncs = await tx.selectFrom('hub_sync').selectAll().where('endpoint_id', '=', e.id).execute();
+      const syncOut = syncs.length ? await loadSyncOut(p, tx, syncs, ev.payload as EventEnvelope, String(ev.aggregateid)) : null;
       const connector = e.connector_id ? await tx.selectFrom('hub_connector').select('spec').where('id', '=', e.connector_id).executeTakeFirst() : null;
-      return { d, e, envelope: ev.payload as EventEnvelope, sync, map, connector };
+      return { d, e, envelope: ev.payload as EventEnvelope, syncOut, connector };
     });
     if (!loaded) return;
     const { d, e, envelope } = loaded;
@@ -361,8 +361,8 @@ export class HubDeliverer {
       });
       return;
     }
-    const sync = loaded.sync.find((s) => envelope.type.startsWith('record.') && envelope.data.entity === s.entity) ?? null;
-    const body = sync ? syncBody(sync, envelope, loaded.map.find((m) => m.sync_id === sync.id)?.external_id ?? null) : JSON.stringify(envelope);
+    const syncOut = loaded.syncOut;
+    const body = syncOut ? syncBody(syncOut, envelope) : JSON.stringify(envelope);
     const msg: OutboundMessage = { id: envelope.id, type: envelope.type, timestamp: new Date(), body };
 
     let result: { ok: boolean; status?: number | undefined; error?: string | undefined; response?: string | undefined; durationMs: number };
@@ -382,7 +382,7 @@ export class HubDeliverer {
       if (result.ok) {
         await tx.updateTable('hub_delivery').set({ status: 'succeeded', attempts: attempt, last_status: result.status ?? null, last_error: null, lease_until: null, updated_at: new Date() }).where('id', '=', d.id).execute();
         await tx.updateTable('hub_endpoint').set({ consecutive_failures: 0, circuit_state: 'closed', circuit_opened_at: null }).where('id', '=', e.id).execute();
-        if (sync) await recordSyncedOut(tx, tenantId, sync.id, envelope, result.response);
+        if (syncOut) await recordSyncedOut(tx, tenantId, syncOut, result.response);
         return;
       }
       const dead = attempt >= this.o.maxAttempts;
@@ -447,24 +447,124 @@ const mapIn = (fieldMap: Record<string, string>, data: Record<string, unknown>) 
   return Object.fromEntries(Object.entries(data).map(([k, v]) => [reverse[k] ?? k, v]));
 };
 
-function syncBody(sync: any, env: EventEnvelope, externalId: string | null) {
-  const d = env.data as { record_id: string; version: number | null; values: Record<string, unknown> | null };
+// A sync's `entity` is a custom entity key, or `<app>:<entity>` for an app entity whose
+// manifest declares it under `sync`. The platform follows that declaration and nothing
+// else: it does not know what an order is.
+
+export interface AppSyncTarget {
+  key: string;
+  app: string;
+  entity: Entity;
+  decl: SyncDecl;
+}
+
+/** The app entity behind a sync's `entity`, if `<app>:<entity>` is declared syncable. */
+export function appSyncTarget(p: Platform, key: string): AppSyncTarget | null {
+  const [app, name, ...rest] = key.split(':');
+  if (!app || !name || rest.length) return null;
+  const m = p.catalog.get(app)?.manifest;
+  const decl = m?.sync.find((x) => x.entity === name);
+  const entity = m?.entities.find((x) => x.name === name);
+  return decl && entity ? { key, app, entity, decl } : null;
+}
+
+const syncFields = (t: AppSyncTarget) => [...new Set([...t.decl.fields, ...(t.decl.update?.fields ?? []), ...(t.decl.status ? [t.decl.status.field] : [])])];
+
+/** App entities this tenant can sync (declared in the manifest of an active app). */
+export async function syncTargets(p: Platform, tx: Tx) {
+  const active = new Set(await activeApps(tx));
+  return p.catalog
+    .manifests()
+    .filter((m) => active.has(m.id))
+    .flatMap((m) =>
+      m.sync.map((d) => ({
+        id: `${m.id}:${d.entity}`,
+        label: `${m.name} · ${m.entities.find((e) => e.name === d.entity)?.label ?? d.entity}`,
+        events: d.events,
+        fields: d.fields,
+        inbound_fields: [...(d.update?.fields ?? []), ...(d.status ? [d.status.field] : [])],
+      })),
+    );
+}
+
+/**
+ * Checks what a new sync points at. An outbound app-entity sync still needs its endpoint to
+ * subscribe to the entity's events: the endpoint's own event types, filter and schema pins
+ * keep deciding what is delivered (same rule as custom records, whose endpoint subscribes
+ * to `record.*`); the sync only changes the body of those deliveries. So an endpoint that
+ * subscribes to none of the declared events is refused here instead of silently sending nothing.
+ */
+export async function assertSyncTarget(p: Platform, tx: Tx, input: { entity: string; endpoint_id?: string | undefined; field_map: Record<string, string> }) {
+  if (!input.entity.includes(':')) {
+    await loadEntity(tx, input.entity);
+    return;
+  }
+  const target = appSyncTarget(p, input.entity);
+  if (!target) throw new CommandError(422, 'not_syncable', `${input.entity} cannot be synced`);
+  if (!(await activeApps(tx)).includes(target.app)) throw new CommandError(409, 'app_not_active', `${target.app} is not active in this workspace`);
+  const known = syncFields(target);
+  const unknown = Object.keys(input.field_map).filter((k) => !known.includes(k));
+  if (unknown.length) throw new CommandError(422, 'invalid_field_map', `not a syncable field of ${input.entity}: ${unknown.join(', ')} (syncable: ${known.join(', ')})`);
+  if (input.endpoint_id) {
+    const e = await tx.selectFrom('hub_endpoint').select('event_types').where('id', '=', input.endpoint_id).executeTakeFirst();
+    const subscribed = target.decl.events.some((ev) => ((e?.event_types as string[] | undefined) ?? []).some((pt) => matchesType(pt, ev)));
+    if (!subscribed) throw new CommandError(422, 'endpoint_not_subscribed', `the endpoint must subscribe to at least one of: ${target.decl.events.join(', ')}`);
+  }
+}
+
+/** What a delivery to a sync endpoint sends instead of the raw event. */
+interface SyncOut {
+  syncId: string;
+  name: string;
+  fieldMap: Record<string, string>;
+  localId: string;
+  externalId: string | null;
+  version: number | null;
+  data: Record<string, unknown> | null;
+  deleted: boolean;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The sync (if any) of this endpoint that the event belongs to, with the record's state. */
+async function loadSyncOut(p: Platform, tx: Tx, syncs: any[], env: EventEnvelope, aggregateId: string): Promise<SyncOut | null> {
+  for (const s of syncs) {
+    let out: Pick<SyncOut, 'localId' | 'version' | 'data' | 'deleted'> | null = null;
+    const target = appSyncTarget(p, s.entity);
+    if (target) {
+      if (env.app !== target.app || !target.decl.events.includes(env.type) || !UUID.test(aggregateId)) continue;
+      // The record's state at send time (not a snapshot from the event), read under RLS;
+      // only the declared, never PII, fields leave. A delivery that waited behind an applied
+      // remote change therefore converges on the current state instead of undoing it.
+      const row = await tx.selectFrom(target.entity.table).select([...target.decl.fields, 'version']).where('id', '=', aggregateId).executeTakeFirst();
+      out = { localId: aggregateId, version: row ? Number(row.version) : null, data: row ? Object.fromEntries(target.decl.fields.map((f) => [f, row[f] ?? null])) : null, deleted: false };
+    } else if (env.type.startsWith('record.') && env.data.entity === s.entity && typeof env.data.record_id === 'string') {
+      const d = env.data as { record_id: string; version: number | null; values: Record<string, unknown> | null };
+      out = { localId: d.record_id, version: d.version, data: d.values, deleted: env.type === 'record.deleted' };
+    }
+    if (!out) continue;
+    const map = await tx.selectFrom('external_id_map').select('external_id').where('sync_id', '=', s.id).where('local_id', '=', out.localId).executeTakeFirst();
+    return { syncId: s.id, name: s.name, fieldMap: s.field_map as Record<string, string>, externalId: map?.external_id ?? null, ...out };
+  }
+  return null;
+}
+
+function syncBody(out: SyncOut, env: EventEnvelope) {
   return JSON.stringify({
-    sync: sync.name,
+    sync: out.name,
     event_id: env.id,
     op: env.type.split('.')[1],
-    local_id: d.record_id,
-    external_id: externalId,
-    version: d.version,
-    data: d.values ? mapOut(sync.field_map as Record<string, string>, d.values) : null,
+    local_id: out.localId,
+    external_id: out.externalId,
+    version: out.version,
+    data: out.data ? mapOut(out.fieldMap, out.data) : null,
     occurred_at: env.occurred_at,
   });
 }
 
-async function recordSyncedOut(tx: Tx, tenantId: string, syncId: string, env: EventEnvelope, response?: string) {
-  const d = env.data as { record_id: string; version: number | null };
-  if (env.type === 'record.deleted') {
-    await tx.deleteFrom('external_id_map').where('sync_id', '=', syncId).where('local_id', '=', d.record_id).execute();
+async function recordSyncedOut(tx: Tx, tenantId: string, out: SyncOut, response?: string) {
+  if (out.deleted) {
+    await tx.deleteFrom('external_id_map').where('sync_id', '=', out.syncId).where('local_id', '=', out.localId).execute();
     return;
   }
   let externalId: string | null = null;
@@ -474,15 +574,108 @@ async function recordSyncedOut(tx: Tx, tenantId: string, syncId: string, env: Ev
   } catch {
     /* remote did not answer JSON */
   }
-  const existing = await tx.selectFrom('external_id_map').selectAll().where('sync_id', '=', syncId).where('local_id', '=', d.record_id).executeTakeFirst();
+  const existing = await tx.selectFrom('external_id_map').selectAll().where('sync_id', '=', out.syncId).where('local_id', '=', out.localId).executeTakeFirst();
   if (existing) {
-    await tx.updateTable('external_id_map').set({ local_version: Math.max(existing.local_version, d.version ?? 0), last_synced_at: new Date() }).where('sync_id', '=', syncId).where('local_id', '=', d.record_id).execute();
+    await tx.updateTable('external_id_map').set({ local_version: Math.max(existing.local_version, out.version ?? 0), last_synced_at: new Date() }).where('sync_id', '=', out.syncId).where('local_id', '=', out.localId).execute();
   } else if (externalId) {
-    await tx.insertInto('external_id_map').values({ tenant_id: tenantId, sync_id: syncId, local_id: d.record_id, external_id: externalId, local_version: d.version ?? 1 }).onConflict((oc) => oc.doNothing()).execute();
+    await tx.insertInto('external_id_map').values({ tenant_id: tenantId, sync_id: out.syncId, local_id: out.localId, external_id: externalId, local_version: out.version ?? 1 }).onConflict((oc) => oc.doNothing()).execute();
   }
 }
 
-export const SyncInboundBody = z.object({ external_id: z.string(), updated_at: z.string(), data: z.record(z.string(), z.unknown()), deleted: z.boolean() });
+export const SyncInboundBody = z.object({ external_id: z.string(), updated_at: z.string(), data: z.record(z.string(), z.unknown()), deleted: z.boolean(), local_id: z.uuid().optional() });
+
+/** Most single steps an inbound status change may take through the advance command. */
+const MAX_STATUS_STEPS = 10;
+
+/**
+ * Inbound change for an app entity. It is applied only through the commands the manifest
+ * declares (authorize, validation, outbox and audit as for any other caller), under the
+ * sync's correlation id so the resulting events are not echoed back to the remote system.
+ * Records are never created or deleted this way.
+ */
+async function applyInboundApp(p: Platform, tx: Tx, tenantId: string, principal: Principal, sync: any, target: AppSyncTarget, change: z.infer<typeof SyncInboundBody>, remoteAt: Date, correlationId: string) {
+  if (!(await activeApps(tx)).includes(target.app)) throw new CommandError(409, 'app_not_active', `${target.app} is not active in this workspace`);
+  const { decl, entity } = target;
+  const what = `${target.app} ${entity.label.toLowerCase()}`;
+  const columns = [...(decl.status ? [decl.status.field] : []), 'version', 'updated_at'];
+  const read = (id: string) => tx.selectFrom(entity.table).select(columns).where('id', '=', id).executeTakeFirst();
+  const run = async (command: string, input: Record<string, unknown>) => (await executeCommand(p, { tenantId, principal, app: target.app, command, input, origin: 'integration', correlationId }, tx)).body;
+
+  let map = await tx.selectFrom('external_id_map').selectAll().where('sync_id', '=', sync.id).where('external_id', '=', change.external_id).executeTakeFirst();
+  if (!map) {
+    // No mapping yet (the remote never answered an outbound delivery with its id): the
+    // remote may name the record it means. Without that there is nothing to apply to.
+    if (!change.local_id) return { result: 'ignored', reason: `unknown record: a ${what} is not created through sync; send local_id to link an existing one` };
+    const row = await read(change.local_id);
+    if (!row) throw new CommandError(404, 'not_found', `${what} ${change.local_id} not found`);
+    const taken = await tx.selectFrom('external_id_map').select('external_id').where('sync_id', '=', sync.id).where('local_id', '=', change.local_id).executeTakeFirst();
+    if (taken) throw new CommandError(409, 'already_linked', `this ${what} is already linked to another external id`);
+    map = await tx.insertInto('external_id_map').values({ tenant_id: tenantId, sync_id: sync.id, local_id: change.local_id, external_id: change.external_id, local_version: Number(row.version) }).returningAll().executeTakeFirstOrThrow();
+  }
+  const localId = map.local_id as string;
+  const touch = (extra: Record<string, unknown> = {}) => tx.updateTable('external_id_map').set({ remote_updated_at: remoteAt, last_synced_at: new Date(), ...extra }).where('sync_id', '=', sync.id).where('local_id', '=', localId).execute();
+  if (map.remote_updated_at && remoteAt <= new Date(map.remote_updated_at)) return { result: 'stale', local_id: localId };
+  let cur = await read(localId);
+  if (!cur) {
+    await tx.deleteFrom('external_id_map').where('sync_id', '=', sync.id).where('local_id', '=', localId).execute();
+    return { result: 'ignored', reason: 'local record was deleted' };
+  }
+  if (change.deleted) return { result: 'ignored', reason: `a ${what} is not deleted through sync`, local_id: localId };
+
+  const values = mapIn(sync.field_map as Record<string, string>, change.data);
+  const updates = Object.fromEntries((decl.update?.fields ?? []).filter((f) => values[f] !== undefined).map((f) => [f, values[f]]));
+  const statusField = decl.status?.field;
+  let statusTo = statusField && values[statusField] !== undefined && values[statusField] !== null ? String(values[statusField]) : null;
+  if (statusTo !== null && statusTo === cur[statusField!]) statusTo = null;
+  const ignored = Object.keys(values).filter((k) => !(k in updates) && k !== statusField);
+  const extra = ignored.length ? { ignored_fields: ignored } : {};
+  if (!Object.keys(updates).length && statusTo === null) {
+    await touch();
+    return { result: 'unchanged', local_id: localId, ...extra };
+  }
+
+  const localChanged = Number(cur.version) > map.local_version;
+  if (localChanged) {
+    const remoteWins = sync.conflict_rule === 'remote_wins' || (sync.conflict_rule === 'last_write_wins' && remoteAt > new Date(cur.updated_at));
+    if (!remoteWins) {
+      await touch();
+      await recordChange(p, tx, { tenantId, actor: principal, action: 'platform:hub.sync_conflict', resourceType: 'platform::HubSync', resourceId: sync.id, correlationId, events: [{ type: 'hub.sync_conflict', data: { sync_id: sync.id, local_id: localId, external_id: change.external_id, rule: sync.conflict_rule, winner: 'platform' } }] });
+      return { result: 'conflict', winner: 'platform', local_id: localId };
+    }
+  }
+
+  if (Object.keys(updates).length) await run(decl.update!.command, { id: localId, version: Number(cur.version), ...updates });
+  if (statusTo !== null) {
+    const status = decl.status!;
+    const options = entity.fields.find((f) => f.key === status.field)?.options;
+    if (options && !options.includes(statusTo)) throw new CommandError(422, 'invalid_status', `${statusTo} is not a ${status.field} of a ${what} (${options.join(', ')})`);
+    const version = async () => Number((await read(localId))!.version);
+    if (status.cancel && statusTo === status.cancel.value) {
+      await run(status.cancel.command, { id: localId, version: await version() });
+    } else if (status.advance) {
+      // One step at a time: each step is its own command (events, audit), and the entity's
+      // own rules decide whether the target can be reached at all.
+      const from = String(cur[status.field]);
+      for (let step = 0; ; step++) {
+        cur = (await read(localId))!;
+        if (cur[status.field] === statusTo) break;
+        const unreachable = (why: string) => new CommandError(409, 'unreachable_status', `cannot move the ${what} from ${from} to ${statusTo}: ${why}`);
+        if (step >= MAX_STATUS_STEPS) throw unreachable(`not reached in ${MAX_STATUS_STEPS} steps`);
+        const before = cur[status.field];
+        await run(status.advance, { id: localId, version: Number(cur.version) }).catch((e: unknown) => {
+          // The entity refused the step; a missing permission or anything else stays as it is.
+          if (e instanceof CommandError && e.status === 409 && e.code !== 'version_conflict') throw unreachable(e.message);
+          throw e;
+        });
+        if ((await read(localId))?.[status.field] === before) throw unreachable(`${status.advance} did not change the ${status.field}`);
+      }
+    } else {
+      throw new CommandError(422, 'invalid_status', `the ${status.field} of a ${what} can only be set to ${status.cancel?.value} through sync`);
+    }
+  }
+  await touch({ local_version: Number((await read(localId))!.version) });
+  return { result: localChanged ? 'conflict' : 'updated', winner: localChanged ? 'remote' : undefined, local_id: localId, ...extra };
+}
 
 /**
  * Applies a change pushed by the remote system. Conflict = both sides changed since the
@@ -492,9 +685,14 @@ export async function applyInbound(p: Platform, tenantId: string, principal: Pri
   return p.database.withTenant(tenantId, async (tx) => {
     const sync = await tx.selectFrom('hub_sync').selectAll().where('id', '=', syncId).executeTakeFirst();
     if (!sync) throw new CommandError(404, 'not_found', 'sync not found');
-    await loadEntity(tx, sync.entity);
     const remoteAt = new Date(change.updated_at);
     const correlationId = `sync:${sync.id}:${correlationSuffix}`;
+    if (sync.entity.includes(':')) {
+      const target = appSyncTarget(p, sync.entity);
+      if (!target) throw new CommandError(409, 'not_syncable', `${sync.entity} can no longer be synced`);
+      return applyInboundApp(p, tx, tenantId, principal, sync, target, change, remoteAt, correlationId);
+    }
+    await loadEntity(tx, sync.entity);
     const values = mapIn(sync.field_map as Record<string, string>, change.data);
     const map = await tx.selectFrom('external_id_map').selectAll().where('sync_id', '=', sync.id).where('external_id', '=', change.external_id).executeTakeFirst();
     const base = { tenantId, principal, entity: sync.entity, origin: 'integration' as const, correlationId };

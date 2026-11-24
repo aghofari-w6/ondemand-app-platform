@@ -4,8 +4,7 @@ import { sql } from 'kysely';
 import { z } from 'zod';
 import { newId } from '../../db/database.ts';
 import type { Platform } from '../../platform/context.ts';
-import { endpointView, replayDeliveries, rotateSecret, runConnector, saveEndpoint } from '../../platform/hub.ts';
-import { loadEntity } from '../../platform/records.ts';
+import { assertSyncTarget, endpointView, replayDeliveries, rotateSecret, runConnector, saveEndpoint, syncTargets } from '../../platform/hub.ts';
 import { recordChange } from '../../platform/record.ts';
 import { correlationId, parse, requirePermission } from '../app.ts';
 
@@ -149,7 +148,8 @@ export function hubRoutes(p: Platform) {
       return p.database.withTenant(a.tenantId, async (tx) => {
         const syncs = await tx.selectFrom('hub_sync').selectAll().orderBy('name').execute();
         const counts = await tx.selectFrom('external_id_map').select(['sync_id', sql<number>`count(*)::int`.as('n')]).groupBy('sync_id').execute();
-        return { syncs: syncs.map((s) => ({ ...s, mapped: counts.find((c) => c.sync_id === s.id)?.n ?? 0, inbound_url: `${p.env.PUBLIC_URL}/v1/sync/${s.id}` })) };
+        // `targets`: app entities that can be synced besides custom entities (manifest `sync`).
+        return { syncs: syncs.map((s) => ({ ...s, mapped: counts.find((c) => c.sync_id === s.id)?.n ?? 0, inbound_url: `${p.env.PUBLIC_URL}/v1/sync/${s.id}` })), targets: await syncTargets(p, tx) };
       });
     });
 
@@ -157,11 +157,11 @@ export function hubRoutes(p: Platform) {
       const a = requirePermission(req, 'platform:hub.manage');
       const input = parse(SyncInput, req.body);
       const id = await p.database.withTenant(a.tenantId, async (tx) => {
-        await loadEntity(tx, input.entity);
         if (input.endpoint_id) {
           const e = await tx.selectFrom('hub_endpoint').select('kind').where('id', '=', input.endpoint_id).executeTakeFirst();
           if (!e || !['webhook', 'rest_push'].includes(e.kind)) throw new CommandError(422, 'invalid_endpoint', 'outbound sync needs a webhook or REST push endpoint');
         }
+        await assertSyncTarget(p, tx, input);
         const id = newId();
         await tx.insertInto('hub_sync').values({ id, tenant_id: a.tenantId, name: input.name, entity: input.entity, endpoint_id: input.endpoint_id ?? null, conflict_rule: input.conflict_rule, field_map: JSON.stringify(input.field_map) }).execute();
         await recordChange(p, tx, { tenantId: a.tenantId, actor: a.principal, action: 'platform:hub.sync_created', resourceType: 'platform::HubSync', resourceId: id, correlationId: correlationId(req) });

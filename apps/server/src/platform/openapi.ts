@@ -131,7 +131,7 @@ export async function buildOpenApi(p: Platform, tx: Tx, tenant: { slug: string; 
       summary: 'Push a change from your system through a two-way sync',
       security: [{ bearer: ['sync:write'] }, { oauth2: ['sync:write'] }],
       parameters: [{ name: 'syncId', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } }],
-      requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['external_id', 'updated_at', 'data'], properties: { external_id: { type: 'string' }, updated_at: { type: 'string', format: 'date-time' }, data: { type: 'object' }, deleted: { type: 'boolean' } } } } } },
+      requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['external_id', 'updated_at', 'data'], properties: { external_id: { type: 'string' }, updated_at: { type: 'string', format: 'date-time' }, data: { type: 'object' }, deleted: { type: 'boolean' }, local_id: { type: 'string', format: 'uuid', description: 'App-entity syncs only: the local record this external id belongs to, when no mapping exists yet.' } } } } } },
       responses: { 200: { description: 'Applied, stale, or resolved as a conflict' }, 404: err },
     },
   };
